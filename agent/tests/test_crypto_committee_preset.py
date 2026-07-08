@@ -34,8 +34,8 @@ def run():
 def test_preset_loads_and_lists():
     data = load_preset(PRESET)
     assert data["name"] == PRESET
-    assert len(data["agents"]) == 12
-    assert len(data["tasks"]) == 12
+    assert len(data["agents"]) == 13
+    assert len(data["tasks"]) == 13
 
 
 def test_dag_is_acyclic_and_debate_is_sequential(run):
@@ -43,8 +43,17 @@ def test_dag_is_acyclic_and_debate_is_sequential(run):
     layers = topological_layers(run.tasks)
     order = {tid: i for i, layer in enumerate(layers) for tid in layer}
 
-    # 4 analysts run first, in parallel.
-    analyst_layer = {order[t] for t in ("task-market", "task-onchain", "task-news", "task-sentiment")}
+    # 4 analysts + the reflection officer run first, in parallel.
+    analyst_layer = {
+        order[t]
+        for t in (
+            "task-market",
+            "task-onchain",
+            "task-news",
+            "task-sentiment",
+            "task-reflection",
+        )
+    }
     assert analyst_layer == {0}
 
     # Sequential decision spine: bull -> bear -> plan -> trader -> risk x3 -> PM.
@@ -89,6 +98,24 @@ def test_decision_agents_carry_submit_decision_tool(run):
             assert "submit_decision" in spec.tools, spec.id
         else:
             assert "submit_decision" not in spec.tools, spec.id
+
+
+def test_learning_loop_wiring(run):
+    """Reflection officer feeds the PM; both carry decision_journal."""
+    specs = {a.id: a for a in run.agents}
+    tasks = {t.id: t for t in run.tasks}
+
+    assert "decision_journal" in specs["reflection_officer"].tools
+    assert "decision_journal" in specs["portfolio_manager"].tools
+    # nobody else touches the journal
+    for spec in run.agents:
+        if spec.id not in {"reflection_officer", "portfolio_manager"}:
+            assert "decision_journal" not in spec.tools, spec.id
+
+    # PM receives the lessons report; reflection runs with no upstream inputs
+    assert tasks["task-decision"].input_from.get("past_lessons") == "task-reflection"
+    assert tasks["task-reflection"].depends_on == []
+    assert not tasks["task-reflection"].input_from
 
 
 def test_all_agents_can_write_their_report(run):

@@ -1,6 +1,6 @@
 name: crypto_committee
 title: "Crypto Investment Committee (sequential debate)"
-description: "TradingAgents-style decision pipeline for crypto: 4 analysts (TA / on-chain / news / sentiment) -> sequential bull/bear debate -> research manager ruling -> trader proposal -> risky/safe/neutral risk rotation -> portfolio manager final decision. Typed decisions via submit_decision; adapted from TauricResearch/TradingAgents (Apache-2.0)."
+description: "TradingAgents-style decision pipeline for crypto: reflection officer (resolves past decisions into lessons) + 4 analysts (TA / on-chain / news / sentiment) -> sequential bull/bear debate -> research manager ruling -> trader proposal -> risky/safe/neutral risk rotation -> portfolio manager final decision (journaled for future reflection). Typed decisions via submit_decision; learning loop via decision_journal; adapted from TauricResearch/TradingAgents (Apache-2.0)."
 
 # NOTE (engine contract):
 # - Workers whose task uses input_from MUST keep {upstream_context} in their
@@ -152,6 +152,37 @@ agents:
     skills: [sentiment-analysis, social-media-intelligence, behavioral-finance]
     max_iterations: 40
     timeout_seconds: 1800
+    max_retries: 1
+
+  - id: reflection_officer
+    role: Reflection Officer (learning loop)
+    system_prompt: |
+      You are the committee's reflection officer. Before today's debate, you close the
+      loop on PAST decisions: you resolve their realized outcomes and distill lessons.
+      You are a historian, not a forecaster — you never opine on the current setup.
+
+      ## Protocol (in order)
+      1. Call decision_journal with action "resolve_due". This computes realized
+         returns and alpha vs the BTC benchmark for every pending past decision.
+      2. For EACH entry in reflection_due: write a 2-4 sentence reflection and save it
+         via decision_journal action "reflect" (entry_id, reflection). Rules:
+         - Cite the numbers: realized raw return and alpha at the primary horizon.
+         - State plainly whether the rating was directionally right.
+         - Name which part of the recorded thesis held or failed IF the entry data
+           supports it — no hindsight invention beyond the recorded fields.
+         - End with ONE transferable lesson (e.g. "extreme-fear + rising price
+           divergences resolved upward twice now").
+      3. Call decision_journal action "lessons" for the target asset.
+      4. Write report.md containing EXACTLY:
+         - "## Past Lessons" followed by the lessons_markdown returned in step 3,
+         - "## Reflections written this run: N" (the count from step 2),
+         - any resolve errors verbatim under "## Data issues".
+      If the journal is empty, report.md is just: "## Past Lessons" and
+      "No prior committee decisions recorded."
+    tools: [write_file, decision_journal]
+    skills: [behavioral-finance]
+    max_iterations: 20
+    timeout_seconds: 900
     max_retries: 1
 
   # ----------------------------------------------------------------- debate
@@ -359,7 +390,14 @@ agents:
          which you overrode and why.
       4. Be decisive: "Hold" must be a positive choice with a thesis, not an escape.
 
-      ## Deliverable (both steps required)
+      ## Past lessons (from the reflection officer's report above)
+      Weigh recurring, evidenced mistakes — if the journal shows the committee was
+      directionally wrong twice in a row in similar conditions, demand stronger
+      evidence for the same call today. Lessons INFORM the decision; they never
+      override today's evidence by themselves. If there are no prior lessons, proceed
+      on current evidence alone.
+
+      ## Deliverable (all three steps required)
       1. Call submit_decision with schema "portfolio_decision", payload:
          rating (Buy|Overweight|Hold|Underweight|Sell),
          executive_summary (>= 50 chars, standalone — readable without the reports),
@@ -367,16 +405,25 @@ agents:
          invalidation condition),
          price_target (number or null), time_horizon (e.g. "72h swing").
          Fix any validation issues and resubmit until status is ok.
-      2. Write report.md: the rendered_markdown from the tool, then "Committee notes":
-         which arguments you weighted most, which you rejected, and the monitoring
-         triggers that would change this rating.
-    tools: [write_file, read_file, submit_decision]
+      2. Call decision_journal with action "append": symbol = the target asset,
+         rating = your rating, time_horizon = your stated horizon, price_target if
+         set. This records the decision for future reflection — the learning loop
+         depends on it.
+      3. Write report.md: the rendered_markdown from the tool, then "Committee notes":
+         which arguments you weighted most, which you rejected (including which past
+         lessons applied), and the monitoring triggers that would change this rating.
+    tools: [write_file, read_file, submit_decision, decision_journal]
     skills: [asset-allocation, risk-analysis]
     max_iterations: 15
     timeout_seconds: 900
     max_retries: 1
 
 tasks:
+  - id: task-reflection
+    agent_id: reflection_officer
+    prompt_template: "Resolve past committee decisions, write due reflections, and produce the Past Lessons report for {target}."
+    depends_on: []
+
   - id: task-market
     agent_id: market_analyst
     prompt_template: "Produce the technical analysis report for {target} over the {timeframe} horizon."
@@ -463,8 +510,9 @@ tasks:
   - id: task-decision
     agent_id: portfolio_manager
     prompt_template: "Issue the final portfolio_decision for {target} over the {timeframe} horizon."
-    depends_on: [task-risk-neutral]
+    depends_on: [task-risk-neutral, task-reflection]
     input_from:
+      past_lessons: task-reflection
       research_plan: task-research-plan
       trader_proposal: task-trader
       risk_adjudication: task-risk-neutral
