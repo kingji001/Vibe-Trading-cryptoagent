@@ -20,3 +20,9 @@ repository as factual mathematical content (formulas are not copyrightable):
 Prose, tables, and figures from the source papers and reports are NOT
 reproduced in this repository. Only the mathematical formulas — which are
 factual content and not subject to copyright — are reimplemented here.
+
+The crypto_committee swarm preset and src/committee decision schemas adapt
+the multi-agent decision workflow design (analyst/debate/risk/portfolio-
+manager pipeline, typed decision schemas, 5-tier rating scale) from
+TauricResearch/TradingAgents (https://github.com/TauricResearch/TradingAgents),
+Apache License 2.0, described in arXiv:2412.20138.

@@ -135,6 +135,19 @@ _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
         0.9,
     ),
     (
+        "crypto_committee",
+        [
+            r"crypto\s+committee",
+            r"committee.*(?:BTC|ETH|SOL|crypto|加密)",
+            r"bull.*bear.*(?:debate|辩论)",
+            "多空辩论",
+            "加密.*委员会",
+            "委员会.*加密",
+            r"(?:trading|investment)\s+decision.*(?:BTC|ETH|SOL|crypto|加密)",
+        ],
+        1.0,
+    ),
+    (
         "crypto_research_lab",
         [
             r"\bBTC\b",
@@ -611,6 +624,7 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         "event_driven_task_force": {"market": market, "event_type": "all types"},
         "etf_allocation_desk": {"risk_profile": _risk_to_etf_profile(risk), "market": market},
         "derivatives_strategy_desk": {"target": g, "view": "neutral"},
+        "crypto_committee": {"target": "BTC-USDT", "timeframe": "72h swing"},
         "crypto_research_lab": {"target": "BTC, ETH, SOL", "timeframe": "medium-term 1-3 months"},
         "credit_research_team": {"target": g, "market": "China credit bonds"},
         "convertible_bond_team": {
