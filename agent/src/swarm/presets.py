@@ -31,6 +31,51 @@ _INTERNAL_TEMPLATE_VARS = {"upstream_context", "round"}
 # preset-build time so a misconfigured debate fails before spending tokens.
 _DEBATE_ROUNDS_CAP = 4
 
+# Phase 6 — optional experiment knob. TradingAgents deliberately restricts
+# reflection/memory context to the Portfolio Manager; the learning-loop
+# preset wiring (crypto_committee.yaml) follows that on purpose — only
+# task-decision (portfolio_manager) declares past_lessons: task-reflection.
+# VIBE_LESSONS_TO_MANAGER=1 mirrors that same wiring onto the research
+# manager's task too, for A/B testing whether earlier-stage judging benefits
+# from the same lessons. Default OFF preserves upstream behavior exactly.
+LESSONS_TO_MANAGER_ENV = "VIBE_LESSONS_TO_MANAGER"
+_LESSONS_TO_MANAGER_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _lessons_to_manager_enabled() -> bool:
+    return os.getenv(LESSONS_TO_MANAGER_ENV, "").strip().lower() in _LESSONS_TO_MANAGER_TRUE_VALUES
+
+
+def _inject_lessons_into_manager(tasks: list[SwarmTask]) -> None:
+    """Mirror the PM's ``past_lessons`` input onto the ``research_manager`` task.
+
+    No-op when the flag is off (default), when the preset has no
+    ``research_manager`` seat, when nothing else in the preset feeds
+    ``past_lessons`` to anything (nothing to mirror), or when the preset
+    already wires it explicitly (never override an explicit preset choice).
+    Mutates the matching task's ``input_from``/``depends_on`` in place —
+    same pattern ``_expand_debate`` uses to rewire a sink task's dependency
+    bookkeeping (``blocked_by``/``status``) after adding a dependency post
+    construction.
+    """
+    if not _lessons_to_manager_enabled():
+        return
+    source_task_id = next(
+        (t.input_from["past_lessons"] for t in tasks if "past_lessons" in t.input_from),
+        None,
+    )
+    manager_task = next((t for t in tasks if t.agent_id == "research_manager"), None)
+    if source_task_id is None or manager_task is None:
+        return
+    if "past_lessons" in manager_task.input_from:
+        return  # preset already wires it explicitly; don't override
+
+    manager_task.input_from = {**manager_task.input_from, "past_lessons": source_task_id}
+    if source_task_id not in manager_task.depends_on:
+        manager_task.depends_on = list(manager_task.depends_on) + [source_task_id]
+        manager_task.blocked_by = list(manager_task.depends_on)
+        manager_task.status = TaskStatus.blocked
+
 # Matches a whole-string ${ENV_VAR} or ${ENV_VAR:-default} placeholder. Only
 # the entire model_name value is treated as a placeholder — this is not a
 # general templating engine, so partial/mixed strings are left untouched.
@@ -509,6 +554,10 @@ def build_run_from_preset(preset_name: str, user_vars: dict[str, str]) -> SwarmR
             expanded.extend(inserts_before_sink.get(task.id, []))
             expanded.append(task)
         tasks = expanded
+
+    # Phase 6 — optional flagged experiment (default OFF): mirror the PM's
+    # past_lessons input onto the research_manager task too.
+    _inject_lessons_into_manager(tasks)
 
     # Generate run ID
     now = datetime.now(timezone.utc)

@@ -233,3 +233,68 @@ An optional utility tier applies the same mechanism to context compaction:
 summarization call through `ChatLLM(model_name=os.getenv("VIBE_COMPACT_MODEL"))`
 when that env var is set (same same-provider constraint), and through the
 loop's main model when unset (unchanged upstream behavior).
+
+## Phase 6 — Reflection loop automation + crypto benchmark fix
+
+**Scheduled resolution.** The committee decision journal
+(`agent/src/committee/journal.py`, tool `agent/src/tools/committee_journal_tool.py`)
+previously resolved past decisions' 24h/72h/7d outcomes only when the *next*
+committee run's reflection officer happened to fire — a day with no committee
+run just left due outcomes unresolved and no lesson accrued. With
+`VIBE_TRADING_ENABLE_SCHEDULER=1`, server startup now also registers a daily
+scheduled-research job (`agent/src/api/scheduled_routes.py::_ensure_decision_journal_job`,
+job id `decision-journal-reflection`, schedule `0 0 * * *` UTC) whose prompt
+instructs the agent to call `decision_journal action=resolve_due` and then
+`action=reflect` for every entry the resolve pass surfaces. Registration is
+idempotent — a restart never resets the job's schedule or clobbers a manual
+edit — and dispatch reuses the existing scheduled-research executor/session
+runtime unchanged (`agent/src/scheduled_research/`); this is new *wiring*,
+not a new execution mechanism.
+
+**System-cron alternative (scheduler off).** If you keep
+`VIBE_TRADING_ENABLE_SCHEDULER` unset/`0` — the upstream default — nothing
+runs this automatically. Reflection text requires judgment (`resolve_due` is
+pure arithmetic, but the written lesson is not), so the equivalent is a
+system-cron entry that invokes the same one-shot agent prompt via the
+existing `vibe-trading run` CLI subcommand, e.g.:
+
+```cron
+# Daily at 00:00 UTC — resolve due committee decisions and write reflections.
+0 0 * * * cd /path/to/Vibe-Trading-cryptoagent/agent && \
+  vibe-trading run -p "Call decision_journal action='resolve_due'. For each \
+  entry in reflection_due, write a 2-4 sentence reflection citing the \
+  realized raw return and alpha at the primary horizon and whether the \
+  rating was directionally right, then call decision_journal \
+  action='reflect' (entry_id, reflection)." >> ~/.vibe-trading/logs/reflection-cron.log 2>&1
+```
+
+This doc is the chosen home for that alternative (over the
+`committee_journal_tool.py` docstring) because it is the file `.env.example`
+and the rest of the Phase 0–5 notes already point users to for env-var
+behavior — a user deciding whether to leave the scheduler off is reading
+migration/config docs, not swarm tool source. The tool's docstring carries
+only a one-line pointer back here for readers browsing the code.
+
+**Crypto benchmark routing fix.** `agent/backtest/benchmark.py` maps
+`crypto -> BTC-USDT` (`MARKET_BENCHMARKS`), but `_fetch_benchmark` fetched
+every ticker via yfinance only — which cannot reliably resolve every
+OKX-format symbol, so crypto benchmark comparison in *backtests* was silently
+broken (a fetch failure is caught by `resolve_benchmark` and just returns
+`None`, no benchmark line). `_fetch_benchmark` now routes crypto-format
+tickers (`BTC-USDT`, detected the same way `_infer_market` already does)
+through the backtest loader registry (`okx` -> `ccxt`, via the new
+`backtest.loaders.registry.fetch_ohlcv_with_fallback` helper) — the same
+source chain the decision journal's alpha calc already uses
+(`src/tools/committee_journal_tool.py::_loader_fetch_bars`). Every other
+market (`us_equity`, `hk_equity`, `a_share`, `futures`) keeps using yfinance,
+unchanged. The journal's own alpha path was not touched — it already used
+the loader registry and is unaffected by this fix.
+
+**Lessons-to-manager experiment (flagged, default OFF).** TradingAgents
+deliberately restricts reflection/memory context to the Portfolio Manager;
+`crypto_committee.yaml` follows that on purpose (`task-decision` is the only
+task with `past_lessons: task-reflection` in `input_from`).
+`VIBE_LESSONS_TO_MANAGER=1` mirrors that same wiring onto the
+`research_manager` task too (`agent/src/swarm/presets.py::_inject_lessons_into_manager`),
+for A/B testing whether the debate-judging seat benefits from the same
+lessons the PM sees. Unset/`0` reproduces the current preset graph exactly.

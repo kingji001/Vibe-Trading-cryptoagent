@@ -12,6 +12,13 @@ manager) and the main agent can drive the learning loop:
 - list         raw entries for inspection.
 
 Learning-loop design adapted from TauricResearch/TradingAgents (Apache-2.0).
+
+Resolution/reflection normally run inline in a committee run (the reflection
+officer seat) or, when ``VIBE_TRADING_ENABLE_SCHEDULER=1``, via a daily
+scheduled job (``src/api/scheduled_routes.py::_ensure_decision_journal_job``)
+so outcomes resolve even on days with no committee run. If you keep the
+scheduler off, see docs/minimax-migration-notes.md (Phase 6) for the
+system-cron ``vibe-trading run`` equivalent.
 """
 
 from __future__ import annotations

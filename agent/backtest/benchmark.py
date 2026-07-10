@@ -95,15 +95,7 @@ def _resolve_ticker(
 
     # Infer market from source + first code pattern
     market = _infer_market(codes, source)
-    ticker = MARKET_BENCHMARKS.get(market)
-
-    # yfinance is the universal fallback for benchmark fetch
-    # but it only works for us_equity / hk_equity market types
-    if ticker and market not in {"us_equity", "hk_equity"}:
-        # Only use benchmark if we can actually fetch it
-        pass
-
-    return ticker
+    return MARKET_BENCHMARKS.get(market)
 
 
 def _infer_market(codes: list[str], source: str) -> str:
@@ -129,13 +121,50 @@ def _infer_market(codes: list[str], source: str) -> str:
     return "us_equity"
 
 
+def _is_crypto_ticker(ticker: str) -> bool:
+    """OKX/ccxt-format tickers (e.g. ``BTC-USDT``) are the only benchmark
+    tickers with a ``-`` or ``/`` in ``MARKET_BENCHMARKS`` — every other
+    market's default (``SPY``, ``HK.03100``, ``000300.SH``, ``ES.CME``) uses
+    a dot or no separator. Mirrors ``_infer_market``'s symbol heuristic."""
+    upper = ticker.upper()
+    return "-" in upper or "/" in upper
+
+
 def _fetch_benchmark(
     ticker:    str,
     start_date: str,
     end_date:   str,
     interval:   str,
+    market:    Optional[str] = None,
 ) -> pd.DataFrame:
-    """Fetch benchmark OHLCV data via yfinance (single symbol, no auth)."""
+    """Fetch benchmark OHLCV data.
+
+    Crypto tickers route through the backtest loader registry (okx -> ccxt),
+    exactly like the committee decision journal's alpha path
+    (``src.tools.committee_journal_tool._loader_fetch_bars``) — yfinance
+    cannot resolve every OKX-format symbol, so crypto benchmark comparison
+    was previously silently broken (fetch failure -> ``resolve_benchmark``
+    swallows the exception and returns ``None``). Every other market keeps
+    using yfinance, unchanged.
+
+    Args:
+        ticker: Benchmark ticker to fetch.
+        start_date: Start date (YYYY-MM-DD).
+        end_date: End date (YYYY-MM-DD).
+        interval: Bar interval (1m/5m/15m/30m/1H/4H/1D).
+        market: Optional explicit market override; inferred from the
+            ticker's own shape when omitted (see ``_is_crypto_ticker``).
+    """
+    if market is None:
+        market = "crypto" if _is_crypto_ticker(ticker) else "us_equity"
+
+    if market == "crypto":
+        from backtest.loaders.registry import fetch_ohlcv_with_fallback
+
+        return fetch_ohlcv_with_fallback(
+            ["okx", "ccxt"], ticker, start_date, end_date, interval=interval
+        )
+
     loader = YfinanceLoader()
     result = loader.fetch([ticker], start_date, end_date, interval=interval)
 

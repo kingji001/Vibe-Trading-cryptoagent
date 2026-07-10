@@ -25,6 +25,77 @@ logger = logging.getLogger(__name__)
 _SCHEDULED_RESEARCH_SCHEDULER_ENV = "VIBE_TRADING_ENABLE_SCHEDULER"
 _SCHEDULED_RESEARCH_TRUE_VALUES = {"1", "true", "yes", "on"}
 
+# ---------------------------------------------------------------------------
+# Phase 6 — decision-journal reflection job
+#
+# The committee's decision journal (src/committee/journal.py) previously
+# resolved past decisions (24h/72h/7d realized returns + alpha) only when the
+# next committee run's reflection officer happened to fire — so on a day
+# with no committee run, due outcomes just sat unresolved and no lesson
+# accrued. When the scheduler is enabled this well-known job is registered
+# once (idempotent — a restart never clobbers a user's edited schedule) so
+# resolution and reflection happen daily regardless of committee activity.
+# The prompt is dispatched through the ordinary session runtime (see
+# ``_dispatch_scheduled_research_job`` below), so it runs with a real agent
+# turn — writing an actual lesson (action='reflect') needs judgment, not
+# just arithmetic (action='resolve_due' is pure and lookahead-safe, but the
+# reflection text is not mechanically derivable).
+#
+# Users who keep VIBE_TRADING_ENABLE_SCHEDULER unset/0 get no automatic job;
+# the CLI equivalent for a system-cron entry is documented in
+# docs/minimax-migration-notes.md (Phase 6) — that doc is the more
+# discoverable spot for an end-user config decision than this module's
+# docstring, since it's the file cfg.md and the other phase docs already
+# point users to for env var behavior.
+# ---------------------------------------------------------------------------
+
+DECISION_JOURNAL_JOB_ID = "decision-journal-reflection"
+# Daily at 00:00 UTC. Overridable for operators who want a different time of
+# day without touching code — the job is upserted with whatever schedule is
+# in the store already (see _ensure_decision_journal_job), so changing this
+# default only affects brand-new installs, never an existing job.
+DECISION_JOURNAL_JOB_SCHEDULE = "0 0 * * *"
+DECISION_JOURNAL_JOB_PROMPT = (
+    "You are running the committee's scheduled reflection pass. There is no "
+    "live debate today — you are only closing the loop on PAST decisions.\n\n"
+    "1. Call the decision_journal tool with action='resolve_due'. This computes "
+    "realized 24h/72h/7d returns and alpha vs the configured benchmark for every "
+    "pending decision that has reached a due horizon.\n"
+    "2. For EACH entry in the returned reflection_due list: write a 2-4 sentence "
+    "reflection citing the realized raw return and alpha at the primary horizon, "
+    "and state plainly whether the rating was directionally right. End with one "
+    "transferable lesson. Save it via decision_journal action='reflect' "
+    "(entry_id, reflection).\n"
+    "3. Reply with a one-line summary: how many horizons were resolved and how "
+    "many reflections were written this run. If resolve_due reported any "
+    "errors, include them verbatim.\n"
+    "If nothing was due, say so and stop — do not fabricate a decision or a "
+    "reflection for an entry that isn't due."
+)
+
+
+def _ensure_decision_journal_job(store) -> None:
+    """Register the daily resolve_due + reflect job if not already persisted.
+
+    Idempotent and non-clobbering: called on every startup while the
+    scheduler is enabled, but a job that already exists (whatever schedule
+    or prompt it currently has — including a user's own edits) is left
+    untouched, so a restart never resets ``next_run_at`` or discards an
+    edit.
+    """
+    if store.get(DECISION_JOURNAL_JOB_ID) is not None:
+        return
+
+    from src.scheduled_research.models import ScheduledResearchJob
+
+    store.upsert(
+        ScheduledResearchJob(
+            id=DECISION_JOURNAL_JOB_ID,
+            prompt=DECISION_JOURNAL_JOB_PROMPT,
+            schedule=DECISION_JOURNAL_JOB_SCHEDULE,
+        )
+    )
+
 
 # ---------------------------------------------------------------------------
 # Module-level state
@@ -93,9 +164,14 @@ def _get_scheduled_research_executor():
 
 
 def _start_scheduled_research_executor() -> None:
-    """Start scheduled research execution when explicitly enabled."""
+    """Start scheduled research execution when explicitly enabled.
+
+    Also registers the Phase 6 decision-journal reflection job (idempotent)
+    so daily resolve_due + reflect runs regardless of committee activity.
+    """
     if not _scheduled_research_scheduler_enabled():
         return
+    _ensure_decision_journal_job(_get_scheduled_research_store())
     _get_scheduled_research_executor().start()
 
 

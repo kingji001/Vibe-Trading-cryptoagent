@@ -190,6 +190,33 @@ def test_snapshot_seat_prompts_reference_get_verified_crypto_snapshot(run):
         assert SNAPSHOT_TOOL in specs[seat_id].system_prompt, seat_id
 
 
+def test_lessons_to_manager_flag_off_by_default(run):
+    """Upstream default (TradingAgents restricts memory to the PM): with
+    VIBE_LESSONS_TO_MANAGER unset, the research manager's task does NOT
+    receive past_lessons — only the PM does (see test_learning_loop_wiring)."""
+    tasks = {t.id: t for t in run.tasks}
+    assert "past_lessons" not in tasks["task-research-plan"].input_from
+
+
+def test_lessons_to_manager_flag_on_injects_research_manager_input(monkeypatch):
+    """VIBE_LESSONS_TO_MANAGER=1 mirrors the PM's past_lessons wiring onto the
+    research manager (experiment knob), without disturbing the PM's own
+    wiring or the reflection officer's task."""
+    monkeypatch.setenv("VIBE_LESSONS_TO_MANAGER", "1")
+    flagged_run = build_run_from_preset(PRESET, USER_VARS)
+    tasks = {t.id: t for t in flagged_run.tasks}
+
+    assert tasks["task-research-plan"].input_from.get("past_lessons") == "task-reflection"
+    assert "task-reflection" in tasks["task-research-plan"].depends_on
+    # PM wiring is unaffected.
+    assert tasks["task-decision"].input_from.get("past_lessons") == "task-reflection"
+    # DAG stays acyclic and reflection still runs task-reflection first.
+    validate_dag(flagged_run.tasks)
+    layers = topological_layers(flagged_run.tasks)
+    order = {tid: i for i, layer in enumerate(layers) for tid in layer}
+    assert order["task-reflection"] < order["task-research-plan"]
+
+
 def test_snapshot_tool_json_keys_match_prompt_references():
     """Prompt-contract: every top-level field name the snapshot tool's JSON
     envelope actually returns is referenced somewhere in the preset text —
