@@ -22,7 +22,14 @@ from src.swarm.models import RunStatus, SwarmAgentSpec, SwarmRun, SwarmTask, Tas
 from src.swarm.task_store import topological_layers, validate_dag
 
 PRESETS_DIR = Path(__file__).resolve().parent / "presets"
-_INTERNAL_TEMPLATE_VARS = {"upstream_context"}
+# ``round`` is injected by the Phase 4 debate expansion (the round number is
+# baked into rebuttal prompt_templates at build time), so it is not a
+# user-declared preset variable.
+_INTERNAL_TEMPLATE_VARS = {"upstream_context", "round"}
+
+# Hard cap on debate rounds (Phase 4). Rounds above this are rejected at
+# preset-build time so a misconfigured debate fails before spending tokens.
+_DEBATE_ROUNDS_CAP = 4
 
 # Matches a whole-string ${ENV_VAR} or ${ENV_VAR:-default} placeholder. Only
 # the entire model_name value is treated as a placeholder — this is not a
@@ -30,6 +37,32 @@ _INTERNAL_TEMPLATE_VARS = {"upstream_context"}
 _MODEL_ENV_PLACEHOLDER_RE = re.compile(
     r"^\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>.*))?\}$"
 )
+
+
+def _resolve_env_placeholder(value):
+    """Resolve a whole-string ``${VAR}`` / ``${VAR:-default}`` env placeholder.
+
+    Shared scalar resolver behind both Phase 3 ``model_name`` tiering and the
+    Phase 4 ``debates: rounds`` field. Deliberately NOT a general templating
+    engine — only a value that is *entirely* a placeholder is substituted.
+
+    Rules:
+        - ``None`` and non-``str`` values pass through unchanged.
+        - A literal with no placeholder syntax passes through unchanged.
+        - ``${VAR}`` -> ``os.environ["VAR"]`` when set and non-empty.
+        - ``${VAR:-default}`` -> ``default`` when ``VAR`` is unset/empty.
+        - Unset/empty with no (or empty) default -> ``None``.
+    """
+    if value is None or not isinstance(value, str):
+        return value
+    match = _MODEL_ENV_PLACEHOLDER_RE.match(value.strip())
+    if not match:
+        return value
+    env_value = os.environ.get(match.group("name"), "")
+    if env_value:
+        return env_value
+    default = match.group("default")
+    return default or None
 
 
 def _resolve_model_name(value: str | None) -> str | None:
@@ -56,16 +89,150 @@ def _resolve_model_name(value: str | None) -> str | None:
     Returns:
         The resolved model name, or ``None`` to fall back to the global model.
     """
-    if value is None:
-        return None
-    match = _MODEL_ENV_PLACEHOLDER_RE.match(value.strip())
-    if not match:
-        return value
-    env_value = os.environ.get(match.group("name"), "")
-    if env_value:
-        return env_value
-    default = match.group("default")
-    return default or None
+    return _resolve_env_placeholder(value)
+
+
+def _resolve_debate_rounds(raw, debate_id: str) -> int:
+    """Resolve and validate a debate's ``rounds`` field at build time.
+
+    ``raw`` may be a literal int (``rounds: 2``) or an env placeholder string
+    (``rounds: ${VIBE_DEBATE_ROUNDS:-1}``). Missing / unresolved -> 1 (today's
+    single-pass behavior). Non-integer, ``< 1``, or ``> _DEBATE_ROUNDS_CAP``
+    raise ``ValueError`` — the guardrail that fails a misconfigured debate
+    before any tokens are spent.
+    """
+    if raw is None:
+        return 1
+    if isinstance(raw, bool):
+        raise ValueError(f"debate '{debate_id}' rounds must be an integer, got {raw!r}")
+    if isinstance(raw, int):
+        resolved = raw
+    else:
+        text = _resolve_env_placeholder(str(raw))
+        if text is None or str(text).strip() == "":
+            return 1
+        try:
+            resolved = int(str(text).strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"debate '{debate_id}' rounds must be an integer, got {text!r}"
+            ) from exc
+    if resolved < 1:
+        raise ValueError(
+            f"debate '{debate_id}' rounds must be >= 1, got {resolved}"
+        )
+    if resolved > _DEBATE_ROUNDS_CAP:
+        raise ValueError(
+            f"debate '{debate_id}' rounds={resolved} exceeds the cap of "
+            f"{_DEBATE_ROUNDS_CAP}"
+        )
+    return resolved
+
+
+def _make_task(
+    task_id: str,
+    agent_id: str,
+    prompt_template: str,
+    depends_on: list[str],
+    input_from: dict[str, str],
+) -> SwarmTask:
+    """Construct a SwarmTask with blocked_by/status derived from depends_on."""
+    deps = list(depends_on)
+    status = TaskStatus.blocked if deps else TaskStatus.pending
+    return SwarmTask(
+        id=task_id,
+        agent_id=agent_id,
+        prompt_template=prompt_template,
+        depends_on=deps,
+        blocked_by=list(deps),
+        input_from=dict(input_from),
+        status=status,
+    )
+
+
+def _expand_debate(debate: dict, tasks_by_id: dict[str, SwarmTask]) -> list[SwarmTask]:
+    """Unroll one ``debates:`` entry into chained round tasks (Phase 4).
+
+    The engine's DAG stays single-pass and acyclic by construction: rounds are
+    materialized here as a serial chain of ordinary tasks that the runtime
+    executes natively. For participants ``[p0, p1, ...]`` and ``R`` rounds the
+    alternation is ``p0_r1 -> p1_r1 -> ... -> p0_r2 -> ...``. Each round task's
+    ``input_from`` carries the seed reports plus every prior round summary; the
+    sink (judge/aggregator) receives the full alternation.
+
+    Round 1 reuses each participant's legacy ``task_id`` (so unset envs ==
+    today's graph byte-for-byte); rounds >= 2 append ``-r{n}``.
+
+    Args:
+        debate: One entry from the preset's ``debates:`` list.
+        tasks_by_id: Base tasks already parsed from ``tasks:``; the sink is
+            mutated in place to consume the transcript and depend on the final
+            round task.
+
+    Returns:
+        The newly generated round tasks, in execution order.
+    """
+    debate_id = debate.get("id", "?")
+    rounds = _resolve_debate_rounds(debate.get("rounds"), debate_id)
+    participants = debate.get("participants") or []
+    if not participants:
+        raise ValueError(f"debate '{debate_id}' has no participants")
+    seed_inputs: dict[str, str] = dict(debate.get("seed_inputs", {}) or {})
+    entry_inputs: dict[str, str] = dict(debate.get("entry_inputs", {}) or {})
+    sink_id = debate.get("sink")
+    if sink_id not in tasks_by_id:
+        raise ValueError(
+            f"debate '{debate_id}' sink '{sink_id}' is not a defined task"
+        )
+
+    # Entry (round-1, first participant) depends on the seed report tasks only;
+    # entry_inputs is context the opener also reads but does not gate on (the
+    # engine resolves it transitively, matching the pre-Phase-4 wiring).
+    entry_depends = list(dict.fromkeys(seed_inputs.values()))
+
+    new_tasks: list[SwarmTask] = []
+    transcript: dict[str, str] = {}  # running {input key -> round task id}
+    last_task_id: str | None = None
+
+    for rnd in range(1, rounds + 1):
+        for idx, participant in enumerate(participants):
+            seat = participant["seat"]
+            summary_key = participant["summary_key"]
+            base_id = participant["task_id"]
+            is_entry = rnd == 1 and idx == 0
+
+            task_id = base_id if rnd == 1 else f"{base_id}-r{rnd}"
+
+            input_from = dict(seed_inputs)
+            input_from.update(transcript)
+            if is_entry:
+                input_from.update(entry_inputs)
+
+            depends_on = list(entry_depends) if is_entry else [last_task_id]
+
+            if rnd == 1:
+                prompt = participant["opener"]
+            else:
+                # Bake the round number in now so the runtime template only ever
+                # sees the declared {target}/{timeframe} vars.
+                prompt = str(participant["rebuttal"]).replace("{round}", str(rnd))
+
+            new_tasks.append(_make_task(task_id, seat, prompt, depends_on, input_from))
+
+            key = summary_key if rnd == 1 else f"{summary_key}_r{rnd}"
+            transcript[key] = task_id
+            last_task_id = task_id
+
+    # Wire the sink: it consumes the whole transcript and runs after the last
+    # round task. Its non-debate inputs / dependencies (declared in tasks:) are
+    # preserved.
+    sink = tasks_by_id[sink_id]
+    sink.input_from = {**sink.input_from, **transcript}
+    if last_task_id and last_task_id not in sink.depends_on:
+        sink.depends_on = list(sink.depends_on) + [last_task_id]
+        sink.blocked_by = list(sink.depends_on)
+        sink.status = TaskStatus.blocked
+    return new_tasks
 
 
 def load_preset(name: str) -> dict:
@@ -213,6 +380,19 @@ def inspect_preset(name: str) -> dict:
             used_variables.update(_template_variables(task.get("prompt_template", "")))
         except ValueError as exc:
             errors.append(f"Task '{task.get('id', '?')}' has invalid prompt template: {exc}")
+    # Debate (Phase 4) opener/rebuttal templates also render at runtime; scan
+    # them so undeclared variables surface in the dry run too.
+    for debate in data.get("debates", []) or []:
+        for participant in debate.get("participants", []) or []:
+            for field in ("opener", "rebuttal"):
+                try:
+                    used_variables.update(_template_variables(participant.get(field, "")))
+                except ValueError as exc:
+                    errors.append(
+                        f"Debate '{debate.get('id', '?')}' participant "
+                        f"'{participant.get('seat', '?')}' has invalid {field} "
+                        f"template: {exc}"
+                    )
 
     missing_declarations = sorted(used_variables - declared_variables)
     unused_declarations = sorted(declared_variables - used_variables)
@@ -307,16 +487,28 @@ def build_run_from_preset(preset_name: str, user_vars: dict[str, str]) -> SwarmR
     tasks: list[SwarmTask] = []
     for task_data in data.get("tasks", []):
         depends_on = task_data.get("depends_on", [])
-        status = TaskStatus.blocked if depends_on else TaskStatus.pending
-        tasks.append(SwarmTask(
-            id=task_data["id"],
-            agent_id=task_data["agent_id"],
-            prompt_template=task_data.get("prompt_template", ""),
-            depends_on=depends_on,
-            blocked_by=list(depends_on),
-            input_from=task_data.get("input_from", {}),
-            status=status,
+        tasks.append(_make_task(
+            task_data["id"],
+            task_data["agent_id"],
+            task_data.get("prompt_template", ""),
+            depends_on,
+            task_data.get("input_from", {}),
         ))
+
+    # Phase 4: unroll any debates: sugar into chained round tasks. Round tasks
+    # are inserted immediately before their sink so the task order mirrors the
+    # pre-Phase-4 layout at rounds=1. The sink task is mutated in place.
+    tasks_by_id = {t.id: t for t in tasks}
+    inserts_before_sink: dict[str, list[SwarmTask]] = {}
+    for debate in data.get("debates", []) or []:
+        round_tasks = _expand_debate(debate, tasks_by_id)
+        inserts_before_sink.setdefault(debate["sink"], []).extend(round_tasks)
+    if inserts_before_sink:
+        expanded: list[SwarmTask] = []
+        for task in tasks:
+            expanded.extend(inserts_before_sink.get(task.id, []))
+            expanded.append(task)
+        tasks = expanded
 
     # Generate run ID
     now = datetime.now(timezone.utc)

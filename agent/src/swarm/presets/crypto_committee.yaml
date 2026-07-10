@@ -464,35 +464,22 @@ tasks:
     prompt_template: "Produce the structured sentiment report for {target} over the {timeframe} horizon."
     depends_on: []
 
-  - id: task-bull
-    agent_id: bull_researcher
-    prompt_template: "Argue the bull case for {target} over the {timeframe} horizon, grounded in the four analyst reports."
-    depends_on: [task-market, task-onchain, task-news, task-sentiment]
-    input_from:
-      market_report: task-market
-      onchain_report: task-onchain
-      news_report: task-news
-      sentiment_report: task-sentiment
-
-  - id: task-bear
-    agent_id: bear_researcher
-    prompt_template: "Rebut the bull and argue the bear case for {target} over the {timeframe} horizon."
-    depends_on: [task-bull]
-    input_from:
-      market_report: task-market
-      onchain_report: task-onchain
-      news_report: task-news
-      sentiment_report: task-sentiment
-      bull_argument: task-bull
+  # NOTE: the bull/bear debate and the risk rotation are declared under the
+  # debates: section below and unrolled into chained round tasks at build time
+  # (Phase 4; see src/swarm/presets.py::_expand_debate). With VIBE_DEBATE_ROUNDS
+  # / VIBE_RISK_ROUNDS unset the defaults are 1, reproducing this preset's
+  # historical single-pass graph exactly (task-bull -> task-bear ->
+  # task-research-plan, and task-risk-aggressive -> ...-safe -> ...-neutral ->
+  # task-decision). Only the SINK tasks (task-research-plan, task-decision) are
+  # declared here; the debate expansion appends the transcript inputs and the
+  # dependency on the final round task.
 
   - id: task-research-plan
     agent_id: research_manager
     prompt_template: "Judge the bull/bear debate on {target} ({timeframe} horizon) and submit the binding research_plan."
-    depends_on: [task-bear]
+    depends_on: []
     input_from:
       market_report: task-market
-      bull_argument: task-bull
-      bear_rebuttal: task-bear
 
   - id: task-trader
     agent_id: trader
@@ -502,42 +489,77 @@ tasks:
       research_plan: task-research-plan
       market_report: task-market
 
-  - id: task-risk-aggressive
-    agent_id: risky_analyst
-    prompt_template: "Critique the trader proposal for {target} from the aggressive (risk-seeking) seat."
-    depends_on: [task-trader]
-    input_from:
-      trader_proposal: task-trader
-      research_plan: task-research-plan
-
-  - id: task-risk-safe
-    agent_id: safe_analyst
-    prompt_template: "Rebut the aggressive debator and critique the trader proposal for {target} from the conservative seat."
-    depends_on: [task-risk-aggressive]
-    input_from:
-      trader_proposal: task-trader
-      aggressive_argument: task-risk-aggressive
-
-  - id: task-risk-neutral
-    agent_id: neutral_analyst
-    prompt_template: "Adjudicate the risk debate on {target} and list recommended modifications for the PM."
-    depends_on: [task-risk-safe]
-    input_from:
-      trader_proposal: task-trader
-      aggressive_argument: task-risk-aggressive
-      conservative_argument: task-risk-safe
-
   - id: task-decision
     agent_id: portfolio_manager
     prompt_template: "Issue the final portfolio_decision for {target} over the {timeframe} horizon."
-    depends_on: [task-risk-neutral, task-reflection]
+    depends_on: [task-reflection]
     input_from:
       past_lessons: task-reflection
       research_plan: task-research-plan
       trader_proposal: task-trader
-      risk_adjudication: task-risk-neutral
-      aggressive_argument: task-risk-aggressive
-      conservative_argument: task-risk-safe
+
+# ---------------------------------------------------------------------- debates
+# Multi-round adversarial debate (Phase 4), unrolled into chained DAG tasks at
+# preset-build time. Each entry expands into a serial chain:
+#   round r: participant[0] -> participant[1] -> ... ; then round r+1, ...
+# Every round task's input_from carries the seed_inputs plus ALL prior round
+# summaries; the sink (judge/PM) receives the full alternation. rounds default
+# to 1 (== today's single pass) when the env var is unset; the recommended .env
+# sets VIBE_DEBATE_ROUNDS=2 / VIBE_RISK_ROUNDS=1 (see .env.example).
+#
+# Participant fields:
+#   seat        agent id executing this round task
+#   task_id     round-1 task id (rounds >=2 append -r{n}); preserves legacy ids
+#   summary_key input_from key under which this seat's output is exposed
+#               downstream (round >=2 outputs get an _r{n} suffix)
+#   opener      round-1 prompt_template
+#   rebuttal    round >=2 prompt_template; {round} is substituted at build time,
+#               instructing the seat to answer the LATEST opposing argument
+#               rather than restate its opener ("debate, don't list")
+debates:
+  - id: research_debate
+    rounds: ${VIBE_DEBATE_ROUNDS:-1}   # 1 = today's behavior; recommend 2 in .env
+    seed_inputs:                        # the four analyst reports, given to every round
+      market_report: task-market
+      onchain_report: task-onchain
+      news_report: task-news
+      sentiment_report: task-sentiment
+    sink: task-research-plan
+    participants:
+      - seat: bull_researcher
+        task_id: task-bull
+        summary_key: bull_argument
+        opener: "Argue the bull case for {target} over the {timeframe} horizon, grounded in the four analyst reports."
+        rebuttal: "Round {round} of the debate on {target} ({timeframe} horizon): respond directly to the bear's most recent rebuttal shown above. Advance the strongest NEW support from the analyst reports and defend the specific claims the bear attacked — do not restate your opener."
+      - seat: bear_researcher
+        task_id: task-bear
+        summary_key: bear_rebuttal
+        opener: "Rebut the bull and argue the bear case for {target} over the {timeframe} horizon."
+        rebuttal: "Round {round} of the debate on {target} ({timeframe} horizon): rebut the bull's latest round-{round} argument shown above, point by point, with report evidence. Attack its weakest NEW links — do not restate your earlier rebuttal."
+
+  - id: risk_rotation
+    rounds: ${VIBE_RISK_ROUNDS:-1}      # 1 = today's behavior
+    seed_inputs:                        # the object under debate, given to every seat
+      trader_proposal: task-trader
+    entry_inputs:                       # grounding the opener also reads (transitive dep)
+      research_plan: task-research-plan
+    sink: task-decision
+    participants:
+      - seat: risky_analyst
+        task_id: task-risk-aggressive
+        summary_key: aggressive_argument
+        opener: "Critique the trader proposal for {target} from the aggressive (risk-seeking) seat."
+        rebuttal: "Round {round}: given the neutral seat's latest adjudication shown above, re-press the strongest aggressive case on {target} — respond to the specific concessions demanded, do not restate your opener."
+      - seat: safe_analyst
+        task_id: task-risk-safe
+        summary_key: conservative_argument
+        opener: "Rebut the aggressive debator and critique the trader proposal for {target} from the conservative seat."
+        rebuttal: "Round {round}: rebut the aggressive seat's latest round-{round} argument on {target} directly — press the uncompensated-risk case with new evidence, do not restate your earlier rebuttal."
+      - seat: neutral_analyst
+        task_id: task-risk-neutral
+        summary_key: risk_adjudication
+        opener: "Adjudicate the risk debate on {target} and list recommended modifications for the PM."
+        rebuttal: "Round {round}: re-adjudicate the {target} risk debate given the latest aggressive and conservative arguments shown above; update your recommended modification list for the PM."
 
 variables:
   - name: target

@@ -31,11 +31,17 @@ def run():
     return build_run_from_preset(PRESET, USER_VARS)
 
 
-def test_preset_loads_and_lists():
+def test_preset_loads_and_lists(run):
     data = load_preset(PRESET)
     assert data["name"] == PRESET
     assert len(data["agents"]) == 13
-    assert len(data["tasks"]) == 13
+    # Phase 4: the bull/bear debate and risk rotation now live under debates:
+    # and are unrolled at build time. The raw YAML declares fewer tasks, but the
+    # built run reproduces the historical 13-task graph when debate envs are
+    # unset (rounds default to 1).
+    assert len(data["tasks"]) == 8
+    assert len(data["debates"]) == 2
+    assert len(run.tasks) == 13
 
 
 def test_dag_is_acyclic_and_debate_is_sequential(run):
