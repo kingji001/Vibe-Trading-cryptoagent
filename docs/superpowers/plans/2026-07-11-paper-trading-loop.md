@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - All changes additive; live-execution stack (`agent/src/live/`, `policy.py`, connectors) untouched
-- Spot long-only v1: Sell/StrongSell with no position = ledger-noted no-op; no shorting
+- Spot long-only v1: Sell/Underweight with no position = ledger-noted no-op; no shorting
 - Never invent a price: fetch failure → no fill, logged, retried next tick
 - Env knobs and defaults exactly as spec §5: `VIBE_PAPER_ENABLED=1`, `VIBE_PAPER_START_CASH=100000`, `VIBE_PAPER_SLIPPAGE_BPS=5`, `VIBE_PAPER_FEE_BPS=10`, `VIBE_PAPER_MAX_POSITIONS=3`, `VIBE_PAPER_MAX_SYMBOL_PCT=25`, `VIBE_PAPER_DEFAULT_SIZE_PCT=10`, `VIBE_PAPER_DEFAULT_STOP_PCT=8`, `VIBE_PAPER_ROOT` override
 - State dir `~/.vibe-trading/paper/` (or `VIBE_PAPER_ROOT`); atomic writes (tmp+rename, same pattern as swarm store)
@@ -41,7 +41,7 @@
 - [ ] Write failing tests: (a) `PortfolioDecision(**old_payload)` without new fields still validates (regression — old submissions must not break); (b) new fields validate: `position_size_pct=125` → ValidationError, `stop_loss="<unavailable>"` → coerced None (mirror existing `_nullish` tests); (c) `append_decision` with a decision carrying the fields writes them into the JSONL entry, and without them writes an entry with NO such keys (byte-shape regression vs existing fixture entries)
 - [ ] Run: `.venv/bin/python -m pytest agent/tests/test_committee_schemas.py agent/tests/test_committee_journal.py -q` — new tests FAIL (unknown field under `extra="forbid"`? NO — fields must be declared; expect AttributeError/KeyError shape)
 - [ ] Implement: add the three optional fields to `PortfolioDecision` with the `_nullish` validator extended to cover them; `position_size_pct: float | None = Field(default=None, ge=0, le=100)`; thread through `append_decision` (only write keys when value is not None)
-- [ ] Amend the PM prompt in `crypto_committee.yaml`: one short paragraph instructing that Buy/StrongBuy decisions SHOULD include `stop_loss`, `take_profit`, `position_size_pct` in the submitted decision, grounded in the trader's proposal and verified snapshot prices; Hold decisions MAY include stop/TP adjustments; never invent — omit when not determinable
+- [ ] Amend the PM prompt in `crypto_committee.yaml`: one short paragraph instructing that Buy/Overweight decisions SHOULD include `stop_loss`, `take_profit`, `position_size_pct` in the submitted decision, grounded in the trader's proposal and verified snapshot prices; Hold decisions MAY include stop/TP adjustments; never invent — omit when not determinable
 - [ ] Run full files: same pytest command → all pass. Also `.venv/bin/python -m pytest agent/tests/test_crypto_committee_preset.py -q` (prompt edit regression)
 - [ ] Commit: `feat(paper): typed execution fields on PortfolioDecision + journal passthrough`
 
