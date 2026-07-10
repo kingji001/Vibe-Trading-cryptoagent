@@ -298,3 +298,112 @@ task with `past_lessons: task-reflection` in `input_from`).
 `research_manager` task too (`agent/src/swarm/presets.py::_inject_lessons_into_manager`),
 for A/B testing whether the debate-judging seat benefits from the same
 lessons the PM sees. Unset/`0` reproduces the current preset graph exactly.
+
+## Final configuration (Phase 7)
+
+This section maps `cfg.md`'s target-state config block onto what's actually
+implemented on this branch, as `agent/.env.example` ships it today (see that
+file for the authoritative, commented, copy-pasteable block — it is already
+assembled with a "MiniMax M3 Token Plan (active)" block at the top of the
+provider section, and a "DeepSeek (rollback path from MiniMax)" block kept
+commented immediately below the other alternate providers as the escape
+hatch called for below). Every var here is verified present in code as of
+this phase.
+
+| Var | Where it's read | Verified default / behavior |
+|---|---|---|
+| `LANGCHAIN_PROVIDER=minimax` | `agent/src/providers/llm.py:build_llm` | Selects the MiniMax branch; Path A (`ChatOpenAIWithReasoning`) vs Path B (`ChatAnthropic`) chosen by `MINIMAX_BASE_URL`. |
+| `LANGCHAIN_MODEL_NAME=MiniMax-M3` | `agent/src/providers/llm_providers.json` | Registry default; pinned by `agent/tests/test_llm_provider_defaults.py`. |
+| `MINIMAX_API_KEY` | `agent/src/providers/capabilities.py` (`api_key_env`) | Subscription Key or pay-as-you-go key. |
+| `MINIMAX_BASE_URL` | `_minimax_base_url` / `_minimax_uses_anthropic_endpoint` (`llm.py:430-447`) | `/v1` (default) → Path A. Containing `/anthropic` (case-insensitive substring match) → Path B, which requires `pip install "vibe-trading-ai[minimax]"` (`langchain-anthropic`) and raises an explicit ImportError with that install hint if missing. |
+| `LANGCHAIN_TEMPERATURE=1.0` | `llm.py` MiniMax temperature clamp (~line 805-812) | **Only self-triggers when temperature is left at the repo's own upstream default of `0.0`** — the clamp promotes `0.0` → `1.0` and *also* sets `top_p=0.95` in that case. Since `.env.example` sets `LANGCHAIN_TEMPERATURE=1.0` explicitly, the clamp branch is not entered for the recommended config: `top_p` is left unset (not forced to `0.95`) and MiniMax's own server-side default (documented as `0.95`) applies. Functionally equivalent for the recommended config, but worth knowing if you ever set `LANGCHAIN_TEMPERATURE` to something other than `0.0` or `1.0` — no clamp applies once temperature is non-zero. |
+| `TIMEOUT_SECONDS=180`, `MAX_RETRIES=4` | Generic LLM client construction | Not MiniMax-specific plumbing; just the recommended values for M3's longer thinking turns. |
+| `MINIMAX_THINKING` (optional; unset = adaptive) | `_minimax_thinking_mode` (`llm.py:450-457`) | `disabled` turns off M3 thinking (quick tier); any other value/unset keeps adaptive (M3 decides per turn). |
+| `MINIMAX_MAX_TOKENS` (optional; default `4096`) | `_build_native_minimax_anthropic` (`llm.py:461-514`) | Path B (Anthropic adapter) only — `max_tokens` is required by that wire format. |
+| `VIBE_LLM_MAX_CONCURRENT=3` | `agent/src/providers/chat.py` (`_resolve_gate_limit`) | Process-wide `BoundedSemaphore`; `0` (default) disables the gate entirely (byte-identical to upstream). 3 matches the MiniMax Token Plan Plus tier's observed concurrent-agent ceiling. |
+| `SWARM_MAX_WORKERS=3` | `agent/src/tools/swarm_tool.py:758` | Per-run thread-pool hint; code default is `4` — `.env.example` recommends `3` to match the gate cap so a single committee run doesn't routinely queue on `VIBE_LLM_MAX_CONCURRENT`. |
+| `VT_STREAM_RETRY_MAX=5`, `VT_STREAM_RETRY_BASE_S=2` | `agent/src/providers/backoff.py` | These are also the code defaults — `.env.example` lists them commented as documentation, not because 5/2 need overriding. |
+| `VIBE_RUN_TOKEN_BUDGET_WARN=3000000` (optional; default `0` = off) | `agent/src/core/token_budget.py` | Observability-only warning, no hard cutoff. |
+| `VIBE_DEEP_MODEL` / `VIBE_QUICK_MODEL` | `agent/src/swarm/presets.py::_resolve_model_name`, consumed by `crypto_committee.yaml` | Unset ⇒ `None` ⇒ every seat falls back to `LANGCHAIN_MODEL_NAME`. Must name a model on the same `LANGCHAIN_PROVIDER`. |
+| `VIBE_COMPACT_MODEL` (optional) | `agent/src/agent/loop.py::AgentLoop._auto_compact` | Not a committee-seat tier — routes context-compaction summarization for *any* agent run, main-agent or swarm. |
+| `VIBE_DEBATE_ROUNDS` / `VIBE_RISK_ROUNDS` (optional; default `1` each) | `agent/src/swarm/presets.py::_resolve_debate_rounds`, `crypto_committee.yaml`'s `debates:` block | Capped at 4; rejected above that at preset-build time. `1`/`1` reproduces the pre-Phase-4 single-pass graph exactly. |
+| `VIBE_COMMITTEE_BENCHMARK=BTC-USDT` (default) | `agent/src/committee/journal.py` (`DEFAULT_BENCHMARK`), `agent/src/tools/committee_journal_tool.py` (`BENCHMARK_ENV`) | Alpha benchmark for the decision journal; always fetched via the loader registry (okx → ccxt) regardless of whether this is explicitly set. |
+| `VIBE_TRADING_ENABLE_SCHEDULER=1` (default off) | `agent/src/api/scheduled_routes.py` | Enables the daily `decision-journal-reflection` job (and any other scheduled-research jobs) at server startup. |
+| `VIBE_LESSONS_TO_MANAGER` (optional; default off) | `agent/src/swarm/presets.py::_inject_lessons_into_manager` | A/B experiment knob, not part of the recommended target state — omitted from `cfg.md`'s block and from `.env.example`'s active lines (documented, commented). |
+
+**`.env.example` coherence check (Phase 7).** `agent/.env.example` was
+inspected end-to-end for the config landed incrementally across Phases 0-6.
+It already assembles a single coherent MiniMax-active block (provider
+selection with Path A/B comments, LLM parameters, concurrency governance,
+model tiering, debate depth, and the learning loop) in one place, with every
+optional var correctly commented out and every default matching the code
+verified above — no duplication, no stale phase-numbered TODOs, no
+conflicting values found. The DeepSeek block is present and commented,
+immediately below the provider alternatives, satisfying the "keep the
+DeepSeek block commented in `.env.example` permanently as the escape hatch"
+requirement below. No changes were needed.
+
+## Transition protocol (DeepSeek → MiniMax)
+
+The committee's own decision journal (`docs/crypto-committee.md#decision-journal--learning-loop`)
+is the instrument for this evaluation — no separate harness is built or
+needed. Four steps:
+
+1. **Freeze two `.env` configs.** A DeepSeek-baseline block (provider =
+   `deepseek`, model = `deepseek-v4-pro`, `VIBE_DEBATE_ROUNDS`/`VIBE_RISK_ROUNDS`
+   unset or matching whatever the baseline period used) and the MiniMax
+   config from the table above. Keep both as literal, copy-pasteable blocks
+   — `agent/.env.example` already keeps the DeepSeek block commented
+   immediately below the MiniMax block for exactly this purpose; do not let
+   the two configs drift by editing one in place.
+2. **Run daily via the Phase 6 scheduler.** Start the server with
+   `VIBE_TRADING_ENABLE_SCHEDULER=1` and register one scheduled-research job
+   per asset in the fixed universe (e.g. `BTC-USDT`, `ETH-USDT`, `SOL-USDT`),
+   each with a daily cron schedule and a prompt that runs the
+   `crypto_committee` swarm on that asset with a consistent `timeframe`
+   (e.g. `"Run the crypto_committee swarm on BTC-USDT for a 72h swing
+   decision."` — the agent calls `run_swarm` itself). Create jobs over REST
+   per the README's "Scheduled research" section, e.g.:
+   ```bash
+   curl -X POST http://localhost:8899/scheduled-runs \
+     -H "Content-Type: application/json" \
+     -d '{"prompt":"Run the crypto_committee swarm on BTC-USDT for a 72h swing decision.","schedule":"0 1 * * *"}'
+   ```
+   Repeat for ETH-USDT and SOL-USDT at staggered times so the LLM gate isn't
+   fighting itself. Run for **10-14 days** on the MiniMax build; if quota
+   allows, alternate-day baseline (DeepSeek) runs on the same universe give
+   a same-window comparison rather than a different-week one.
+3. **Compare metrics from `journal.jsonl` plus operational telemetry.** Per
+   horizon (24h/72h/7d), pull `direction_correct` rate and mean `alpha` for
+   each build from the journal (`decision_journal action=list`, or read
+   `~/.vibe-trading/committee/journal.jsonl` directly — see the [entry
+   format](crypto-committee.md#journal-entry-format-one-json-object-per-line)).
+   Alongside decision quality, track operational health per build: run
+   failures, retry counts (`agent/src/providers/backoff.py`'s retry
+   schedule), 429/`gate_wait_seconds` occurrences
+   (`llm_gate_wait` events, `agent/src/swarm/worker.py`), wall time per run,
+   and tokens/run against the ~5-hour Token Plan window
+   (`VIBE_RUN_TOKEN_BUDGET_WARN` warnings, if any fired).
+4. **Cut over when both hold:** the MiniMax build is *operationally clean*
+   (zero failed runs in the last 5 days of the window) **and** decision
+   quality is statistically indistinguishable-or-better than the DeepSeek
+   baseline over the same window. Cutover is deploying the MiniMax `.env`
+   block as the new default. **Rollback is a pure `.env` swap** — restore
+   the DeepSeek block (still commented in `agent/.env.example`, kept there
+   permanently as the escape hatch) and restart; no code changes are
+   involved either direction.
+
+**Honest caveat.** 10-14 daily decisions per asset is an **operational smoke
+test, not statistical proof of decision quality** — n is tiny (roughly 10-14
+per asset, 30-42 across a 3-asset universe) and crypto is noisy; a handful of
+lucky or unlucky calls can swing `direction_correct` rate and mean alpha well
+outside what a larger sample would show, and neither build's week-two
+numbers are a verdict on the underlying model's trading judgment. What this
+window *does* establish reliably is operational health (does the MiniMax
+integration run cleanly under real daily load — throttling, retries, context
+length, reasoning replay across turns) and whether the journal mechanism
+itself is functioning (decisions appended, horizons resolving, reflections
+written). Treat the journal as what it is: a way to make decision quality
+*observable over time*, not a one-shot verdict after two weeks. If a cutover
+decision is made on this window, keep collecting journal data afterward and
+revisit the comparison once a materially larger sample has accrued.
