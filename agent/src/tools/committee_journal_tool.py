@@ -46,12 +46,13 @@ def _derive_run_id(run_dir: Any) -> str | None:
     The swarm worker injects only ``run_dir`` (``.swarm/runs/<run_id>/...``),
     never ``run_id``. Without a run_id the journal's (run_id, symbol)
     idempotency can't fire, so a retried PM task re-appends and the paper hook
-    buys again. Pull the id defensively from the path segment after ``runs``;
-    return None when it isn't derivable.
+    buys again. Anchored to the ``.swarm/runs/`` segment — a checkout path that
+    merely contains ``/runs/`` must not match (it would derive a constant wrong
+    run_id and silently dedupe across runs). None when not derivable.
     """
     if not run_dir:
         return None
-    match = re.search(r"[\\/]runs[\\/]([^\\/]+)", str(run_dir))
+    match = re.search(r"\.swarm[\\/]runs[\\/]([^\\/]+)", str(run_dir))
     return match.group(1) if match else None
 
 

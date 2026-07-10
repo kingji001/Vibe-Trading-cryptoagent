@@ -297,11 +297,14 @@ TP, fraction 1.0).
 duplicate journal append) is skipped — if the ledger has ANY row with that
 `decision_id`, with one exception: rows recording "price unavailable — not
 executed" are retriable (a price-fetch failure never fills, so it must not
-permanently block the decision). Every other outcome is final and never
-retried, including **mandate-rejected decisions** (max positions / symbol
-exposure cap) and **sell-with-no-position noops** — a decision rejected by a
-mandate does NOT get retried automatically later when a position slot frees
-up; a fresh decision is needed.
+permanently block the decision). Retriable decisions are actively re-driven by
+the daily tick: `run_tick` re-runs any decision whose only ledger rows are
+retriable noops, for up to **7 days** after `decided_at` (older ones are left
+alone), reporting the outcomes under `retried_decisions`. Every other outcome
+is final and never retried, including **mandate-rejected decisions** (max
+positions / symbol exposure cap) and **sell-with-no-position noops** — a
+decision rejected by a mandate does NOT get retried automatically later when a
+position slot frees up; a fresh decision is needed.
 
 ### Fill math (binding)
 
@@ -363,6 +366,15 @@ Under `~/.vibe-trading/paper/` (override: `VIBE_PAPER_ROOT`), atomic writes
 | `VIBE_PAPER_DEFAULT_SIZE_PCT` | `10` | Entry size (% of equity) when a decision omits `position_size_pct`. |
 | `VIBE_PAPER_DEFAULT_STOP_PCT` | `8` | Stop distance (% below fill) when a decision omits `stop_loss`. |
 | `VIBE_PAPER_ROOT` | `~/.vibe-trading/paper` | State-dir override (used by tests). |
+
+Note that disabling `VIBE_PAPER_ENABLED` **freezes** existing positions:
+stops/take-profits are not evaluated while the switch is off (no conditional
+fills, no mark-to-market), not just new trades blocked.
+
+One further mandate is always on (no env knob): a **cash floor** — buys are
+clamped to available cash net of fee (ledger note `"clamped to available
+cash"`), and a buy with zero/negative cash is rejected outright, so cash can
+never go negative.
 
 ### PnL-aware reflection
 

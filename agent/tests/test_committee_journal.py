@@ -320,6 +320,20 @@ def test_tool_append_derives_run_id_from_run_dir(jtool, jpath, monkeypatch):
     assert out["entry"]["run_id"] == "run-abc123"
 
 
+def test_derive_run_id_anchored_to_swarm_runs_segment():
+    """Post-review polish: a checkout path containing a bare /runs/ segment
+    must not poison the derivation (a constant wrong run_id would silently
+    dedupe across runs) — the regex anchors to `.swarm/runs/`."""
+    from src.tools.committee_journal_tool import _derive_run_id
+
+    poisoned = "/home/user/runs/checkout/.swarm/runs/run-x/artifacts/pm"
+    assert _derive_run_id(poisoned) == "run-x"
+    # no .swarm/runs segment at all -> None, never the bare /runs/ match
+    assert _derive_run_id("/home/user/runs/checkout/artifacts/pm") is None
+    assert _derive_run_id(None) is None
+    assert _derive_run_id("") is None
+
+
 def test_tool_append_explicit_run_id_wins_over_run_dir(jtool, jpath, monkeypatch):
     monkeypatch.setenv("VIBE_PAPER_ENABLED", "")
     out = json.loads(

@@ -113,11 +113,10 @@ def _ensure_decision_journal_job(store) -> None:
 # trading itself is enabled (``VIBE_PAPER_ENABLED``, same kill-switch rule as
 # the rest of the paper package — unset means enabled). A user who disables
 # paper trading after the job was already registered keeps the (now inert)
-# job — ``paper_tick`` simply calls ``run_tick`` which is unaffected by the
-# executor kill switch (that switch only gates the translator's execution
-# hook, Task 4/5's ``maybe_execute_paper``) — so the tick still marks
-# existing positions to market; only the journal-append hook actually stops
-# opening new trades.
+# job — ``paper_tick`` calls ``run_tick``, which itself honors the kill
+# switch and no-ops fast with a disabled marker. Disabling therefore FREEZES
+# existing positions: no conditional stop/TP evaluation, no mark-to-market
+# snapshot, and no new trades, until the switch is turned back on.
 # ---------------------------------------------------------------------------
 
 PAPER_TICK_JOB_ID = "paper-trading-tick"
