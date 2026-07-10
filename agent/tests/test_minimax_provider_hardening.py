@@ -155,25 +155,11 @@ def test_minimax_reasoning_captured_from_reasoning_details() -> None:
     assert msg.additional_kwargs["reasoning_content"] == "STEP-1 then STEP-2"
 
 
-def test_minimax_reasoning_replayed_on_turn_2_as_reasoning_details() -> None:
-    """Turn-1 reasoning must be re-attached to the assistant turn on turn 2.
-
-    Simulates the ReAct loop: a streamed turn-1 assistant message carries
-    reasoning (captured into ``reasoning_content``); the loop replays it via
-    ``format_assistant_tool_calls``; the next request payload must re-emit it
-    under M3's ``reasoning_details`` field so the model does not re-derive its
-    chain of thought from scratch.
-    """
+def _minimax_replay_payload(reasoning) -> dict:
+    """Run a two-turn ReAct history through the real request serializer."""
     llm = ChatOpenAIWithReasoning(
         model="MiniMax-M3", api_key="mm-key", vibe_provider="minimax"
     )
-
-    # Turn 1: a mocked stream delta from M3 carrying reasoning_details.
-    turn1_chunk = SimpleNamespace(additional_kwargs={})
-    llm._capture({"reasoning_details": "chain-of-thought-A"}, turn1_chunk)
-    reasoning = turn1_chunk.additional_kwargs["reasoning_content"]
-
-    # Loop replays the assistant turn (with tool calls + reasoning) into history.
     tool_call = ToolCallRequest(id="call_1", name="get_time", arguments={})
     assistant_message = ContextBuilder.format_assistant_tool_calls(
         [tool_call], content="", reasoning_content=reasoning
@@ -183,11 +169,61 @@ def test_minimax_reasoning_replayed_on_turn_2_as_reasoning_details() -> None:
         assistant_message,
         {"role": "tool", "tool_call_id": "call_1", "name": "get_time", "content": "12:00Z"},
     ]
-
     payload = llm._get_request_payload(history)
-    assistant = next(m for m in payload["messages"] if m.get("role") == "assistant")
+    return next(m for m in payload["messages"] if m.get("role") == "assistant")
 
-    assert assistant["reasoning_details"] == "chain-of-thought-A"
+
+def test_minimax_reasoning_replayed_on_turn_2_as_typed_list() -> None:
+    """Turn-1 string reasoning must be replayed as a typed reasoning_details list.
+
+    Live testing (api.minimaxi.com/v1, MiniMax-M3, reasoning_split=True) showed
+    the server rejects a plain string under ``reasoning_details`` with a 400
+    ``Mismatch type []*open_platform_oai.ReasoningDetail``; the accepted replay
+    shape is a list of ``{"type": "reasoning.text", "text": ...}`` objects.
+    """
+    llm = ChatOpenAIWithReasoning(
+        model="MiniMax-M3", api_key="mm-key", vibe_provider="minimax"
+    )
+
+    # Turn 1: a mocked stream delta from M3 carrying string reasoning.
+    turn1_chunk = SimpleNamespace(additional_kwargs={})
+    llm._capture({"reasoning_content": "chain-of-thought-A"}, turn1_chunk)
+    reasoning = turn1_chunk.additional_kwargs["reasoning_content"]
+
+    assistant = _minimax_replay_payload(reasoning)
+
+    assert assistant["reasoning_details"] == [
+        {"type": "reasoning.text", "text": "chain-of-thought-A"}
+    ]
+    assert "reasoning_content" not in assistant
+
+
+def test_minimax_list_reasoning_details_replayed_verbatim() -> None:
+    """A captured reasoning_details LIST (M3's native shape) replays as-is."""
+    native_list = [
+        {
+            "type": "reasoning.text",
+            "id": "reasoning-text-1",
+            "format": "MiniMax-response-v1",
+            "index": 0,
+            "text": "chain-of-thought-B",
+        }
+    ]
+    assistant = _minimax_replay_payload(native_list)
+
+    assert assistant["reasoning_details"] == native_list
+    assert "reasoning_content" not in assistant
+
+
+def test_minimax_no_reasoning_turn_omits_reasoning_details() -> None:
+    """An assistant turn without reasoning must NOT send reasoning_details.
+
+    Live testing showed ``reasoning_details: ""`` is also rejected with a 400;
+    the key must be omitted entirely on no-reasoning turns.
+    """
+    assistant = _minimax_replay_payload(None)
+
+    assert "reasoning_details" not in assistant
     assert "reasoning_content" not in assistant
 
 

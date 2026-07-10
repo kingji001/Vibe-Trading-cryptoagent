@@ -81,6 +81,19 @@ This environment has no `MINIMAX_API_KEY`, so the live probes in section
 
 ## Known limitations (Phase 1)
 
+- **Path A reasoning wire shape: RESOLVED by live testing** (api.minimaxi.com/v1,
+  MiniMax-M3, `reasoning_split=True`). Responses carry BOTH `reasoning_content`
+  (plain string) and `reasoning_details` (a list of typed objects:
+  `[{"type": "reasoning.text", "id": "reasoning-text-1",
+  "format": "MiniMax-response-v1", "index": 0, "text": "..."}]`), in both
+  non-stream and stream deltas. On replay the server accepts a string under
+  `reasoning_content`, a wrapped list `[{"type": "reasoning.text", "text": ...}]`
+  under `reasoning_details`, or the verbatim response list — but rejects a plain
+  string **or an empty string** under `reasoning_details` with a 400
+  `Mismatch type []*open_platform_oai.ReasoningDetail`. Our adapter therefore
+  replays string reasoning wrapped as `[{"type": "reasoning.text", "text": <str>}]`,
+  replays a captured list verbatim, and omits `reasoning_details` entirely on
+  turns with no reasoning.
 - **Path B reasoning round-trip is unimplemented/unverified.** Phase 1's Path B
   (`MINIMAX_BASE_URL` containing `/anthropic`) constructs a stock
   `langchain-anthropic` `ChatAnthropic` client, but the ReAct loop replays

@@ -279,10 +279,21 @@ if ChatOpenAI is not None:
                 if caps.send_reasoning_content:
                     reasoning = source_message.additional_kwargs.get("reasoning_content", "")
                     if caps.reasoning_split_extra_body:
-                        # MiniMax M3 expects the reasoning replayed under its own
-                        # ``reasoning_details`` field, not ``reasoning_content``.
-                        m["reasoning_details"] = reasoning
+                        # MiniMax M3 expects reasoning replayed under its own
+                        # ``reasoning_details`` field as a TYPED LIST of
+                        # ``{"type": "reasoning.text", "text": ...}`` objects.
+                        # Live-verified (api.minimaxi.com/v1): a plain or empty
+                        # string is rejected with 400 "Mismatch type
+                        # []*open_platform_oai.ReasoningDetail"; on turns with
+                        # no reasoning the key must be omitted entirely.
                         m.pop("reasoning_content", None)
+                        m.pop("reasoning_details", None)
+                        if reasoning and isinstance(reasoning, list):
+                            m["reasoning_details"] = reasoning
+                        elif reasoning:
+                            m["reasoning_details"] = [
+                                {"type": "reasoning.text", "text": reasoning}
+                            ]
                     else:
                         m["reasoning_content"] = reasoning
                 else:
