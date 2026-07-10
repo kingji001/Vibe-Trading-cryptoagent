@@ -77,12 +77,18 @@ in the journal entry plus its `decision_id`/`id`). Mapping (spot long-only):
 | Hold | no entry | apply stop/TP adjustments from the decision's typed risk fields (stop level, TP levels/fractions); absent → leave unchanged |
 | Sell / StrongSell | no-op (no shorting in v1) | close full position (StrongSell) / half (Sell) at market |
 
-- The translator reads ONLY typed fields from the decision schema
-  (`agent/src/committee/schemas.py` — e.g. entry/stop/target fields on
-  TraderProposal/PortfolioDecision as journaled). It never parses free prose.
-  If a typed field is absent, the documented default applies. A survey of the
-  actual journaled fields is Task 1 of the implementation plan; the mapping
-  above binds to whatever the schema actually carries.
+- **Schema reality (surveyed 2026-07-11):** journaled entries carry only
+  `rating`, `price_target`, `time_horizon` — no stop or sizing. Therefore
+  `PortfolioDecision` gains OPTIONAL typed execution fields (additive; old
+  payloads stay valid): `stop_loss: float|None`, `take_profit: float|None`,
+  `position_size_pct: float|None (0–100)`. `append_decision` passes them
+  through as optional entry keys (JSONL tolerates extra keys; resolution
+  logic and idempotency are untouched). The PM prompt is amended minimally to
+  request them on Buy/Sell decisions.
+- The translator reads ONLY these typed fields; it never parses free prose.
+  Defaults when absent: TP ← `price_target`; stop ← entry ×
+  (1 − `VIBE_PAPER_DEFAULT_STOP_PCT`/100) (default 8); size ←
+  `VIBE_PAPER_DEFAULT_SIZE_PCT` (default 10).
 - Idempotency: `(decision_id)` is unique in the ledger — the executor refuses
   to act twice on the same decision (a re-run of the hook is a no-op).
 
