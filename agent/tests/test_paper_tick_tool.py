@@ -65,6 +65,18 @@ def test_execute_no_params_required(monkeypatch):
     assert out["fills"] == 0
 
 
+def test_execute_disabled_returns_disabled_marker(monkeypatch):
+    """Final review cleanup 1: the tool surfaces run_tick's disabled marker."""
+    monkeypatch.setattr(
+        "src.paper.tick.run_tick",
+        lambda: {"conditional_fills": [], "equity_snapshot": {}, "errors": [],
+                 "notes": [], "retried_decisions": [], "disabled": True},
+    )
+    tool = PaperTickTool()
+    out = json.loads(tool.execute())
+    assert out["status"] == "disabled"
+
+
 def test_execute_catches_run_tick_exception(monkeypatch):
     def boom():
         raise RuntimeError("tick blew up")

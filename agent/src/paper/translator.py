@@ -195,8 +195,15 @@ def _buy_or_add(
         ]
 
     if stop_loss is None:
-        default_stop = result["fill_price"] * (1 - broker.config.default_stop_pct / 100.0)
-        broker.set_risk(symbol, stop=default_stop, take_profit=None)
+        # Only apply the default stop when the position has NO stop yet (a fresh
+        # open, or an add onto a stopless position). An add onto a position that
+        # already carries a stop keeps it (review cleanup 3) — an explicit
+        # stop_loss still always applies via market_buy above.
+        positions = broker.store.load_positions()
+        pos = _find_position(positions, symbol)
+        if pos is not None and pos.get("stop") is None:
+            default_stop = result["fill_price"] * (1 - broker.config.default_stop_pct / 100.0)
+            broker.set_risk(symbol, stop=default_stop, take_profit=None)
 
     return [result]
 

@@ -222,6 +222,30 @@ def test_buy_no_position_default_sizing_and_stop(broker):
     assert pos["take_profits"] == []  # no take_profit, no price_target
 
 
+def test_buy_position_size_pct_zero_is_noop_no_position(broker):
+    """Final review C1/M3: a zero-pct Buy sizes to notional 0 -> broker raises
+    MandateViolation -> translator records a noop and opens NO position (no
+    slot-squatting, no zero-qty row)."""
+    entry = _decision("Buy", id="dec_zero", position_size_pct=0)
+    result = execute_decision(entry, broker)
+
+    assert result["skipped"] is None
+    assert len(result["actions"]) == 1
+    assert result["actions"][0]["order_type"] == "noop"
+    assert broker.store.load_positions() == []
+
+
+def test_add_preserves_existing_stop_when_no_typed_stop(broker):
+    """Final review cleanup 3: adding to a position that already has a stop,
+    with no typed stop_loss, preserves the existing stop (no default override)."""
+    _seed_position(broker.store, stop=90.0)
+    entry = _decision("Buy", id="dec_add_stop", symbol="BTC-USDT")
+    execute_decision(entry, broker)
+
+    pos = broker.store.load_positions()[0]
+    assert pos["stop"] == pytest.approx(90.0, abs=ABS)
+
+
 def test_overweight_no_position_half_sizing(broker):
     entry = _decision("Overweight", id="dec_2")
     execute_decision(entry, broker)

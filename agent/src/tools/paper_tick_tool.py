@@ -50,6 +50,14 @@ class PaperTickTool(BaseTool):
         except Exception as exc:
             return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
 
+        # Review cleanup 1: run_tick no-ops fast when the kill switch is off;
+        # surface a disabled marker rather than an empty ok summary.
+        if result.get("disabled"):
+            return json.dumps(
+                {"status": "disabled", "reason": "VIBE_PAPER_ENABLED is off"},
+                ensure_ascii=False,
+            )
+
         equity = result.get("equity_snapshot") or {}
         summary = {
             "status": "ok",

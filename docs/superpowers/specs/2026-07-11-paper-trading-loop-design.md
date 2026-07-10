@@ -62,9 +62,9 @@ Rules:
 Mandates enforced in the broker (hard, code-level):
 - max open positions: `VIBE_PAPER_MAX_POSITIONS` (default 3)
 - max capital per symbol: `VIBE_PAPER_MAX_SYMBOL_PCT` (default 25, percent)
-- kill switch: `VIBE_PAPER_ENABLED` (default **1** on this branch; the executor
-  hook additionally no-ops when the account doesn't exist and
-  `VIBE_PAPER_AUTOCREATE=0`)
+- kill switch: `VIBE_PAPER_ENABLED` (default **1** on this branch). The falsy
+  set is exactly `{"0", "false", ""}` (case-insensitive), so values like
+  `"off"` / `"no"` still enable.
 
 ### 3.2 `agent/src/paper/translator.py` — decision → orders
 
