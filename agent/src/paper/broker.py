@@ -113,6 +113,16 @@ def _utc_now_iso() -> str:
     )
 
 
+def _fmt_ts(value: object) -> str:
+    """Normalize a bar's ``ts`` (datetime or string) to an ISO-8601 UTC string."""
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
+    return str(value)
+
+
 # --------------------------------------------------------------------------- #
 # Broker                                                                        #
 # --------------------------------------------------------------------------- #
@@ -264,6 +274,49 @@ class PaperBroker:
         quote = self.price_fn(symbol)  # raises PriceUnavailable -> no state change
         price = float(quote["price"])
         sell_fill = self._sell_fill(price)
+        return self._execute_sell(
+            symbol,
+            fraction,
+            fill_price=sell_fill,
+            ref_price=price,
+            decision_id=decision_id,
+            reason=reason,
+            order_type="market",
+            ts=quote["ts"],
+        )
+
+    # -- shared sell persistence path (market + conditional fills) ---------- #
+    def _execute_sell(
+        self,
+        symbol: str,
+        fraction: float,
+        *,
+        fill_price: float,
+        ref_price: float,
+        decision_id: str | None,
+        reason: str | None,
+        order_type: str,
+        ts: str,
+    ) -> dict | None:
+        """Persist a sell of ``fraction`` of the held ``symbol`` at ``fill_price``.
+
+        Shared by ``market_sell`` (fill_price = live price with slippage,
+        ``ref_price`` = the raw pre-slippage price) and
+        ``evaluate_conditionals`` (fill_price = the triggered stop/TP price,
+        ``ref_price == fill_price`` so ``slippage_paid`` is exactly 0 — bar
+        prices are already conservative, per globals.md). Fee always applies.
+
+        Returns ``None`` when there is no held position. Same non-atomic-window
+        invariant/order as the historical ``market_sell``: on a SELL the
+        position reduction persists BEFORE the cash credit (positions ->
+        account -> ledger) — a crash leaves a shrunk position without the
+        cash credit (conservative), never credited cash plus a still-live
+        position (double-count).
+        """
+        positions = self.store.load_positions()
+        held = self._find(positions, symbol)
+        if held is None:
+            return None
 
         # A position exists, so an account necessarily exists already; this is
         # a no-op load in practice (account creation stays deferred to the
@@ -272,10 +325,10 @@ class PaperBroker:
 
         qty_sold = held["qty"] * float(fraction)
         avg_entry = held["avg_entry"]
-        sell_notional = qty_sold * sell_fill
+        sell_notional = qty_sold * fill_price
         sell_fee = self._fee(sell_notional)
-        realized_pnl = (sell_fill - avg_entry) * qty_sold - sell_fee
-        slippage_paid = qty_sold * (price - sell_fill)
+        realized_pnl = (fill_price - avg_entry) * qty_sold - sell_fee
+        slippage_paid = qty_sold * (ref_price - fill_price)
 
         account["cash"] = account["cash"] + sell_notional - sell_fee
         remaining = held["qty"] - qty_sold
@@ -285,28 +338,105 @@ class PaperBroker:
             held["qty"] = remaining
 
         entry = {
-            "ts": quote["ts"],
+            "ts": ts,
             "trade_id": uuid.uuid4().hex,
             "symbol": symbol,
             "side": "sell",
             "qty": qty_sold,
-            "fill_price": sell_fill,
+            "fill_price": fill_price,
             "slippage_paid": slippage_paid,
             "fee_paid": sell_fee,
-            "order_type": "market",
+            "order_type": order_type,
             "decision_id": decision_id,
             "realized_pnl": realized_pnl,
             "note": reason,
         }
-        # Same non-atomic window as market_buy, same invariant (never persist
-        # a state richer than reality), OPPOSITE order: on a SELL the position
-        # reduction goes first (positions -> account -> ledger). A crash then
-        # leaves a shrunk position without the cash credit (conservative),
-        # never credited cash plus a still-live position (double-count).
         self.store.save_positions(positions)
         self.store.save_account(account)
         self.store.append_ledger(entry)
         return entry
+
+    # -- conditional orders (stop / take-profit), evaluated on the daily tick #
+    def evaluate_conditionals(self, symbol: str, bar: dict) -> list[dict]:
+        """Evaluate stop/take-profit triggers for ``symbol`` against one daily
+        ``bar`` (``{"open", "high", "low", "close", "ts"}``) and execute fills.
+
+        Binding fill rules (t3 brief / design spec §3.1):
+          - stop triggers when ``bar["low"] <= stop``; fills at ``bar["open"]``
+            if the bar gapped through (``open <= stop``), else at the stop
+            price.
+          - each take-profit ``{"price", "fraction"}`` triggers when
+            ``bar["high"] >= price``; fills at ``price``, or at ``bar["open"]``
+            if the bar gapped above (``open >= price``).
+          - stop AND any TP inside the same bar -> stop wins (worse outcome):
+            TPs are skipped entirely and the position is closed in full at
+            the stop fill.
+          - no slippage on conditional fills (bar prices are already
+            conservative); fee still applies, via ``_execute_sell``.
+
+        Executed take-profits are removed from the position's
+        ``take_profits`` list (untriggered ones are preserved) so a same-day
+        re-tick against the same bar cannot refill them. Returns the list of
+        executed ledger entries — empty if nothing triggered or the symbol
+        isn't held.
+        """
+        positions = self.store.load_positions()
+        held = self._find(positions, symbol)
+        if held is None:
+            return []
+
+        open_ = float(bar["open"])
+        high = float(bar["high"])
+        low = float(bar["low"])
+        ts = _fmt_ts(bar.get("ts"))
+        decision_id = held.get("decision_id")
+
+        stop = held.get("stop")
+        if stop is not None and low <= stop:
+            fill_price = open_ if open_ <= stop else stop
+            entry = self._execute_sell(
+                symbol,
+                1.0,
+                fill_price=fill_price,
+                ref_price=fill_price,
+                decision_id=decision_id,
+                reason=f"stop triggered @ {stop}",
+                order_type="stop",
+                ts=ts,
+            )
+            return [entry] if entry else []
+
+        fills: list[dict] = []
+        remaining_tps: list[dict] = []
+        triggered = False
+        for tp in held.get("take_profits") or []:
+            tp_price = float(tp["price"])
+            if high >= tp_price:
+                triggered = True
+                fill_price = open_ if open_ >= tp_price else tp_price
+                entry = self._execute_sell(
+                    symbol,
+                    float(tp["fraction"]),
+                    fill_price=fill_price,
+                    ref_price=fill_price,
+                    decision_id=decision_id,
+                    reason=f"take_profit triggered @ {tp_price}",
+                    order_type="take_profit",
+                    ts=ts,
+                )
+                if entry:
+                    fills.append(entry)
+            else:
+                remaining_tps.append(tp)
+
+        if triggered:
+            positions = self.store.load_positions()
+            held = self._find(positions, symbol)
+            if held is not None:
+                held["take_profits"] = remaining_tps
+                self.store.save_positions(positions)
+
+        return fills
 
     # -- risk management ---------------------------------------------------- #
     def set_risk(
