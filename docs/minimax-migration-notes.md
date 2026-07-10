@@ -324,6 +324,15 @@ task with `past_lessons: task-reflection` in `input_from`).
 for A/B testing whether the debate-judging seat benefits from the same
 lessons the PM sees. Unset/`0` reproduces the current preset graph exactly.
 
+**Paper-trading loop (builds on this scheduler wiring).** A later branch
+(`feat/paper-trading-loop`) reuses the exact same scheduled-research
+store/executor plumbing above to register a second daily job
+(`paper-trading-tick`, 00:30 UTC) that drives paper-trade mark-to-market and
+conditional stop/take-profit orders — see
+[crypto-committee.md, "Paper-trading loop"](crypto-committee.md#paper-trading-loop)
+for the full committee-decision → paper-broker → ledger → PnL-aware-reflection
+picture and the `VIBE_PAPER_*` config reference.
+
 ## Final configuration (Phase 7)
 
 This section maps `cfg.md`'s target-state config block onto what's actually

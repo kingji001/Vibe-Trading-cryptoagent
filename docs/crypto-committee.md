@@ -229,6 +229,202 @@ not just the portfolio manager — TradingAgents deliberately restricts
 memory context to the PM, so this is an opt-in A/B experiment, not the
 default wiring.
 
+## Paper-trading loop
+
+Closes the loop from committee decision to executed (paper) trade to
+money-graded reflection: "direction was right but the stop was too tight"
+becomes a learnable lesson, not just a directional grade. Everything below is
+additive to the decision journal — the journal's own schema, resolution
+logic, and idempotency key are untouched; a new package,
+`agent/src/paper/`, holds a deterministic, LLM-free portfolio engine
+(no credentials, no real orders — the live-execution stack in
+`agent/src/live/` and `policy.py` is completely separate and untouched).
+
+### End-to-end flow
+
+```
+committee (portfolio_manager decision)
+  -> decision_journal action=append               (agent/src/tools/committee_journal_tool.py)
+  -> maybe_execute_paper(entry)                    (agent/src/paper/hook.py, called from the
+                                                     append success path — never fails the
+                                                     committee run, any exception is caught
+                                                     and returned as {"error": ...})
+       -> execute_decision(entry, broker)          (agent/src/paper/translator.py)
+            -> PaperBroker.market_buy / market_sell (agent/src/paper/broker.py)
+            -> PaperStore.append_ledger(...)         (agent/src/paper/store.py, ledger.jsonl)
+
+scheduled "paper-trading-tick" job, 00:30 UTC        (agent/src/api/scheduled_routes.py,
+  (double-gated: VIBE_TRADING_ENABLE_SCHEDULER=1      registered idempotently at server
+   AND paper trading itself enabled)                  startup, after the 00:00 UTC
+  -> paper_tick tool (no params)                      decision-journal reflection job)
+       -> run_tick()                                (agent/src/paper/tick.py)
+            -> PaperBroker.evaluate_conditionals(...)  (stop/take-profit checks against
+                                                         the latest confirmed daily bar)
+            -> PaperBroker.equity(...)                 (mark-to-market)
+            -> PaperStore.append_equity(...)           (equity.jsonl, one row/UTC day)
+
+reflection_officer seat (next committee run, or the daily reflection job)
+  -> decision_journal action=pnl (decision_id or symbol)
+       -> decision_pnl(...)                         (agent/src/paper/pnl.py)
+       -> compact summary block quoted into the reflection prompt
+```
+
+Also runnable by hand: `vibe-trading paper tick` (see CLI section below) runs
+exactly the same `run_tick()` the scheduled job calls.
+
+### Decision -> order translation
+
+`agent/src/paper/translator.py::execute_decision` reads ONLY typed fields on
+the journaled entry — `stop_loss`, `take_profit`, `position_size_pct`
+(optional, additive fields on `PortfolioDecision`; absent on legacy entries) —
+never free prose. Rating -> action (spot long-only; the real 5-tier enum is
+`Buy | Overweight | Hold | Underweight | Sell` per
+`committee/schemas.py::parse_rating`):
+
+| Rating | No position | Existing long position |
+|---|---|---|
+| Buy | open long, sized `position_size_pct`% of current equity (default `VIBE_PAPER_DEFAULT_SIZE_PCT`, 10%) | add, same sizing rule, capped by the symbol-exposure mandate |
+| Overweight | open at HALF the Buy sizing | add at half sizing, same cap |
+| Hold | no entry | apply any provided typed `stop_loss`/`take_profit`; `price_target` is NOT used as a TP fallback for Hold — a Hold that only carries `price_target` is a pure no-op |
+| Underweight | ledger noop (`"sell signal with no position"`) — no shorting | reduce the position by half at market |
+| Sell | ledger noop (`"sell signal with no position"`) — no shorting | close the full position at market |
+
+Stop/TP defaults when the typed fields are absent: stop ← fill price ×
+`(1 - VIBE_PAPER_DEFAULT_STOP_PCT/100)`; take-profit ← `price_target` (single
+TP, fraction 1.0).
+
+**Idempotency:** a decision is "already executed" — and a repeat call (e.g. a
+duplicate journal append) is skipped — if the ledger has ANY row with that
+`decision_id`, with one exception: rows recording "price unavailable — not
+executed" are retriable (a price-fetch failure never fills, so it must not
+permanently block the decision). Every other outcome is final and never
+retried, including **mandate-rejected decisions** (max positions / symbol
+exposure cap) and **sell-with-no-position noops** — a decision rejected by a
+mandate does NOT get retried automatically later when a position slot frees
+up; a fresh decision is needed.
+
+### Fill math (binding)
+
+```
+buy fill  = price * (1 + VIBE_PAPER_SLIPPAGE_BPS/10000)
+sell fill = price * (1 - VIBE_PAPER_SLIPPAGE_BPS/10000)
+fee       = fill_notional * VIBE_PAPER_FEE_BPS/10000        (deducted from cash on both sides)
+```
+
+Conditional orders (stop / take-profit), evaluated once per UTC day against
+the latest confirmed daily OHLC bar:
+
+- no slippage on conditional fills (bar prices are already conservative) —
+  fee still applies;
+- a bar that gaps THROUGH a stop fills at the bar's OPEN, not the stop price
+  (worse for the trader, never invents a better fill than what actually
+  happened);
+- a stop AND a take-profit inside the same bar → the stop wins (the
+  conservative, worse outcome) — the take-profit is skipped entirely and the
+  position closes in full at the stop fill;
+- each take-profit's `fraction` applies to the position's REMAINING qty at
+  the time it triggers, not the original entry qty — so a TP ladder (e.g.
+  50% then 50%) sells half of whatever is still held at each step, not half
+  of the original size twice.
+
+### State files
+
+Under `~/.vibe-trading/paper/` (override: `VIBE_PAPER_ROOT`), atomic writes
+(tmp + `os.replace`, matching `src/swarm/task_store.py`'s pattern):
+
+- `account.json` — cash, created_at, a config snapshot taken at account
+  creation (fees/slippage settings don't retroactively change an existing
+  account — only `paper reset` picks up new values).
+- `positions.json` — open positions: symbol, qty, avg_entry, stop,
+  take_profits (list of `{price, fraction}`), opened_at, decision_id (the id
+  of whichever decision most recently opened the position from flat).
+- `ledger.jsonl` — append-only fills AND noop rows: ts, symbol, side, qty,
+  fill_price, slippage_paid, fee_paid, order_type
+  (market/stop/take_profit/noop), decision_id, realized_pnl, trade_id, note.
+- `equity.jsonl` — one row per UTC day: ts, cash, positions_value, equity,
+  per-position marks/unrealized, `stale_positions` count.
+
+### Env knobs
+
+| Var | Default | Meaning |
+|---|---|---|
+| `VIBE_PAPER_ENABLED` | `1` (unset = enabled) | Kill switch for the whole executor. `"0"` / `"false"` / `""` (case-insensitive) disables; anything else enables. Gates the hook/translator only — an already-running daily tick still marks existing positions to market when disabled. |
+| `VIBE_PAPER_START_CASH` | `100000` | Paper USDT at account creation only. |
+| `VIBE_PAPER_SLIPPAGE_BPS` | `5` | Market-fill slippage against the trader (basis points). |
+| `VIBE_PAPER_FEE_BPS` | `10` | Taker fee on notional, both sides. |
+| `VIBE_PAPER_MAX_POSITIONS` | `3` | Mandate: max concurrent open positions. |
+| `VIBE_PAPER_MAX_SYMBOL_PCT` | `25` | Mandate: max % of equity a single symbol may hold; buys are clamped (not rejected) to the remaining headroom, except when headroom is already zero. |
+| `VIBE_PAPER_DEFAULT_SIZE_PCT` | `10` | Entry size (% of equity) when a decision omits `position_size_pct`. |
+| `VIBE_PAPER_DEFAULT_STOP_PCT` | `8` | Stop distance (% below fill) when a decision omits `stop_loss`. |
+| `VIBE_PAPER_ROOT` | `~/.vibe-trading/paper` | State-dir override (used by tests). |
+
+### PnL-aware reflection
+
+`decision_journal action=pnl` (`decision_id` or `symbol`) replays the ledger
+into per-symbol open/close "lineages" (`agent/src/paper/pnl.py`) and returns
+realized PnL, fees paid, current unrealized PnL, max drawdown while held, and
+how the position ended (`stopped` / `took_profit` / `closed_by_sell` /
+`open` / `not_executed`). A few non-obvious behaviors, worth knowing before
+trusting the numbers:
+
+- **PnL is position-lifecycle-wide, not per-decision.** If a later add or a
+  separate Sell/Underweight decision touched the same physical position, its
+  fills are folded into the same lineage and the summary flags this: `note:
+  PnL is position-lifecycle-wide (includes trades under N other decision(s))`.
+  Don't read the reported number as this one decision's marginal quality when
+  that note is present.
+- **`realized_pnl` is net of EXIT fees only** (`(sell_fill - avg_entry) *
+  qty_sold - sell_fee`); the entry-side fee already reduced cash at open and
+  shows up separately in `fees_paid`, not subtracted a second time from
+  `realized_pnl`.
+- A decision whose only ledger rows are noops (mandate-rejected, no-position
+  sell, disabled kill switch) reports `executed: false` /
+  `exit_kind: "not_executed"` — the noop note(s) are folded into the summary
+  text.
+
+### Reading `vibe-trading paper status`
+
+`status` never auto-creates an account (it's read-only) — a missing account
+just prints a hint. When an account exists it shows cash, equity, and mandate
+headroom as `positions used/max` plus the per-symbol exposure cap, then one
+block per open position: qty @ avg entry, mark, unrealized PnL, exposure %
+vs the cap, stop, and take-profit(s). **Stale marks are always shown, never
+hidden**: a position whose live price/latest bar mark isn't available is
+valued at `avg_entry` (zero unrealized) and flagged `[STALE]` inline plus a
+"no live price available" note on the Mark line —
+`PaperBroker.equity()`'s `stale` flag is surfaced verbatim, not silently
+absorbed into the equity total. `paper ledger [--limit N] [--symbol S]`
+lists recent fills (date/symbol/side/qty/fill/fee/PnL/type); rows carrying a
+note (mandate rejections, no-position noops, retriable price-unavailable
+noops) are additionally listed underneath so a rejected decision is visible,
+not just silently absent. `paper tick` runs the daily conditional-order/
+mark-to-market pass immediately (the same `run_tick()` the scheduled job
+calls) and reports fills/equity/stale count/bar-fetch errors. `paper reset`
+refuses without `--confirm` (nonzero exit) — with `--confirm` it archives
+account/positions/ledger/equity into a timestamped `archive-<UTC-stamp>/`
+subdirectory and a fresh account is created on the next trade or tick.
+
+### Honest limits
+
+Read this before treating paper PnL as a strategy backtest:
+
+- **Synthetic fills.** No order book, no partial fills; slippage is a flat
+  basis-point model applied uniformly regardless of size or liquidity. Good
+  enough to grade committee decisions on realistic-ish executed money, not to
+  certify a strategy — the broker interface is deliberately connector-shaped
+  so a real OKX-demo backend can replace the fill simulator later.
+- **Daily-bar approximation for conditional orders.** Stop/take-profit
+  evaluation uses one confirmed daily OHLC bar per UTC day: an intraday touch
+  that reverses by close IS caught (via the bar's low/high), but fill prices
+  are approximations (bar open on a gap, the stop/TP price otherwise) — not
+  the exact intraday price at the moment of the touch.
+- **Long-only v1.** Sell/Underweight signals with no held position are
+  no-shorting no-ops, recorded in the ledger's notes (not silently dropped)
+  so reflection can still see the signal went unused.
+- **Reflection prompt size.** PnL-aware reflection adds one compact block per
+  resolved decision to the reflection officer's prompt — a modest but
+  nonzero token-budget cost.
+
 ## Debate rounds
 
 `agent/src/swarm/presets.py::_expand_debate` unrolls the `debates:` YAML

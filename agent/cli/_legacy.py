@@ -4354,6 +4354,31 @@ def _build_parser() -> argparse.ArgumentParser:
     memory_forget_parser.add_argument("name", help="Memory title or filename stem")
     memory_forget_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
 
+    paper_parser = subparsers.add_parser("paper", help="Inspect/manage the paper-trading account")
+    paper_subparsers = paper_parser.add_subparsers(dest="paper_command")
+
+    paper_subparsers.add_parser(
+        "status", help="Show equity, open positions, and mandate headroom"
+    )
+
+    paper_ledger_parser = paper_subparsers.add_parser("ledger", help="Show recent paper-trading fills")
+    paper_ledger_parser.add_argument(
+        "--limit", dest="paper_limit", type=int, default=20, help="Maximum rows (default: 20)"
+    )
+    paper_ledger_parser.add_argument("--symbol", dest="paper_symbol", help="Filter by symbol")
+
+    paper_subparsers.add_parser(
+        "tick", help="Run the conditional-order/mark-to-market pass now"
+    )
+
+    paper_reset_parser = paper_subparsers.add_parser(
+        "reset", help="Archive the current paper account and start fresh"
+    )
+    paper_reset_parser.add_argument(
+        "--confirm", dest="paper_confirm", action="store_true",
+        help="Required to actually archive + reset (refuses otherwise)",
+    )
+
     connector_parser = subparsers.add_parser("connector", help="Manage trading connector profiles")
     connector_subparsers = connector_parser.add_subparsers(dest="connector_command")
 
@@ -4799,6 +4824,193 @@ def cmd_memory_forget(name: str, *, yes: bool = False, memory_dir: Optional[Path
         return EXIT_SUCCESS
     console.print(f"[red]Failed to remove[/red] {rich_escape(entry.title)}")
     return EXIT_RUN_FAILED
+
+
+def cmd_paper_status() -> int:
+    """Show the paper account's equity, open positions, and mandate headroom.
+
+    Read-only: never auto-creates an account (unlike ``broker.equity()``,
+    which lazily creates one on first call) -- a missing ``account.json``
+    just prints a friendly hint instead.
+    """
+    from src.paper.broker import PaperBroker
+    from src.paper.store import PaperStore, paper_root
+
+    store = PaperStore(paper_root())
+    if store.load_account() is None:
+        console.print(
+            "[dim]No paper account yet.[/dim] It is created automatically the "
+            "first time the committee journals a Buy/Overweight decision (or "
+            "run `vibe-trading paper tick` after seeding a position)."
+        )
+        return EXIT_SUCCESS
+
+    broker = PaperBroker(store)
+    snapshot = broker.equity()
+    positions = store.load_positions()
+    pos_by_symbol = {p["symbol"]: p for p in positions}
+
+    header_lines = [
+        f"Cash: {snapshot['cash']:.2f} USDT   Equity: {snapshot['equity']:.2f} USDT",
+        f"Positions: {len(positions)}/{broker.config.max_positions} "
+        f"(max)   Symbol cap: {broker.config.max_symbol_pct:.0f}% of equity per symbol",
+    ]
+    if snapshot["stale_positions"]:
+        header_lines.append(
+            f"[yellow]{snapshot['stale_positions']} position(s) STALE — no live "
+            f"price available, valued at avg_entry[/yellow]"
+        )
+    console.print(Panel("\n".join(header_lines), title="Paper Account", border_style="cyan"))
+
+    if not positions:
+        console.print("[dim]No open positions.[/dim]")
+        return EXIT_SUCCESS
+
+    # Field/Value table (same idiom as cmd_live_status's mandate block) rather
+    # than a single wide row-per-position table: at up to MAX_POSITIONS (3)
+    # open positions, a narrow terminal truncating the symbol/stop/TP columns
+    # of a 9-column table is a real failure mode (silently hiding exactly the
+    # risk data this command exists to surface) -- indented Field rows never
+    # truncate a value, they wrap it in place.
+    equity_total = snapshot["equity"]
+    table = Table(title="Open Positions", box=box.SIMPLE, show_header=False, show_lines=False)
+    table.add_column("Field", style="cyan", no_wrap=True)
+    table.add_column("Value")
+
+    for row in snapshot["positions"]:
+        pos = pos_by_symbol.get(row["symbol"], {})
+        stop = pos.get("stop")
+        tps = pos.get("take_profits") or []
+        tp_text = (
+            ", ".join(f"{tp['price']:.2f} x{tp['fraction']:.2f}" for tp in tps)
+            if tps
+            else "—"
+        )
+        exposure_pct = (row["value"] / equity_total * 100.0) if equity_total else 0.0
+        cap = broker.config.max_symbol_pct
+        unrl_style = "green" if row["unrealized"] >= 0 else "red"
+        symbol_label = rich_escape(row["symbol"])
+        if row["stale"]:
+            symbol_label += " [yellow][STALE][/yellow]"
+        table.add_row(f"[bold]{symbol_label}[/bold]", "")
+        table.add_row("  Qty / Avg Entry", f"{row['qty']:.8f} @ {row['avg_entry']:.2f}")
+        mark_note = " [yellow](stale — no live price, valued at avg_entry)[/yellow]" if row["stale"] else ""
+        table.add_row("  Mark", f"{row['mark']:.2f}{mark_note}")
+        table.add_row(
+            "  Unrealized", f"[{unrl_style}]{row['unrealized']:.2f}[/{unrl_style}] USDT"
+        )
+        table.add_row("  Exposure", f"{exposure_pct:.1f}% of equity (cap {cap:.0f}%)")
+        table.add_row("  Stop", f"{stop:.2f}" if stop is not None else "—")
+        table.add_row("  Take Profit", rich_escape(tp_text))
+
+    console.print(table)
+    return EXIT_SUCCESS
+
+
+def cmd_paper_ledger(limit: int = 20, symbol: Optional[str] = None) -> int:
+    """Show recent paper-trading ledger fills (most recent last, like the file)."""
+    from src.paper.store import PaperStore, paper_root
+
+    store = PaperStore(paper_root())
+    rows = list(store.iter_ledger())
+    if symbol:
+        rows = [r for r in rows if r.get("symbol") == symbol]
+    if limit:
+        rows = rows[-limit:]
+
+    if not rows:
+        scope = f" symbol={symbol}" if symbol else ""
+        console.print(f"[dim]No ledger entries found{scope}.[/dim]")
+        return EXIT_SUCCESS
+
+    # 8 narrow columns rather than 10: decision_id/note are printed as a
+    # separate compact list below so the Symbol column (load-bearing for
+    # `--symbol` filtering and for spotting mandate-rejected noops) never
+    # gets truncated by rich's column-fitting under a narrow terminal.
+    table = Table(title="Paper Ledger", box=box.SIMPLE_HEAVY, show_lines=False)
+    table.add_column("Date", style="dim")
+    table.add_column("Symbol", style="bold")
+    table.add_column("Side")
+    table.add_column("Qty", justify="right")
+    table.add_column("Fill", justify="right")
+    table.add_column("Fee", justify="right")
+    table.add_column("PnL", justify="right")
+    table.add_column("Type")
+
+    notes: list[tuple[str, str, str, str]] = []
+    for row in rows:
+        realized = row.get("realized_pnl")
+        fill = row.get("fill_price")
+        ts = str(row.get("ts") or "")
+        table.add_row(
+            rich_escape(ts[:10]),
+            rich_escape(str(row.get("symbol", ""))),
+            row.get("side") or "—",
+            f"{row.get('qty', 0.0):.6g}",
+            f"{fill:.2f}" if fill is not None else "—",
+            f"{row.get('fee_paid', 0.0):.2f}",
+            f"{realized:.2f}" if realized is not None else "—",
+            row.get("order_type", ""),
+        )
+        note = row.get("note")
+        if note:
+            notes.append((ts, str(row.get("symbol", "")), str(row.get("decision_id") or ""), str(note)))
+
+    console.print(table)
+    console.print(f"[dim]{len(rows)} entr{'y' if len(rows) == 1 else 'ies'}[/dim]")
+
+    if notes:
+        console.print("[dim]Notes:[/dim]")
+        for ts, sym, decision_id, note in notes:
+            console.print(
+                f"  [dim]{rich_escape(ts)}[/dim] {rich_escape(sym)} "
+                f"(decision={rich_escape(decision_id)}): {rich_escape(note)}"
+            )
+    return EXIT_SUCCESS
+
+
+def cmd_paper_tick() -> int:
+    """Run one paper-trading daily tick now (conditional orders + mark-to-market)."""
+    from src.paper.tick import run_tick
+
+    result = run_tick()
+    equity = result.get("equity_snapshot") or {}
+    fills = result.get("conditional_fills") or []
+    errors = result.get("errors") or []
+
+    console.print(f"[bold]Paper tick[/bold] — {equity.get('date', '')}")
+    console.print(f"Conditional fills: {len(fills)}")
+    console.print(
+        f"Equity: {equity.get('equity', 0.0):.2f} USDT   "
+        f"Cash: {equity.get('cash', 0.0):.2f} USDT   "
+        f"Stale positions: {equity.get('stale_positions', 0)}"
+    )
+    if equity.get("already_recorded"):
+        console.print(
+            "[dim]equity.jsonl snapshot for today already recorded "
+            "(idempotent no-op).[/dim]"
+        )
+    if errors:
+        console.print("[red]Bar-fetch errors (position left untouched, retried next tick):[/red]")
+        for err in errors:
+            console.print(f"  [red]{rich_escape(str(err.get('symbol')))}[/red]: {rich_escape(str(err.get('error')))}")
+    return EXIT_SUCCESS
+
+
+def cmd_paper_reset(*, confirm: bool = False) -> int:
+    """Archive the current paper account state and start fresh. Requires --confirm."""
+    if not confirm:
+        console.print("[red]Refusing to reset the paper account without --confirm.[/red]")
+        console.print("[dim]This archives account/positions/ledger/equity state. Run:[/dim] vibe-trading paper reset --confirm")
+        return EXIT_USAGE_ERROR
+
+    from src.paper.store import PaperStore, paper_root
+
+    store = PaperStore(paper_root())
+    archive_dir = store.archive_and_reset()
+    console.print(f"[green]Paper account archived to[/green] {archive_dir}")
+    console.print("[dim]A fresh account will be created on the next paper trade or `paper tick`.[/dim]")
+    return EXIT_SUCCESS
 
 
 def cmd_init() -> int:
@@ -5256,6 +5468,17 @@ def main(argv: list[str] | None = None) -> int:
         return _coerce_exit_code(_research_dispatch(args))
     if args.command == "connector":
         return _coerce_exit_code(_dispatch_connector(args))
+    if args.command == "paper":
+        if args.paper_command == "status":
+            return _coerce_exit_code(cmd_paper_status())
+        if args.paper_command == "ledger":
+            return _coerce_exit_code(cmd_paper_ledger(args.paper_limit, args.paper_symbol))
+        if args.paper_command == "tick":
+            return _coerce_exit_code(cmd_paper_tick())
+        if args.paper_command == "reset":
+            return _coerce_exit_code(cmd_paper_reset(confirm=args.paper_confirm))
+        console.print("[red]paper requires a subcommand.[/red] Try: vibe-trading paper status")
+        return EXIT_USAGE_ERROR
     if args.command == "memory":
         if args.memory_command == "list":
             return _coerce_exit_code(cmd_memory_list(args.memory_type))
