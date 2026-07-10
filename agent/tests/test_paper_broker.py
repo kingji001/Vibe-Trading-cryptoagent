@@ -212,6 +212,7 @@ def test_adding_to_held_symbol_allowed_at_max_positions(broker):
 
 def test_oversize_notional_clamped_to_symbol_cap(broker):
     # fresh account: equity == 100_000; cap = 25% => 25_000 max symbol exposure
+    # PARTIAL headroom: clamp, don't reject — the allowed amount still fills.
     entry = broker.market_buy(
         "BTC-USDT", 50_000.0, decision_id="d1", stop=None, take_profit=None
     )
@@ -225,6 +226,52 @@ def test_oversize_notional_clamped_to_symbol_cap(broker):
     assert account["cash"] == pytest.approx(100_000.0 - 25_000.0 - expected_fee, abs=ABS)
 
 
+def test_zero_headroom_at_exposure_cap_raises(broker):
+    """Review Minor 2: zero headroom is a rejection, not a zero-qty ledger row."""
+    broker.market_buy("BTC-USDT", 25_000.0, decision_id="d1", stop=None, take_profit=None)
+    with pytest.raises(MandateViolation, match="exposure cap"):
+        broker.market_buy("BTC-USDT", 1_000.0, decision_id="d2", stop=None, take_profit=None)
+    # no zero-qty row appended; position untouched
+    rows = list(broker.store.iter_ledger())
+    assert len(rows) == 1
+    assert all(r["qty"] > 0 for r in rows)
+    assert len(broker.store.load_positions()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Write ordering: cash persisted first (review Important 2)                    #
+# --------------------------------------------------------------------------- #
+def _record_store_calls(store, monkeypatch):
+    calls: list[str] = []
+    for name in ("save_account", "save_positions", "append_ledger"):
+        orig = getattr(store, name)
+
+        def wrapper(arg, _name=name, _orig=orig):
+            calls.append(_name)
+            return _orig(arg)
+
+        monkeypatch.setattr(store, name, wrapper)
+    return calls
+
+
+def test_market_buy_persists_cash_before_positions_before_ledger(
+    broker, monkeypatch
+):
+    calls = _record_store_calls(broker.store, monkeypatch)
+    broker.market_buy("BTC-USDT", 10_000.0, decision_id="d1", stop=None, take_profit=None)
+    assert calls == ["save_account", "save_positions", "append_ledger"]
+
+
+def test_market_sell_persists_cash_before_positions_before_ledger(
+    broker, monkeypatch, price_fn
+):
+    broker.market_buy("BTC-USDT", 10_000.0, decision_id="d1", stop=None, take_profit=None)
+    calls = _record_store_calls(broker.store, monkeypatch)
+    price_fn.price = 110.0
+    broker.market_sell("BTC-USDT", 1.0, decision_id="d2", reason="close")
+    assert calls == ["save_account", "save_positions", "append_ledger"]
+
+
 # --------------------------------------------------------------------------- #
 # Price unavailable: no fill, no state change                                 #
 # --------------------------------------------------------------------------- #
@@ -234,6 +281,18 @@ def test_price_unavailable_no_ledger_no_position_change(broker, price_fn):
         broker.market_buy("BTC-USDT", 10_000.0, decision_id="d1", stop=None, take_profit=None)
     assert broker.store.load_positions() == []
     assert list(broker.store.iter_ledger()) == []
+    # Review Minor 1: failed FIRST order must not leave an account.json behind
+    assert broker.store.load_account() is None
+
+
+def test_rejected_first_order_creates_no_account(monkeypatch, tmp_path, price_fn):
+    """Review Minor 1: account creation is deferred until an order will execute."""
+    _set_default_env(monkeypatch, tmp_path, VIBE_PAPER_MAX_POSITIONS="0")
+    store = PaperStore(tmp_path)
+    b = PaperBroker(store, price_fn=price_fn)
+    with pytest.raises(MandateViolation):
+        b.market_buy("BTC-USDT", 1_000.0, decision_id="d1", stop=None, take_profit=None)
+    assert store.load_account() is None
 
 
 def test_price_unavailable_on_sell_leaves_position(broker, price_fn):
@@ -288,6 +347,33 @@ def test_equity_reports_unrealized(broker):
     assert eq["equity"] == pytest.approx(eq["cash"] + eq["positions_value"], abs=ABS)
     posrow = eq["positions"][0]
     assert posrow["unrealized"] == pytest.approx((120.0 - fill) * qty, abs=ABS)
+    # explicit-mark row is NOT stale (review Important 1)
+    assert posrow["stale"] is False
+    assert eq["stale_positions"] == 0
+
+
+def test_equity_live_price_row_not_stale(broker, price_fn):
+    broker.market_buy("BTC-USDT", 10_000.0, decision_id="d1", stop=None, take_profit=None)
+    price_fn.price = 115.0
+    eq = broker.equity()  # no explicit mark: falls through to price_fn (live)
+    posrow = eq["positions"][0]
+    assert posrow["mark"] == pytest.approx(115.0, abs=ABS)
+    assert posrow["stale"] is False
+    assert eq["stale_positions"] == 0
+
+
+def test_equity_cost_basis_fallback_flagged_stale(broker, price_fn):
+    """Review Important 1: when no mark is available and price_fn fails, the
+    avg_entry fallback must be visibly flagged, not silent."""
+    broker.market_buy("BTC-USDT", 10_000.0, decision_id="d1", stop=None, take_profit=None)
+    fill = 100.0 * (1 + 5 / 10_000)
+    price_fn.raises = True
+    eq = broker.equity(mark_prices={})  # no-raise semantics preserved
+    posrow = eq["positions"][0]
+    assert posrow["mark"] == pytest.approx(fill, abs=ABS)  # valued at avg_entry
+    assert posrow["unrealized"] == pytest.approx(0.0, abs=ABS)
+    assert posrow["stale"] is True
+    assert eq["stale_positions"] == 1
 
 
 # --------------------------------------------------------------------------- #

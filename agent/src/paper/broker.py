@@ -165,7 +165,6 @@ class PaperBroker:
         Raises ``PriceUnavailable`` (no state change) when the price fetch fails.
         Returns the persisted ledger entry.
         """
-        account = self._ensure_account()
         positions = self.store.load_positions()
         held = self._find(positions, symbol)
 
@@ -181,11 +180,23 @@ class PaperBroker:
         price = float(quote["price"])
         fill_price = self._buy_fill(price)
 
+        # Account creation is deferred until here: mandate check passed and the
+        # price fetch succeeded, so the order WILL execute. A failed/rejected
+        # first order therefore never leaves an account.json behind.
+        account = self._ensure_account()
+
         # -- mandate: per-symbol exposure clamp ------------------------------ #
         equity_now = self._equity_value(account, positions, {symbol: fill_price})
         cap = equity_now * self.config.max_symbol_pct / 100.0
         held_value = (held["qty"] * fill_price) if held else 0.0
-        allowed = max(0.0, cap - held_value)
+        allowed = cap - held_value
+        if allowed <= 0:
+            # Zero headroom is a rejection, not a zero-qty ledger row: the
+            # spec's "clamp, don't reject" applies to PARTIAL headroom only.
+            raise MandateViolation(
+                f"symbol at exposure cap: {symbol} already holds "
+                f">= {self.config.max_symbol_pct}% of equity"
+            )
         requested = float(notional_usdt)
         notional = min(requested, allowed)
         note: str | None = None
@@ -218,9 +229,15 @@ class PaperBroker:
             "realized_pnl": None,
             "note": note,
         }
-        # persist: positions + account first, then append the ledger row
-        self.store.save_positions(positions)
+        # NON-ATOMIC WINDOW: the three files are written by separate atomic
+        # renames, so a crash can land between them. CASH IS PERSISTED FIRST
+        # (account -> positions -> ledger): a crash after the account write
+        # leaves conservatively-deducted cash with no position — money "lost"
+        # to the paper account, never a free position that cash didn't pay
+        # for. Full journal-then-apply machinery is out of scope for a paper
+        # engine (review Important 2).
         self.store.save_account(account)
+        self.store.save_positions(positions)
         self.store.append_ledger(entry)
         return entry
 
@@ -239,7 +256,6 @@ class PaperBroker:
         translator's responsibility, Task 4). Raises ``PriceUnavailable`` (no
         state change) when the price fetch fails.
         """
-        account = self._ensure_account()
         positions = self.store.load_positions()
         held = self._find(positions, symbol)
         if held is None:
@@ -248,6 +264,11 @@ class PaperBroker:
         quote = self.price_fn(symbol)  # raises PriceUnavailable -> no state change
         price = float(quote["price"])
         sell_fill = self._sell_fill(price)
+
+        # A position exists, so an account necessarily exists already; this is
+        # a no-op load in practice (account creation stays deferred to the
+        # point where an order actually executes).
+        account = self._ensure_account()
 
         qty_sold = held["qty"] * float(fraction)
         avg_entry = held["avg_entry"]
@@ -277,8 +298,10 @@ class PaperBroker:
             "realized_pnl": realized_pnl,
             "note": reason,
         }
-        self.store.save_positions(positions)
+        # Same non-atomic window and account -> positions -> ledger ordering
+        # as market_buy (cash persisted first; see the comment there).
         self.store.save_account(account)
+        self.store.save_positions(positions)
         self.store.append_ledger(entry)
         return entry
 
@@ -302,15 +325,20 @@ class PaperBroker:
     def equity(self, mark_prices: dict[str, float] | None = None) -> dict:
         """Mark the account to market. Returns cash / positions_value / equity /
         per-position unrealized. Missing marks fall back to ``price_fn`` and, if
-        that fails, to ``avg_entry`` (unrealized 0) so this never raises."""
+        that fails, to ``avg_entry`` (unrealized 0) so this never raises — but
+        the fallback is never silent: such rows carry ``stale: True`` and the
+        top-level dict reports ``stale_positions`` (review Important 1)."""
         account = self._ensure_account()
         positions = self.store.load_positions()
         marks = dict(mark_prices or {})
 
         rows: list[dict] = []
         positions_value = 0.0
+        stale_positions = 0
         for pos in positions:
-            mark = self._mark_for(pos, marks)
+            mark, stale = self._mark_for(pos, marks)
+            if stale:
+                stale_positions += 1
             value = pos["qty"] * mark
             positions_value += value
             rows.append(
@@ -321,6 +349,7 @@ class PaperBroker:
                     "mark": mark,
                     "value": value,
                     "unrealized": (mark - pos["avg_entry"]) * pos["qty"],
+                    "stale": stale,
                 }
             )
 
@@ -331,6 +360,7 @@ class PaperBroker:
             "positions_value": positions_value,
             "equity": cash + positions_value,
             "positions": rows,
+            "stale_positions": stale_positions,
         }
 
     # -- helpers ------------------------------------------------------------ #
@@ -341,14 +371,21 @@ class PaperBroker:
                 return pos
         return None
 
-    def _mark_for(self, pos: dict, marks: dict[str, float]) -> float:
+    def _mark_for(self, pos: dict, marks: dict[str, float]) -> tuple[float, bool]:
+        """Resolve the mark for a position; returns ``(mark, stale)``.
+
+        ``stale`` is True only when neither an explicit mark nor a live price
+        was available and the position is valued at cost basis (avg_entry)."""
         symbol = pos["symbol"]
         if symbol in marks:
-            return float(marks[symbol])
+            return float(marks[symbol]), False
         try:
-            return float(self.price_fn(symbol)["price"])
+            return float(self.price_fn(symbol)["price"]), False
         except PriceUnavailable:
-            return float(pos["avg_entry"])
+            logger.warning(
+                "paper equity: no mark for %s; valuing at avg_entry (stale)", symbol
+            )
+            return float(pos["avg_entry"]), True
 
     def _equity_value(
         self, account: dict, positions: list[dict], marks: dict[str, float]
