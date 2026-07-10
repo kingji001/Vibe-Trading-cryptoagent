@@ -33,6 +33,20 @@ from src.agent.tools import BaseTool
 BENCHMARK_ENV = "VIBE_COMMITTEE_BENCHMARK"
 
 
+def _coerce_optional_float(value: Any) -> float | None:
+    """Nullish-tolerant float coercion, same rule as the schema fields.
+
+    Workers sometimes send "n/a" / "<unavailable>" / "$65,000" instead of a
+    bare number; reuse the committee schemas' nullish coercion so those
+    coerce to None / 65000.0 rather than erroring or journaling a string.
+    Raises ValueError/TypeError on genuinely unparseable input.
+    """
+    from src.committee.schemas import _coerce_nullish
+
+    coerced = _coerce_nullish(value)
+    return None if coerced is None else float(coerced)
+
+
 def _loader_fetch_bars(symbol: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
     """Fetch 1H bars via the backtest loader registry (okx -> ccxt fallback)."""
     from backtest.loaders.registry import get_loader_cls_with_fallback
@@ -88,7 +102,8 @@ class DecisionJournalTool(BaseTool):
     description = (
         "The committee decision journal (learning loop). Actions: "
         "'append' a new decision (symbol, rating, time_horizon, price_target?, "
-        "run_id?) — call after a portfolio_decision is accepted; "
+        "stop_loss?, take_profit?, position_size_pct?, run_id?) — call after a "
+        "portfolio_decision is accepted; "
         "'resolve_due' computes realized 24h/72h/7d returns and alpha vs the "
         "BTC benchmark for pending entries and returns entries needing a "
         "reflection; 'reflect' attaches a 2-4 sentence lesson (entry_id, "
@@ -118,6 +133,21 @@ class DecisionJournalTool(BaseTool):
                 "description": "Stated horizon, e.g. '72h swing' (append).",
             },
             "price_target": {"type": "number", "description": "Optional (append)."},
+            "stop_loss": {
+                "type": "number",
+                "description": "Optional protective stop in quote currency (append). "
+                "Omit when not determinable.",
+            },
+            "take_profit": {
+                "type": "number",
+                "description": "Optional target exit in quote currency (append). "
+                "Omit when not determinable.",
+            },
+            "position_size_pct": {
+                "type": "number",
+                "description": "Optional position size as percent of equity, 0-100 "
+                "(append). Omit when not determinable.",
+            },
             "run_id": {"type": "string", "description": "Swarm run id (append)."},
             "entry_id": {"type": "string", "description": "Journal entry id (reflect)."},
             "reflection": {
@@ -145,12 +175,22 @@ class DecisionJournalTool(BaseTool):
                 missing = [k for k in ("symbol", "rating", "time_horizon") if not kwargs.get(k)]
                 if missing:
                     return self._err(f"append requires: {', '.join(missing)}")
+                execution: dict[str, float | None] = {}
+                for field in ("stop_loss", "take_profit", "position_size_pct"):
+                    try:
+                        execution[field] = _coerce_optional_float(kwargs.get(field))
+                    except (TypeError, ValueError):
+                        return self._err(
+                            f"append: {field} must be a number (or a nullish string "
+                            f"like 'n/a'), got {kwargs.get(field)!r}"
+                        )
                 entry = journal.append_decision(
                     symbol=kwargs["symbol"],
                     rating=kwargs["rating"],
                     time_horizon=kwargs["time_horizon"],
                     price_target=kwargs.get("price_target"),
                     run_id=kwargs.get("run_id"),
+                    **execution,
                 )
                 return json.dumps(
                     {"status": "ok", "entry_id": entry["id"], "entry": entry},

@@ -60,6 +60,13 @@ def test_trader_proposal_nullish_numerics_coerce_to_none(nullish):
     assert p.entry_price is None and p.stop_loss is None and p.take_profit is None
 
 
+def test_trader_proposal_unavailable_placeholder_coerces_to_none():
+    """'<unavailable>' is the placeholder the analyst prompts mandate for
+    missing data; pins the shared _NULLISH addition for TraderProposal too."""
+    p = TraderProposal(action="Hold", reasoning=LONG, entry_price="<unavailable>")
+    assert p.entry_price is None
+
+
 def test_trader_proposal_currency_strings_coerce():
     p = TraderProposal(action="Buy", reasoning=LONG, entry_price="$65,000", stop_loss="61200 USDT")
     assert p.entry_price == pytest.approx(65000.0)

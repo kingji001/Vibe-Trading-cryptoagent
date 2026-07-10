@@ -165,6 +165,123 @@ def test_env_var_overrides_path(jpath, monkeypatch):
     assert len(journal.load_entries()) == 1
 
 
+# ------------------------------------- decision_journal tool append (paper loop Task 1 review fix)
+# The PM reaches the journal ONLY through the decision_journal tool, so the
+# execution fields must be exposed on the tool's append action too — otherwise
+# the prompt-requested stop/TP/size could never reach journal.append_decision
+# in production.
+
+
+@pytest.fixture()
+def jtool(jpath, monkeypatch):
+    from src.tools.committee_journal_tool import DecisionJournalTool
+
+    monkeypatch.setenv(journal.JOURNAL_PATH_ENV, str(jpath))
+    return DecisionJournalTool()
+
+
+def test_tool_append_threads_execution_fields(jtool, jpath):
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Buy",
+            time_horizon="72h swing",
+            price_target=110.0,
+            stop_loss=95.0,
+            take_profit=125.0,
+            position_size_pct=10.0,
+            run_id="run-tool-1",
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["entry"]["stop_loss"] == 95.0
+    assert out["entry"]["take_profit"] == 125.0
+    assert out["entry"]["position_size_pct"] == 10.0
+
+    on_disk = journal.load_entries(jpath)[0]
+    assert on_disk["stop_loss"] == 95.0
+    assert on_disk["take_profit"] == 125.0
+    assert on_disk["position_size_pct"] == 10.0
+
+
+def test_tool_append_without_execution_fields_omits_keys(jtool, jpath):
+    """Byte-shape regression at the tool layer: an append without the new
+    fields must produce an entry with NO stop/TP/size keys (not nulls)."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Hold",
+            time_horizon="72h swing",
+            run_id="run-tool-2",
+        )
+    )
+    assert out["status"] == "ok"
+    on_disk = journal.load_entries(jpath)[0]
+    for key in ("stop_loss", "take_profit", "position_size_pct"):
+        assert key not in out["entry"]
+        assert key not in on_disk
+
+
+def test_tool_append_nullish_execution_strings_coerce_to_omitted(jtool, jpath):
+    """A '<unavailable>'/'n/a' string arriving through the tool coerces to
+    None (same rule as the schema fields) — journaled with no key, no error."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Buy",
+            time_horizon="72h swing",
+            stop_loss="<unavailable>",
+            take_profit="n/a",
+            position_size_pct="",
+            run_id="run-tool-3",
+        )
+    )
+    assert out["status"] == "ok"
+    on_disk = journal.load_entries(jpath)[0]
+    for key in ("stop_loss", "take_profit", "position_size_pct"):
+        assert key not in out["entry"]
+        assert key not in on_disk
+
+
+def test_tool_append_numeric_strings_coerce_to_floats(jtool, jpath):
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Buy",
+            time_horizon="72h swing",
+            stop_loss="61200 USDT",
+            take_profit="$70,000",
+            position_size_pct="10",
+            run_id="run-tool-4",
+        )
+    )
+    assert out["status"] == "ok"
+    on_disk = journal.load_entries(jpath)[0]
+    assert on_disk["stop_loss"] == pytest.approx(61200.0)
+    assert on_disk["take_profit"] == pytest.approx(70000.0)
+    assert on_disk["position_size_pct"] == pytest.approx(10.0)
+
+
+def test_tool_append_unparseable_execution_value_is_actionable_error(jtool, jpath):
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Buy",
+            time_horizon="72h swing",
+            stop_loss="watch the 200 SMA area",  # prose, not a level
+            run_id="run-tool-5",
+        )
+    )
+    assert out["status"] == "error"
+    assert "stop_loss" in out["error"]
+    assert journal.load_entries(jpath) == []  # nothing half-journaled
+
+
 # ----------------------------------------------- execution field passthrough (paper loop Task 1)
 
 
