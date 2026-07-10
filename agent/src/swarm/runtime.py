@@ -23,6 +23,7 @@ from typing import Callable
 
 from src.config.schema import AgentConfig
 from src.core.token_budget import log_token_burn
+from src.providers.chat import llm_gate_limit
 from src.swarm import grounding
 from src.swarm.models import (
     RunStatus,
@@ -64,12 +65,19 @@ def compute_layer_deadline(
     a reduced worker cap a layer with more runnable tasks than workers runs in
     serialized waves, so wave-2+ tasks start late and a one-wave deadline
     falsely times out healthy work. Scale by the number of waves =
-    ``ceil(runnable_tasks / max_workers)`` (Phase 2 §4).
+    ``ceil(runnable_tasks / effective_parallelism)`` (Phase 2 §4).
+
+    Effective parallelism is ``max_workers`` bounded by the global LLM gate
+    cap (``VIBE_LLM_MAX_CONCURRENT``) when the gate is enabled: a run's
+    threads can never make more simultaneous LLM progress than the gate
+    allows, so wave math assuming ``max_workers > cap`` would reintroduce the
+    false-timeout bug the scaling exists to fix. With the gate disabled
+    (cap 0) the divisor is ``max_workers``, unchanged from upstream.
 
     Args:
         layer_budget: Worst-case single-task budget in seconds across the layer.
         runnable_tasks: Number of tasks actually submitted to the pool.
-        max_workers: Concurrent worker cap.
+        max_workers: Concurrent worker cap for this run's thread pool.
         buffer_s: Fixed grace added on top of the scaled budget.
 
     Returns:
@@ -79,6 +87,9 @@ def compute_layer_deadline(
     if not layer_budget:
         return None
     workers = max_workers if max_workers > 0 else 1
+    gate_cap = llm_gate_limit()
+    if gate_cap > 0:
+        workers = min(workers, gate_cap)
     waves = math.ceil(runnable_tasks / workers) if runnable_tasks else 1
     return layer_budget * waves + buffer_s
 
@@ -652,7 +663,16 @@ class SwarmRuntime:
             # Collect results with a hard layer-level deadline — defends against
             # worker threads stuck in C extensions / blocked I/O that bypass the
             # in-loop timeout check (issue #42). The deadline scales with the
-            # number of serialized waves at the current worker cap (Phase 2 §4).
+            # number of serialized waves at the effective parallelism — this
+            # run's worker cap bounded by the global LLM gate (Phase 2 §4).
+            #
+            # Known residual: the wave math models ONE run owning the gate. N
+            # simultaneous runs share VIBE_LLM_MAX_CONCURRENT slots, so under
+            # multi-run contention a layer can queue on the gate beyond any
+            # single run's deadline and still be marked timed out. Documented
+            # in docs/minimax-migration-notes.md "Known limitations" — prefer
+            # single-run-at-a-time scheduling (or a larger per-task budget)
+            # for multi-run deployments.
             layer_deadline = compute_layer_deadline(
                 layer_budget=layer_budget,
                 runnable_tasks=len(futures),

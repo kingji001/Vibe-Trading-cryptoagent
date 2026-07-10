@@ -93,6 +93,21 @@ This environment has no `MINIMAX_API_KEY`, so the live probes in section
   evidence-backed path** — its replay behavior is pinned by the mocked-stream
   regression tests in `agent/tests/test_minimax_provider_hardening.py`.
 
+## Known limitations (Phase 2)
+
+- **Layer-deadline math models a single run owning the LLM gate.** With the
+  global gate enabled, `compute_layer_deadline` (`agent/src/swarm/runtime.py`)
+  bounds a run's assumed parallelism by `min(SWARM_MAX_WORKERS,
+  VIBE_LLM_MAX_CONCURRENT)`, so one run never sizes its waves for more
+  concurrency than the gate allows. What it does **not** model is *cross-run*
+  contention: N simultaneous swarm runs (or a run plus a busy main agent /
+  scheduler) share the same `VIBE_LLM_MAX_CONCURRENT` slots, so a layer can
+  queue on the gate beyond any single run's deadline and be marked timed out
+  even though every worker is healthy. For multi-run deployments, prefer
+  single-run-at-a-time scheduling; if concurrent runs are required, raise the
+  per-task budget (`timeout_seconds` / retries in the preset, which the layer
+  deadline is derived from) to absorb the expected gate queueing.
+
 ## How to run the probes
 
 Requires `httpx` (already a repo dependency) and a real `MINIMAX_API_KEY`.

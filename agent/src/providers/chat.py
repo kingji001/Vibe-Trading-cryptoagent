@@ -48,6 +48,15 @@ def _resolve_gate_limit() -> int:
     return limit if limit > 0 else 0
 
 
+def llm_gate_limit() -> int:
+    """Return the configured global LLM concurrency cap (0 = gate disabled).
+
+    Public accessor for schedulers that must not assume more parallelism than
+    the gate allows (e.g. swarm layer-deadline math).
+    """
+    return _resolve_gate_limit()
+
+
 def get_llm_gate() -> Optional["threading.BoundedSemaphore"]:
     """Return the process-wide LLM semaphore, or ``None`` when disabled.
 

@@ -224,6 +224,34 @@ def test_layer_deadline_handles_zero_workers() -> None:
     assert compute_layer_deadline(layer_budget=50, runnable_tasks=4, max_workers=0) == 50 * 4 + 60
 
 
+def test_layer_deadline_wave_divisor_bounded_by_gate_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Gate cap=3 with max_workers=4 → divisor 3: 4 tasks run in 2 waves, not 1.
+
+    With the global gate enabled, a run's 4 pool threads can only make 3-way
+    simultaneous LLM progress, so a deadline sized for a single 4-wide wave
+    would falsely time out the gated 4th task.
+    """
+    monkeypatch.setenv("VIBE_LLM_MAX_CONCURRENT", "3")
+    deadline = compute_layer_deadline(layer_budget=100, runnable_tasks=4, max_workers=4, buffer_s=60)
+    assert deadline == 100 * 2 + 60  # ceil(4/3) = 2 waves
+
+
+def test_layer_deadline_gate_disabled_keeps_max_workers_divisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate cap=0 (and unset) → divisor stays max_workers (upstream behavior)."""
+    monkeypatch.setenv("VIBE_LLM_MAX_CONCURRENT", "0")
+    assert compute_layer_deadline(layer_budget=100, runnable_tasks=4, max_workers=4, buffer_s=60) == 100 + 60
+    monkeypatch.delenv("VIBE_LLM_MAX_CONCURRENT", raising=False)
+    assert compute_layer_deadline(layer_budget=100, runnable_tasks=4, max_workers=4, buffer_s=60) == 100 + 60
+
+
+def test_layer_deadline_gate_cap_above_workers_is_inert(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A gate cap larger than max_workers never widens the divisor."""
+    monkeypatch.setenv("VIBE_LLM_MAX_CONCURRENT", "8")
+    assert compute_layer_deadline(layer_budget=100, runnable_tasks=4, max_workers=4, buffer_s=60) == 100 + 60
+
+
 # --------------------------------------------------------------------------- #
 # 3. Backoff schedule — deterministic sleep sequence
 # --------------------------------------------------------------------------- #

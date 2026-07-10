@@ -75,7 +75,7 @@ def compute_backoff_delay(
     Uses "equal jitter": half the exponential ceiling is fixed and half is
     randomised, so the delay always grows with ``attempt`` (a guaranteed
     floor) while still spreading load. With ``rand`` pinned to ``0.0`` the
-    schedule is exactly the exponential floor (``base_s/1``, ``base_s``,
+    schedule is exactly the exponential floor (``base_s/2``, ``base_s``,
     ``2·base_s`` …); pinned to ``1.0`` it is the full ceiling.
 
     Args:
