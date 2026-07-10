@@ -73,9 +73,13 @@ in the journal entry plus its `decision_id`/`id`). Mapping (spot long-only):
 
 | Rating | No position | Existing long |
 |---|---|---|
-| StrongBuy / Buy | open long sized `size_pct` of equity (from the decision's position-size field, capped by mandates; missing/unparseable → `VIBE_PAPER_DEFAULT_SIZE_PCT`, default 10) | add up to the same cap (no pyramiding beyond symbol cap) |
-| Hold | no entry | apply stop/TP adjustments from the decision's typed risk fields (stop level, TP levels/fractions); absent → leave unchanged |
-| Sell / StrongSell | no-op (no shorting in v1) | close full position (StrongSell) / half (Sell) at market |
+| Buy | open long sized `size_pct` of equity (decision's `position_size_pct`, capped by mandates; missing → `VIBE_PAPER_DEFAULT_SIZE_PCT`, default 10) | add up to the symbol cap |
+| Overweight | open at HALF the Buy sizing | add at half sizing up to the cap |
+| Hold | no entry | apply stop/TP adjustments from typed fields; absent → unchanged |
+| Underweight | no-op (no shorting) | reduce position by half at market |
+| Sell | no-op (no shorting) | close full position at market |
+
+(Real 5-tier enum per `schemas.py`: Buy | Overweight | Hold | Underweight | Sell.)
 
 - **Schema reality (surveyed 2026-07-11):** journaled entries carry only
   `rating`, `price_target`, `time_horizon` — no stop or sizing. Therefore
