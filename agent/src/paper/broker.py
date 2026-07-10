@@ -1,0 +1,399 @@
+"""Paper-trading broker core — deterministic market fills, mandates, PnL.
+
+Trading logic ONLY (persistence lives in ``store.py``). The broker simulates
+market fills against live OKX last prices (via an injectable ``price_fn``; the
+default reuses ``crypto_snapshot_tool``'s fetch path — no new HTTP), enforces
+hard code-level mandates, and computes realized/unrealized PnL net of fees and
+slippage.
+
+Binding formulas (globals.md / design spec §3.1):
+  buy fill  = price * (1 + slippage_bps/10000)
+  sell fill = price * (1 - slippage_bps/10000)
+  fee       = fill_notional * fee_bps/10000        (deducted from cash both sides)
+  realized_pnl = (sell_fill - avg_entry) * qty_sold - sell_fee
+                 (the buy-side fee already reduced cash at entry)
+
+Binding dict shapes (for Tasks 3-7):
+  position = {"symbol", "qty", "avg_entry", "stop",
+              "take_profits": [{"price", "fraction"}], "opened_at", "decision_id"}
+  ledger   = {"ts", "trade_id", "symbol", "side", "qty", "fill_price",
+              "slippage_paid", "fee_paid", "order_type", "decision_id",
+              "realized_pnl", "note"}
+
+Spot long-only v1: no shorting; Sell/reduce on no position is not handled here
+(the translator, Task 4, records that no-op) — ``market_sell`` returns ``None``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from typing import Callable, TypedDict
+
+from src.paper.store import PaperStore
+from src.tools import crypto_snapshot_tool
+
+logger = logging.getLogger(__name__)
+
+
+class PriceQuote(TypedDict):
+    price: float
+    ts: str
+
+
+PriceFn = Callable[[str], PriceQuote]
+
+
+class MandateViolation(Exception):
+    """Raised when a buy would breach a hard broker mandate (no state change)."""
+
+
+class PriceUnavailable(Exception):
+    """Raised when a live price cannot be fetched — the order is NOT filled."""
+
+
+# --------------------------------------------------------------------------- #
+# Config                                                                       #
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class BrokerConfig:
+    """Broker knobs, defaults per design spec §5 (all additive env vars)."""
+
+    enabled: bool = True
+    start_cash: float = 100_000.0
+    slippage_bps: float = 5.0
+    fee_bps: float = 10.0
+    max_positions: int = 3
+    max_symbol_pct: float = 25.0
+    default_size_pct: float = 10.0
+    default_stop_pct: float = 8.0
+
+    @classmethod
+    def from_env(cls) -> "BrokerConfig":
+        env = os.environ
+        return cls(
+            enabled=env.get("VIBE_PAPER_ENABLED", "1") != "0",
+            start_cash=float(env.get("VIBE_PAPER_START_CASH", "100000")),
+            slippage_bps=float(env.get("VIBE_PAPER_SLIPPAGE_BPS", "5")),
+            fee_bps=float(env.get("VIBE_PAPER_FEE_BPS", "10")),
+            max_positions=int(env.get("VIBE_PAPER_MAX_POSITIONS", "3")),
+            max_symbol_pct=float(env.get("VIBE_PAPER_MAX_SYMBOL_PCT", "25")),
+            default_size_pct=float(env.get("VIBE_PAPER_DEFAULT_SIZE_PCT", "10")),
+            default_stop_pct=float(env.get("VIBE_PAPER_DEFAULT_STOP_PCT", "8")),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Default price_fn — reuses the snapshot module's fetch path (no new HTTP)      #
+# --------------------------------------------------------------------------- #
+def default_price_fn(symbol: str) -> PriceQuote:
+    """Fetch the live OKX last price via ``crypto_snapshot_tool``.
+
+    Reuses the module-level last-price fetcher (``_build_last_price`` over the
+    shared ``_fetch_row`` transport) rather than duplicating HTTP code, and
+    translates its output into a ``PriceQuote``. Raises ``PriceUnavailable``
+    when the underlying fetch returns a NO_DATA sentinel (a plain string).
+    """
+    last_price, _row = crypto_snapshot_tool._build_last_price(
+        symbol, crypto_snapshot_tool._fetch_row
+    )
+    if not isinstance(last_price, dict):
+        raise PriceUnavailable(f"no live price for {symbol}: {last_price}")
+    return {"price": float(last_price["value"]), "ts": str(last_price["timestamp"])}
+
+
+def _utc_now_iso() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Broker                                                                        #
+# --------------------------------------------------------------------------- #
+class PaperBroker:
+    """Deterministic paper broker: market fills, mandates, mark-to-market."""
+
+    def __init__(self, store: PaperStore, price_fn: PriceFn | None = None) -> None:
+        self.store = store
+        self.price_fn: PriceFn = price_fn or default_price_fn
+        self.config = BrokerConfig.from_env()
+
+    # -- account ------------------------------------------------------------ #
+    def _ensure_account(self) -> dict:
+        account = self.store.load_account()
+        if account is None:
+            account = self.store.create_account(
+                self.config.start_cash, asdict(self.config)
+            )
+        return account
+
+    # -- fill math ---------------------------------------------------------- #
+    def _buy_fill(self, price: float) -> float:
+        return price * (1 + self.config.slippage_bps / 10_000)
+
+    def _sell_fill(self, price: float) -> float:
+        return price * (1 - self.config.slippage_bps / 10_000)
+
+    def _fee(self, notional: float) -> float:
+        return notional * self.config.fee_bps / 10_000
+
+    # -- market buy --------------------------------------------------------- #
+    def market_buy(
+        self,
+        symbol: str,
+        notional_usdt: float,
+        *,
+        decision_id: str,
+        stop: float | None,
+        take_profit: float | None,
+    ) -> dict:
+        """Open or add to a long position for ``notional_usdt`` at the live fill.
+
+        Mandates (hard, code-level):
+          - reject (``MandateViolation``) when open positions >= MAX_POSITIONS
+            and the symbol is not already held;
+          - clamp ``notional_usdt`` so the symbol's exposure stays <=
+            MAX_SYMBOL_PCT% of current equity (clamp, don't reject; the clamped
+            notional is recorded in the ledger note).
+
+        Raises ``PriceUnavailable`` (no state change) when the price fetch fails.
+        Returns the persisted ledger entry.
+        """
+        account = self._ensure_account()
+        positions = self.store.load_positions()
+        held = self._find(positions, symbol)
+
+        # -- mandate: max open positions (cheap reject before any fetch) ----- #
+        if held is None and len(positions) >= self.config.max_positions:
+            raise MandateViolation(
+                f"max positions ({self.config.max_positions}) reached; "
+                f"cannot open new symbol {symbol}"
+            )
+
+        # -- live price (never invent one) ----------------------------------- #
+        quote = self.price_fn(symbol)  # raises PriceUnavailable -> no state change
+        price = float(quote["price"])
+        fill_price = self._buy_fill(price)
+
+        # -- mandate: per-symbol exposure clamp ------------------------------ #
+        equity_now = self._equity_value(account, positions, {symbol: fill_price})
+        cap = equity_now * self.config.max_symbol_pct / 100.0
+        held_value = (held["qty"] * fill_price) if held else 0.0
+        allowed = max(0.0, cap - held_value)
+        requested = float(notional_usdt)
+        notional = min(requested, allowed)
+        note: str | None = None
+        if notional < requested:
+            note = (
+                f"clamped notional {requested:.8f} -> {notional:.8f} "
+                f"(symbol cap {self.config.max_symbol_pct}% of equity)"
+            )
+
+        qty = notional / fill_price
+        fee = self._fee(qty * fill_price)
+        slippage_paid = qty * (fill_price - price)
+
+        # -- mutate cash + positions ----------------------------------------- #
+        account["cash"] = account["cash"] - notional - fee
+        self._apply_buy(positions, held, symbol, qty, fill_price, stop, take_profit,
+                        decision_id, quote["ts"])
+
+        entry = {
+            "ts": quote["ts"],
+            "trade_id": uuid.uuid4().hex,
+            "symbol": symbol,
+            "side": "buy",
+            "qty": qty,
+            "fill_price": fill_price,
+            "slippage_paid": slippage_paid,
+            "fee_paid": fee,
+            "order_type": "market",
+            "decision_id": decision_id,
+            "realized_pnl": None,
+            "note": note,
+        }
+        # persist: positions + account first, then append the ledger row
+        self.store.save_positions(positions)
+        self.store.save_account(account)
+        self.store.append_ledger(entry)
+        return entry
+
+    # -- market sell -------------------------------------------------------- #
+    def market_sell(
+        self,
+        symbol: str,
+        fraction: float,
+        *,
+        decision_id: str,
+        reason: str,
+    ) -> dict | None:
+        """Sell ``fraction`` (0-1) of the held position at the live fill.
+
+        Returns ``None`` when there is no position (the no-op ledger note is the
+        translator's responsibility, Task 4). Raises ``PriceUnavailable`` (no
+        state change) when the price fetch fails.
+        """
+        account = self._ensure_account()
+        positions = self.store.load_positions()
+        held = self._find(positions, symbol)
+        if held is None:
+            return None
+
+        quote = self.price_fn(symbol)  # raises PriceUnavailable -> no state change
+        price = float(quote["price"])
+        sell_fill = self._sell_fill(price)
+
+        qty_sold = held["qty"] * float(fraction)
+        avg_entry = held["avg_entry"]
+        sell_notional = qty_sold * sell_fill
+        sell_fee = self._fee(sell_notional)
+        realized_pnl = (sell_fill - avg_entry) * qty_sold - sell_fee
+        slippage_paid = qty_sold * (price - sell_fill)
+
+        account["cash"] = account["cash"] + sell_notional - sell_fee
+        remaining = held["qty"] - qty_sold
+        if remaining <= 1e-12:
+            positions.remove(held)
+        else:
+            held["qty"] = remaining
+
+        entry = {
+            "ts": quote["ts"],
+            "trade_id": uuid.uuid4().hex,
+            "symbol": symbol,
+            "side": "sell",
+            "qty": qty_sold,
+            "fill_price": sell_fill,
+            "slippage_paid": slippage_paid,
+            "fee_paid": sell_fee,
+            "order_type": "market",
+            "decision_id": decision_id,
+            "realized_pnl": realized_pnl,
+            "note": reason,
+        }
+        self.store.save_positions(positions)
+        self.store.save_account(account)
+        self.store.append_ledger(entry)
+        return entry
+
+    # -- risk management ---------------------------------------------------- #
+    def set_risk(
+        self, symbol: str, *, stop: float | None, take_profit: float | None
+    ) -> bool:
+        """Update stop / take-profit on a held position. Returns False if absent."""
+        positions = self.store.load_positions()
+        held = self._find(positions, symbol)
+        if held is None:
+            return False
+        if stop is not None:
+            held["stop"] = stop
+        if take_profit is not None:
+            held["take_profits"] = [{"price": take_profit, "fraction": 1.0}]
+        self.store.save_positions(positions)
+        return True
+
+    # -- mark-to-market ----------------------------------------------------- #
+    def equity(self, mark_prices: dict[str, float] | None = None) -> dict:
+        """Mark the account to market. Returns cash / positions_value / equity /
+        per-position unrealized. Missing marks fall back to ``price_fn`` and, if
+        that fails, to ``avg_entry`` (unrealized 0) so this never raises."""
+        account = self._ensure_account()
+        positions = self.store.load_positions()
+        marks = dict(mark_prices or {})
+
+        rows: list[dict] = []
+        positions_value = 0.0
+        for pos in positions:
+            mark = self._mark_for(pos, marks)
+            value = pos["qty"] * mark
+            positions_value += value
+            rows.append(
+                {
+                    "symbol": pos["symbol"],
+                    "qty": pos["qty"],
+                    "avg_entry": pos["avg_entry"],
+                    "mark": mark,
+                    "value": value,
+                    "unrealized": (mark - pos["avg_entry"]) * pos["qty"],
+                }
+            )
+
+        cash = account["cash"]
+        return {
+            "ts": _utc_now_iso(),
+            "cash": cash,
+            "positions_value": positions_value,
+            "equity": cash + positions_value,
+            "positions": rows,
+        }
+
+    # -- helpers ------------------------------------------------------------ #
+    @staticmethod
+    def _find(positions: list[dict], symbol: str) -> dict | None:
+        for pos in positions:
+            if pos["symbol"] == symbol:
+                return pos
+        return None
+
+    def _mark_for(self, pos: dict, marks: dict[str, float]) -> float:
+        symbol = pos["symbol"]
+        if symbol in marks:
+            return float(marks[symbol])
+        try:
+            return float(self.price_fn(symbol)["price"])
+        except PriceUnavailable:
+            return float(pos["avg_entry"])
+
+    def _equity_value(
+        self, account: dict, positions: list[dict], marks: dict[str, float]
+    ) -> float:
+        """Equity for mandate sizing. Traded symbol uses the passed fill mark;
+        other positions are valued at cost basis (avg_entry) to avoid extra
+        network fetches during a buy."""
+        value = account["cash"]
+        for pos in positions:
+            mark = marks.get(pos["symbol"], pos["avg_entry"])
+            value += pos["qty"] * mark
+        return value
+
+    def _apply_buy(
+        self,
+        positions: list[dict],
+        held: dict | None,
+        symbol: str,
+        qty: float,
+        fill_price: float,
+        stop: float | None,
+        take_profit: float | None,
+        decision_id: str,
+        ts: str,
+    ) -> None:
+        take_profits = (
+            [{"price": take_profit, "fraction": 1.0}] if take_profit is not None else []
+        )
+        if held is None:
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "avg_entry": fill_price,
+                    "stop": stop,
+                    "take_profits": take_profits,
+                    "opened_at": ts,
+                    "decision_id": decision_id,
+                }
+            )
+            return
+        new_qty = held["qty"] + qty
+        held["avg_entry"] = (held["qty"] * held["avg_entry"] + qty * fill_price) / new_qty
+        held["qty"] = new_qty
+        if stop is not None:
+            held["stop"] = stop
+        if take_profit is not None:
+            held["take_profits"] = take_profits
