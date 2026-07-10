@@ -300,7 +300,11 @@ class DecisionJournalTool(BaseTool):
                     "status": "ok",
                     "decision_id": decision_id,
                     "executed": False,
-                    "summary": NOT_EXECUTED_MESSAGE,
+                    # Instructive headline + the function's evidence-bearing
+                    # summary (WHY nothing executed: noop notes such as "sell
+                    # signal with no position", a mandate message, or "price
+                    # unavailable — not executed").
+                    "summary": NOT_EXECUTED_MESSAGE + "\n" + result["summary"],
                 },
                 ensure_ascii=False,
             )
@@ -308,17 +312,24 @@ class DecisionJournalTool(BaseTool):
         # symbol lookup: most recent EXECUTED decision for it, newest first.
         candidates = [e for e in journal.load_entries() if e.get("symbol") == symbol]
         candidates.sort(key=lambda e: e.get("decided_at") or "", reverse=True)
+        newest_result: dict | None = None
         for entry in candidates:
             result = decision_pnl(entry["id"], store=store)
             if result.get("executed"):
                 return json.dumps({"status": "ok", **result}, ensure_ascii=False, default=str)
+            if newest_result is None:
+                newest_result = result
 
+        summary = NOT_EXECUTED_MESSAGE
+        if newest_result is not None:
+            # Surface the newest candidate's evidence (noop notes) too.
+            summary += "\n" + newest_result["summary"]
         return json.dumps(
             {
                 "status": "ok",
                 "symbol": symbol,
                 "executed": False,
-                "summary": NOT_EXECUTED_MESSAGE,
+                "summary": summary,
             },
             ensure_ascii=False,
         )

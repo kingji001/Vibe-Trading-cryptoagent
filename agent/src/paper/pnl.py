@@ -193,9 +193,16 @@ def _build_summary(
     position_open: bool,
     exit_kind: str,
     max_drawdown_pct: float | None,
+    has_exits: bool,
+    other_decision_count: int,
 ) -> str:
     lines = [f"Decision {decision_id} ({symbol}): executed -- exit_kind={exit_kind}."]
-    lines.append(f"Realized PnL: {realized_pnl:.2f} | Fees paid: {fees_paid:.2f}")
+    fee_line = f"Realized PnL: {realized_pnl:.2f} | Fees paid: {fees_paid:.2f}"
+    if has_exits:
+        # Broker formula: realized = (fill - avg_entry) * qty - sell_fee only;
+        # the entry-side fee reduced cash at entry and lives in fees_paid.
+        fee_line += " (realized is net of exit fees; entry fees in fees_paid)"
+    lines.append(fee_line)
     if position_open:
         if unrealized_pnl is not None:
             lines.append(f"Position OPEN -- unrealized PnL: {unrealized_pnl:.2f}")
@@ -207,6 +214,15 @@ def _build_summary(
         lines.append(f"Max drawdown while open: {max_drawdown_pct:.2f}%")
     else:
         lines.append("Max drawdown: unavailable (insufficient equity history)")
+    if other_decision_count > 0:
+        # The lineage blends fills from multiple decisions -- flag so the
+        # reflection officer never reads the number as this decision's
+        # MARGINAL quality (an add at a divergent price is masked by the
+        # blended avg_entry).
+        lines.append(
+            f"note: PnL is position-lifecycle-wide (includes trades under "
+            f"{other_decision_count} other decision(s))"
+        )
     return "\n".join(lines)
 
 
@@ -287,6 +303,12 @@ def decision_pnl(
 
     max_drawdown_pct = _max_drawdown(store, symbol, lineage["rows"], position_open)
 
+    has_exits = any(row.get("side") == "sell" for row in lineage["rows"])
+    lineage_decision_ids = {
+        row.get("decision_id") for row in lineage["rows"] if row.get("decision_id")
+    }
+    other_decision_count = len(lineage_decision_ids - {decision_id})
+
     summary = _build_summary(
         decision_id,
         symbol,
@@ -296,6 +318,8 @@ def decision_pnl(
         position_open=position_open,
         exit_kind=exit_kind,
         max_drawdown_pct=max_drawdown_pct,
+        has_exits=has_exits,
+        other_decision_count=other_decision_count,
     )
 
     return {

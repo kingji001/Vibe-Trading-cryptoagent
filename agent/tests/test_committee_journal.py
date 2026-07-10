@@ -509,7 +509,50 @@ def test_pnl_by_decision_id_no_paper_root_not_executed(jtool, jpath, monkeypatch
     out = json.loads(jtool.execute(action="pnl", decision_id=entry["id"]))
     assert out["status"] == "ok"
     assert out["executed"] is False
-    assert out["summary"] == NOT_EXECUTED_MESSAGE
+    # instructive headline first, then decision_pnl's evidence block
+    assert out["summary"].startswith(NOT_EXECUTED_MESSAGE)
+    assert "no paper-trading ledger rows" in out["summary"]
+
+
+def test_pnl_noop_only_decision_tool_response_carries_noop_evidence(jtool, jpath, monkeypatch, tmp_path):
+    """Review Important 1: the tool's not-executed response must not discard
+    decision_pnl's evidence-bearing summary — the reflection officer needs
+    the WHY (noop note) in addition to the instructive headline."""
+    paper_root = tmp_path / "paper_root"
+    _set_paper_env(monkeypatch, paper_root)
+    entry = _append(jpath)
+
+    from src.paper.store import PaperStore
+
+    store = PaperStore(paper_root)
+    store.append_ledger(
+        {
+            "ts": "2026-07-01T00:00:00Z",
+            "trade_id": "t-noop",
+            "symbol": entry["symbol"],
+            "side": "sell",
+            "qty": 0.0,
+            "fill_price": None,
+            "slippage_paid": 0.0,
+            "fee_paid": 0.0,
+            "order_type": "noop",
+            "decision_id": entry["id"],
+            "realized_pnl": None,
+            "note": "sell signal with no position",
+        }
+    )
+
+    out = json.loads(jtool.execute(action="pnl", decision_id=entry["id"]))
+    assert out["status"] == "ok"
+    assert out["executed"] is False
+    # instructive headline preserved AND the noop note surfaces
+    assert NOT_EXECUTED_MESSAGE in out["summary"]
+    assert "sell signal with no position" in out["summary"]
+
+    # same evidence through the symbol path
+    out_sym = json.loads(jtool.execute(action="pnl", symbol=entry["symbol"]))
+    assert out_sym["executed"] is False
+    assert "sell signal with no position" in out_sym["summary"]
 
 
 def test_pnl_by_symbol_no_candidates_not_executed(jtool, monkeypatch, tmp_path):

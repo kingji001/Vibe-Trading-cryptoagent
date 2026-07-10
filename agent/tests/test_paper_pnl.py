@@ -212,6 +212,113 @@ def test_buy_then_market_sell_same_decision_closed_by_sell(store):
     assert result["realized_pnl"] == pytest.approx(98.9, abs=ABS)
 
 
+def test_divergent_add_price_lineage_wide_pnl_can_mask_marginal_quality(store):
+    """Explicitly pins the flattening behavior (review Important 2a): A opens
+    @100 (dec_a), B adds @120 (dec_b), a stop closes ALL @110. Lineage-wide
+    realized is ~0 even though dec_a's marginal entry made money and dec_b's
+    lost -- BOTH decisions report the same blended number, and the summary
+    must therefore carry the multi-decision flag (2b) so the reflection
+    officer knows the number is not marginal."""
+    store.append_ledger(
+        _ledger_row(trade_id="t1", ts="2026-07-01T00:00:00Z", decision_id="dec_a", fill_price=100.0, qty=10.0, fee_paid=1.0)
+    )
+    store.append_ledger(
+        _ledger_row(trade_id="t2", ts="2026-07-02T00:00:00Z", decision_id="dec_b", fill_price=120.0, qty=10.0, fee_paid=1.2)
+    )
+    # avg_entry after the add = 110.0; stop closes all 20 @ 110 -> realized ~ -fee
+    store.append_ledger(
+        _ledger_row(
+            trade_id="t3",
+            ts="2026-07-03T00:00:00Z",
+            side="sell",
+            qty=20.0,
+            fill_price=110.0,
+            fee_paid=2.2,
+            order_type="stop",
+            decision_id="dec_a",
+            realized_pnl=(110.0 - 110.0) * 20.0 - 2.2,
+            note="stop triggered @ 110.0",
+        )
+    )
+
+    result_a = decision_pnl("dec_a", store=store)
+    result_b = decision_pnl("dec_b", store=store)
+
+    # Both report the SAME blended lineage-wide realized -- ~0 minus exit fee.
+    assert result_a["realized_pnl"] == pytest.approx(-2.2, abs=ABS)
+    assert result_b["realized_pnl"] == pytest.approx(result_a["realized_pnl"], abs=ABS)
+    assert result_a["exit_kind"] == "stopped"
+    assert result_b["exit_kind"] == "stopped"
+
+    # 2b: the flag line, in BOTH summaries (1 other decision each).
+    for result in (result_a, result_b):
+        assert "position-lifecycle-wide" in result["summary"]
+        assert "1 other decision" in result["summary"]
+        assert result["summary"].count("\n") <= 4  # still a <=5-line block
+
+
+def test_single_decision_lineage_summary_has_no_multi_decision_flag(store):
+    store.append_ledger(_ledger_row(trade_id="t1", ts="2026-07-01T00:00:00Z", fee_paid=1.0))
+    store.append_ledger(
+        _ledger_row(
+            trade_id="t2",
+            ts="2026-07-02T00:00:00Z",
+            side="sell",
+            qty=10.0,
+            fill_price=110.0,
+            fee_paid=1.1,
+            order_type="market",
+            realized_pnl=(110.0 - 100.0) * 10.0 - 1.1,
+        )
+    )
+    result = decision_pnl("dec1", store=store)
+    assert "position-lifecycle-wide" not in result["summary"]
+
+
+def test_summary_fee_caveat_when_lineage_has_exits(store):
+    """Review minor 3: realized_pnl nets only the exit fee (broker formula:
+    (fill - avg_entry) * qty - sell_fee); the entry fee lives in fees_paid
+    only. The summary's fee line must say so, so the officer doesn't
+    double-reconcile."""
+    store.append_ledger(_ledger_row(trade_id="t1", ts="2026-07-01T00:00:00Z", fee_paid=1.0))
+    store.append_ledger(
+        _ledger_row(
+            trade_id="t2",
+            ts="2026-07-02T00:00:00Z",
+            side="sell",
+            qty=10.0,
+            fill_price=110.0,
+            fee_paid=1.1,
+            order_type="market",
+            realized_pnl=(110.0 - 100.0) * 10.0 - 1.1,
+        )
+    )
+    result = decision_pnl("dec1", store=store)
+    assert "net of exit fees" in result["summary"]
+    assert "entry fees in fees_paid" in result["summary"]
+
+
+def test_summary_no_fee_caveat_for_open_position_without_exits(store):
+    """No sell has happened -> realized is 0 with nothing netted; the caveat
+    would only confuse. It appears only where relevant (some exit fill)."""
+    store.append_ledger(_ledger_row(trade_id="t1", ts="2026-07-01T00:00:00Z", fee_paid=1.0))
+    store.save_positions(
+        [
+            {
+                "symbol": "BTC-USDT",
+                "qty": 10.0,
+                "avg_entry": 100.0,
+                "stop": None,
+                "take_profits": [],
+                "opened_at": "2026-07-01T00:00:00Z",
+                "decision_id": "dec1",
+            }
+        ]
+    )
+    result = decision_pnl("dec1", store=store, mark_price_fn=lambda s: 105.0)
+    assert "net of exit fees" not in result["summary"]
+
+
 def test_buy_closed_by_later_different_decision_sell_attributed_to_opener(store):
     """A separate, later Sell decision (different decision_id) closes the
     position -- exit_kind and the realized PnL of that close must still be
