@@ -8,6 +8,8 @@ behavior under editable installs and built wheels.
 
 from __future__ import annotations
 
+import os
+import re
 import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -21,6 +23,49 @@ from src.swarm.task_store import topological_layers, validate_dag
 
 PRESETS_DIR = Path(__file__).resolve().parent / "presets"
 _INTERNAL_TEMPLATE_VARS = {"upstream_context"}
+
+# Matches a whole-string ${ENV_VAR} or ${ENV_VAR:-default} placeholder. Only
+# the entire model_name value is treated as a placeholder — this is not a
+# general templating engine, so partial/mixed strings are left untouched.
+_MODEL_ENV_PLACEHOLDER_RE = re.compile(
+    r"^\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>.*))?\}$"
+)
+
+
+def _resolve_model_name(value: str | None) -> str | None:
+    """Resolve a ``${ENV_VAR}`` / ``${ENV_VAR:-default}`` placeholder in a
+    preset's ``model_name`` field, at preset-build time.
+
+    This keeps presets provider-agnostic instead of hardcoding vendor model
+    names (Phase 3 model tiering). Only ``model_name`` values are resolved
+    this way — there is no general templating engine.
+
+    Rules:
+        - A literal value with no placeholder syntax passes through
+          unchanged (e.g. ``model_name: foo`` stays ``"foo"``).
+        - ``${VAR}`` resolves to ``os.environ["VAR"]`` when set and non-empty.
+        - ``${VAR:-default}`` resolves to ``default`` when ``VAR`` is unset
+          or empty.
+        - If the env var is unset/empty and no default is given (or the
+          default itself is empty), the result is ``None``, which causes the
+          agent to fall back to the run's global model.
+
+    Args:
+        value: Raw ``model_name`` string from the preset YAML, or ``None``.
+
+    Returns:
+        The resolved model name, or ``None`` to fall back to the global model.
+    """
+    if value is None:
+        return None
+    match = _MODEL_ENV_PLACEHOLDER_RE.match(value.strip())
+    if not match:
+        return value
+    env_value = os.environ.get(match.group("name"), "")
+    if env_value:
+        return env_value
+    default = match.group("default")
+    return default or None
 
 
 def load_preset(name: str) -> dict:
@@ -192,7 +237,16 @@ def inspect_preset(name: str) -> dict:
         "variables": sorted(declared_variables),
         "used_variables": sorted(used_variables),
         "agents": [
-            {"id": agent.id, "role": agent.role, "tools": agent.tools, "skills": agent.skills}
+            {
+                "id": agent.id,
+                "role": agent.role,
+                "tools": agent.tools,
+                "skills": agent.skills,
+                # Resolved model_name (${ENV_VAR} placeholders already
+                # substituted by build_run_from_preset). None means the
+                # agent falls back to the run's global model.
+                "model": agent.model_name,
+            }
             for agent in run.agents
         ],
         "tasks": [
@@ -245,7 +299,7 @@ def build_run_from_preset(preset_name: str, user_vars: dict[str, str]) -> SwarmR
             skills=agent_data.get("skills", []),
             max_iterations=agent_data.get("max_iterations", 25),
             timeout_seconds=agent_data.get("timeout_seconds", 300),
-            model_name=agent_data.get("model_name"),
+            model_name=_resolve_model_name(agent_data.get("model_name")),
             max_retries=agent_data.get("max_retries", 2),
         ))
 

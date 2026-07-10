@@ -532,6 +532,9 @@ class AgentLoop:
         self._previous_summary: str = ""
         self._persistent_memory = persistent_memory
         self._run_iteration: int = 0
+        # Lazily-built ChatLLM for the optional VIBE_COMPACT_MODEL utility
+        # tier (Phase 3); see _auto_compact. None until first used.
+        self._compact_llm: Optional[ChatLLM] = None
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -1572,7 +1575,16 @@ class AgentLoop:
         else:
             prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
 
-        summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
+        # Phase 3 optional utility tier: route the summarization call through
+        # a cheaper same-provider model when VIBE_COMPACT_MODEL is set.
+        # Unset (default) keeps the upstream behavior of using the main model.
+        compact_model = os.getenv("VIBE_COMPACT_MODEL", "").strip()
+        summary_llm = self.llm
+        if compact_model:
+            if self._compact_llm is None or self._compact_llm.model_name != compact_model:
+                self._compact_llm = ChatLLM(model_name=compact_model)
+            summary_llm = self._compact_llm
+        summary_resp = summary_llm.chat([{"role": "user", "content": prompt}])
         summary = summary_resp.content or ""
         self._previous_summary = summary
 

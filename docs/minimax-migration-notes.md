@@ -161,16 +161,16 @@ pointed at MiniMax, run as-is (no adapter changes) to produce a failure
 inventory that feeds Phases 1–2. It is not part of `scripts/minimax_probe.py`
 — it exercises the real swarm engine, not raw HTTP.
 
-**Before running:** `agent/src/swarm/presets/crypto_committee.yaml` pins
-`model_name: deepseek-v4-pro` on two manager seats (`research_manager` and
-`portfolio_manager`, currently around lines 250 and 375) as an explicit
-per-agent model override. Per the preset's own "engine contract" comment,
-`model_name` uses the same provider as `LANGCHAIN_PROVIDER` — so with
-`LANGCHAIN_PROVIDER=minimax` these pins would ask MiniMax for a model named
-`deepseek-v4-pro`, which does not exist on that provider. For the smoke run,
-either comment out / delete both `model_name: deepseek-v4-pro` lines (so
-every agent falls back to the global `LANGCHAIN_MODEL_NAME`), or otherwise
-ensure they're ignored, before invoking the committee.
+**Before running (historical, pre-Phase 3):** `agent/src/swarm/presets/crypto_committee.yaml`
+used to pin `model_name: deepseek-v4-pro` on two manager seats
+(`research_manager` and `portfolio_manager`) as a hardcoded per-agent model
+override. Per the preset's own "engine contract" comment, `model_name` uses
+the same provider as `LANGCHAIN_PROVIDER` — so with `LANGCHAIN_PROVIDER=minimax`
+those pins would have asked MiniMax for a model named `deepseek-v4-pro`, which
+does not exist on that provider. **As of Phase 3 (see below) this is no
+longer a hardcoded vendor name** — both seats now read `model_name:
+${VIBE_DEEP_MODEL}`, which resolves to `None` (global model) when unset, so
+the smoke run needs no manual edit to the preset anymore.
 
 **Run with:**
 
@@ -188,3 +188,48 @@ export MINIMAX_API_KEY=sk-...
 Capture the full run log (success or instructive failure) — that log is the
 failure inventory Phases 1–2 consume, so prefer `tee`-ing it to a file rather
 than letting it scroll.
+
+## Phase 3 — Quick/deep model tiering
+
+`agent/src/swarm/presets.py` now resolves `${ENV_VAR}` / `${ENV_VAR:-default}`
+placeholders in a preset agent's `model_name` field at preset-build time
+(`_resolve_model_name`, applied in both `build_run_from_preset` and
+`inspect_preset`). This makes presets provider-agnostic instead of
+hardcoding a vendor model string:
+
+- `${VAR}` resolves to `os.environ["VAR"]` when set and non-empty.
+- `${VAR:-default}` falls back to `default` when `VAR` is unset/empty.
+- Unset with no default (or an empty default) resolves to `None`, which
+  makes the agent fall back to the run's global model
+  (`LANGCHAIN_MODEL_NAME`) — the same behavior as omitting `model_name`
+  entirely. This is model_name-only substitution, not a general templating
+  engine.
+
+`agent/src/swarm/presets/crypto_committee.yaml` uses this for two tiers:
+`research_manager` / `portfolio_manager` read `model_name: ${VIBE_DEEP_MODEL}`
+(deep tier — the debate judge and final decision seats), and every other
+seat (`market_analyst`, `onchain_analyst`, `news_analyst`,
+`sentiment_analyst`, `reflection_officer`, `bull_researcher`,
+`bear_researcher`, `trader`, `risky_analyst`, `safe_analyst`,
+`neutral_analyst`) reads `model_name: ${VIBE_QUICK_MODEL}`. With both env
+vars unset, every seat resolves to `None` and uses the global model — this
+is an intentional behavior change from the pre-Phase-3 preset (which pinned
+`deepseek-v4-pro` on the two manager seats unconditionally); it is controlled
+purely from `.env` (see `agent/.env.example`'s "Model tiering (Phase 3)"
+block).
+
+**Same-provider constraint (unchanged, pre-existing):** `SwarmAgentSpec.model_name`
+(`agent/src/swarm/models.py`) only substitutes the model string passed to
+`ChatLLM(model_name=...)` (`agent/src/providers/chat.py`), which in turn
+calls `build_llm(model_name=...)` (`agent/src/providers/llm.py`). `build_llm`
+always constructs its client from the current `LANGCHAIN_PROVIDER` env var
+(api key, base URL, adapter selection) — there is no way to select a
+different provider per seat via `model_name` alone. Any `VIBE_DEEP_MODEL` /
+`VIBE_QUICK_MODEL` / `VIBE_COMPACT_MODEL` value MUST name a model available
+under the run's single configured `LANGCHAIN_PROVIDER`.
+
+An optional utility tier applies the same mechanism to context compaction:
+`AgentLoop._auto_compact` (`agent/src/agent/loop.py`) routes its
+summarization call through `ChatLLM(model_name=os.getenv("VIBE_COMPACT_MODEL"))`
+when that env var is set (same same-provider constraint), and through the
+loop's main model when unset (unchanged upstream behavior).

@@ -7,15 +7,25 @@ description: "TradingAgents-style decision pipeline for crypto: reflection offic
 #   system_prompt, or upstream reports are silently dropped.
 # - prompt_template supports only {target}/{timeframe} vars; system_prompt is
 #   NOT format-substituted (JSON examples below are safe).
-# - Managers can pin a stronger model via model_name (same provider as
-#   LANGCHAIN_PROVIDER), e.g. model_name: deepseek-v4-pro
-#   (deepseek-chat/deepseek-reasoner are deprecated 2026-07-24; use
-#   deepseek-v4-flash for the quick tier, deepseek-v4-pro for deep)
+# - model_name supports ${ENV_VAR} / ${ENV_VAR:-default} placeholders,
+#   resolved at preset-build time (Phase 3 model tiering; see
+#   src/swarm/presets.py::_resolve_model_name). This keeps the preset
+#   provider-agnostic instead of hardcoding a vendor model name. The judge
+#   seats (research_manager, portfolio_manager) pin the deep tier via
+#   VIBE_DEEP_MODEL; the analyst/researcher/trader/risk/reflection seats pin
+#   the quick tier via VIBE_QUICK_MODEL. Unset -> None -> falls back to the
+#   run's global model (LANGCHAIN_MODEL_NAME), preserving upstream behavior.
+# - Per-agent model_name overrides MUST stay on the same provider as
+#   LANGCHAIN_PROVIDER (existing constraint of SwarmAgentSpec.model_name —
+#   see agent/src/swarm/models.py and agent/src/providers/llm.py:build_llm,
+#   which always builds the client from the current LANGCHAIN_PROVIDER env
+#   var; model_name only substitutes the model string within that provider).
 
 agents:
   # ---------------------------------------------------------------- analysts
   - id: market_analyst
     role: Market & Technical Analyst
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the market/technical analyst on a crypto investment committee. You analyze
       price action for the target asset using indicators computed from real OHLCV data.
@@ -58,6 +68,7 @@ agents:
 
   - id: onchain_analyst
     role: On-Chain & Flow Analyst
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the on-chain analyst on a crypto investment committee (crypto's equivalent
       of a fundamentals analyst). You assess holder behavior, exchange flows, and
@@ -86,6 +97,7 @@ agents:
 
   - id: news_analyst
     role: News & Macro Analyst
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the news/macro analyst on a crypto investment committee. You gather what
       actually happened recently that bears on the target asset — you do not speculate.
@@ -116,6 +128,7 @@ agents:
 
   - id: sentiment_analyst
     role: Sentiment Analyst
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the sentiment analyst on a crypto investment committee. You read REAL
       sentiment data fetched this run — you never imagine what "crypto Twitter" is saying.
@@ -156,6 +169,7 @@ agents:
 
   - id: reflection_officer
     role: Reflection Officer (learning loop)
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the committee's reflection officer. Before today's debate, you close the
       loop on PAST decisions: you resolve their realized outcomes and distill lessons.
@@ -188,6 +202,7 @@ agents:
   # ----------------------------------------------------------------- debate
   - id: bull_researcher
     role: Bull Researcher
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the bull researcher on a crypto investment committee. Argue the strongest
       honest case FOR increasing exposure to the target asset over the stated horizon.
@@ -216,6 +231,7 @@ agents:
 
   - id: bear_researcher
     role: Bear Researcher
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the bear researcher on a crypto investment committee. Argue the strongest
       honest case AGAINST increasing exposure (or for reducing it) over the stated
@@ -247,7 +263,7 @@ agents:
 
   - id: research_manager
     role: Research Manager (debate judge)
-    model_name: deepseek-v4-pro   # deep tier for the judge seats; analysts use the global model
+    model_name: ${VIBE_DEEP_MODEL}   # deep tier for the judge seats
     system_prompt: |
       You are the research manager chairing a crypto investment committee. You judge the
       bull/bear debate and issue a binding research plan. You are the quality gate:
@@ -281,6 +297,7 @@ agents:
   # ----------------------------------------------------------------- trader
   - id: trader
     role: Trader
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the desk trader on a crypto investment committee. Turn the research plan
       into ONE executable proposal for the target asset.
@@ -313,6 +330,7 @@ agents:
   # ------------------------------------------------------------- risk rotation
   - id: risky_analyst
     role: Aggressive Risk Debator
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the aggressive (risk-seeking) member of the risk committee reviewing the
       trader's proposal for the target asset.
@@ -332,6 +350,7 @@ agents:
 
   - id: safe_analyst
     role: Conservative Risk Debator
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the conservative (risk-averse) member of the risk committee reviewing the
       trader's proposal for the target asset.
@@ -352,6 +371,7 @@ agents:
 
   - id: neutral_analyst
     role: Neutral Risk Debator
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the neutral member of the risk committee reviewing the trader's proposal
       for the target asset. You heard the aggressive and conservative arguments.
@@ -372,7 +392,7 @@ agents:
   # ------------------------------------------------------------------- PM
   - id: portfolio_manager
     role: Portfolio Manager (final decision)
-    model_name: deepseek-v4-pro   # deep tier for the judge seats; analysts use the global model
+    model_name: ${VIBE_DEEP_MODEL}   # deep tier for the judge seats
     system_prompt: |
       You are the portfolio manager of a crypto investment committee. Yours is the final,
       binding decision on the target asset for the stated horizon. You have the research
