@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -81,15 +82,11 @@ def require_api_key() -> str:
 
 
 def _openai_headers(key: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    return {"Authorization": f"Bearer {key}"}
 
 
 def _anthropic_headers(key: str) -> dict[str, str]:
-    return {
-        "x-api-key": key,
-        "anthropic-version": ANTHROPIC_VERSION,
-        "Content-Type": "application/json",
-    }
+    return {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}
 
 
 def _headers_for(endpoint: str, key: str) -> dict[str, str]:
@@ -213,6 +210,37 @@ def cmd_models(client: httpx.Client, key: str, endpoint: str) -> None:
 
 
 # --------------------------------------------------------------------------- 0.3
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+_REASONING_FIELDS = ("reasoning_details", "reasoning_content", "reasoning")
+
+
+def _strip_reasoning(message: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of an assistant message with all reasoning removed.
+
+    Removes both top-level reasoning fields and inline ``<think>...</think>``
+    spans embedded in ``content`` (MiniMax's two documented representations),
+    printing whatever was stripped so the replayed-vs-stripped comparison in
+    probe 0.3 is auditable.
+    """
+    stripped = {k: v for k, v in message.items() if k not in _REASONING_FIELDS}
+    dropped_fields = [k for k in _REASONING_FIELDS if k in message]
+    if dropped_fields:
+        print(f"stripped top-level reasoning fields: {dropped_fields}")
+
+    content = stripped.get("content")
+    if isinstance(content, str) and "<think>" in content:
+        think_spans = _THINK_TAG_RE.findall(content)
+        stripped["content"] = _THINK_TAG_RE.sub("", content)
+        print(f"stripped {len(think_spans)} inline <think> span(s) from content:")
+        for span in think_spans:
+            print(span[:500])
+
+    if not dropped_fields and not (isinstance(content, str) and "<think>" in content):
+        print("nothing to strip: no reasoning fields or <think> tags found in turn-1 message.")
+    return stripped
+
+
 def _reasoning_openai(client: httpx.Client, key: str) -> None:
     print("\n### OpenAI-compatible surface (reasoning_split)")
     headers = _openai_headers(key)
@@ -233,9 +261,7 @@ def _reasoning_openai(client: httpx.Client, key: str) -> None:
     data1 = resp1.json()
     message = data1["choices"][0]["message"]
     print(f"turn 1 message keys: {sorted(message.keys())}")
-    reasoning_field = next(
-        (k for k in ("reasoning_details", "reasoning_content", "reasoning") if k in message), None
-    )
+    reasoning_field = next((k for k in _REASONING_FIELDS if k in message), None)
     print(f"reasoning field present: {reasoning_field!r}")
     if "<think>" in (message.get("content") or ""):
         print("Found literal <think> tag inline in message content.")
@@ -257,8 +283,9 @@ def _reasoning_openai(client: httpx.Client, key: str) -> None:
     turn2a_body = {**turn1_body, "messages": turn1_body["messages"] + [message, tool_result_msg]}
     resp2a, _ = _request(client, "turn 2a (reasoning replayed)", OPENAI_CHAT_URL, headers, turn2a_body)
 
-    # Turn 2b: same conversation, but with reasoning fields stripped from history.
-    stripped_message = {k: v for k, v in message.items() if k not in ("reasoning_details", "reasoning_content", "reasoning")}
+    # Turn 2b: same conversation, but with reasoning stripped from history —
+    # both top-level fields and inline <think> tags in content.
+    stripped_message = _strip_reasoning(message)
     turn2b_body = {**turn1_body, "messages": turn1_body["messages"] + [stripped_message, tool_result_msg]}
     resp2b, _ = _request(client, "turn 2b (reasoning stripped)", OPENAI_CHAT_URL, headers, turn2b_body)
 
