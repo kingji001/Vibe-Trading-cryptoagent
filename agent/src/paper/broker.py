@@ -230,12 +230,12 @@ class PaperBroker:
             "note": note,
         }
         # NON-ATOMIC WINDOW: the three files are written by separate atomic
-        # renames, so a crash can land between them. CASH IS PERSISTED FIRST
-        # (account -> positions -> ledger): a crash after the account write
-        # leaves conservatively-deducted cash with no position — money "lost"
-        # to the paper account, never a free position that cash didn't pay
-        # for. Full journal-then-apply machinery is out of scope for a paper
-        # engine (review Important 2).
+        # renames, so a crash can land between them. Invariant: NEVER PERSIST
+        # A STATE RICHER THAN REALITY — which is side-dependent. On a BUY the
+        # cash deduction goes first (account -> positions -> ledger): a crash
+        # leaves cash gone with no position, never a free position that cash
+        # didn't pay for. Full journal-then-apply machinery is out of scope
+        # for a paper engine (review Important 2).
         self.store.save_account(account)
         self.store.save_positions(positions)
         self.store.append_ledger(entry)
@@ -298,10 +298,13 @@ class PaperBroker:
             "realized_pnl": realized_pnl,
             "note": reason,
         }
-        # Same non-atomic window and account -> positions -> ledger ordering
-        # as market_buy (cash persisted first; see the comment there).
-        self.store.save_account(account)
+        # Same non-atomic window as market_buy, same invariant (never persist
+        # a state richer than reality), OPPOSITE order: on a SELL the position
+        # reduction goes first (positions -> account -> ledger). A crash then
+        # leaves a shrunk position without the cash credit (conservative),
+        # never credited cash plus a still-live position (double-count).
         self.store.save_positions(positions)
+        self.store.save_account(account)
         self.store.append_ledger(entry)
         return entry
 

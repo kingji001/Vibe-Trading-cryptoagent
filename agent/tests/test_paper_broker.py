@@ -262,14 +262,17 @@ def test_market_buy_persists_cash_before_positions_before_ledger(
     assert calls == ["save_account", "save_positions", "append_ledger"]
 
 
-def test_market_sell_persists_cash_before_positions_before_ledger(
+def test_market_sell_persists_positions_before_cash_before_ledger(
     broker, monkeypatch, price_fn
 ):
+    """Sell-side conservative order: position reduction persisted BEFORE the
+    cash credit — a crash leaves a shrunk position without credited cash,
+    never credited cash plus a still-live position (double-count)."""
     broker.market_buy("BTC-USDT", 10_000.0, decision_id="d1", stop=None, take_profit=None)
     calls = _record_store_calls(broker.store, monkeypatch)
     price_fn.price = 110.0
     broker.market_sell("BTC-USDT", 1.0, decision_id="d2", reason="close")
-    assert calls == ["save_account", "save_positions", "append_ledger"]
+    assert calls == ["save_positions", "save_account", "append_ledger"]
 
 
 # --------------------------------------------------------------------------- #
