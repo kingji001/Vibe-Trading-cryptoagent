@@ -165,6 +165,60 @@ def test_env_var_overrides_path(jpath, monkeypatch):
     assert len(journal.load_entries()) == 1
 
 
+# ----------------------------------------------- execution field passthrough (paper loop Task 1)
+
+
+def test_append_decision_writes_execution_fields_when_present(jpath):
+    entry = journal.append_decision(
+        symbol="ETH-USDT",
+        rating="Buy",
+        time_horizon="72h swing",
+        price_target=110.0,
+        stop_loss=95.0,
+        take_profit=125.0,
+        position_size_pct=10.0,
+        run_id="run-exec-1",
+        decided_at=T0,
+        path=jpath,
+    )
+    assert entry["stop_loss"] == 95.0
+    assert entry["take_profit"] == 125.0
+    assert entry["position_size_pct"] == 10.0
+
+    on_disk = journal.load_entries(jpath)[0]
+    assert on_disk["stop_loss"] == 95.0
+    assert on_disk["take_profit"] == 125.0
+    assert on_disk["position_size_pct"] == 10.0
+
+
+def test_append_decision_omits_execution_keys_when_absent(jpath):
+    """Byte-shape regression: entries written without the new fields must stay
+    identical in shape to pre-existing production journal entries — no null
+    keys added, unlike price_target which is always present."""
+    entry = _append(jpath)
+    for key in ("stop_loss", "take_profit", "position_size_pct"):
+        assert key not in entry
+
+    on_disk = journal.load_entries(jpath)[0]
+    for key in ("stop_loss", "take_profit", "position_size_pct"):
+        assert key not in on_disk
+    assert set(on_disk) == {
+        "id",
+        "decided_at",
+        "symbol",
+        "rating",
+        "time_horizon",
+        "primary_horizon",
+        "price_target",
+        "run_id",
+        "status",
+        "ref_price",
+        "horizons",
+        "reflection",
+        "reflected_at",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Phase 6 — idempotency regression: the scheduled reflection job now calls
 # resolve_due/reflect independently of a committee run's reflection officer,

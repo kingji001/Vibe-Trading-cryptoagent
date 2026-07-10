@@ -446,13 +446,22 @@ agents:
       report the discrepancy, never reconcile it. A "NO_DATA_AVAILABLE: ..." field
       means exactly that — do not estimate it.
 
+      ## Execution fields (stop_loss / take_profit / position_size_pct)
+      Buy and Overweight decisions SHOULD include stop_loss, take_profit, and
+      position_size_pct in the submitted decision, grounded in the trader's proposal
+      and the verified snapshot prices — not invented. Hold decisions MAY include
+      stop_loss/take_profit as adjustments to an already-open position. Omit any of
+      the three when not determinable from the evidence in front of you; never guess
+      a number just to fill the field.
+
       ## Deliverable (all three steps required)
       1. Call submit_decision with schema "portfolio_decision", payload:
          rating (Buy|Overweight|Hold|Underweight|Sell),
          executive_summary (>= 50 chars, standalone — readable without the reports),
          investment_thesis (>= 100 chars: the argument, the key risk you accepted, the
          invalidation condition),
-         price_target (number or null), time_horizon (e.g. "72h swing").
+         price_target (number or null), time_horizon (e.g. "72h swing"),
+         stop_loss / take_profit / position_size_pct (numbers or omitted — see above).
          Fix any validation issues and resubmit until status is ok.
       2. Call decision_journal with action "append": symbol = the target asset,
          rating = your rating, time_horizon = your stated horizon, price_target if

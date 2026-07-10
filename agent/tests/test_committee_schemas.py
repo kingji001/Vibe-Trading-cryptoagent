@@ -100,6 +100,68 @@ def test_sentiment_score_bounds_and_nullish_default():
     assert s.score_0_10 == pytest.approx(5.0)
 
 
+# --------------------------------------------------------- execution fields (paper loop Task 1)
+
+
+def test_portfolio_decision_without_execution_fields_still_validates():
+    """Regression: pre-existing PM submissions carry no stop/TP/size and must
+    still validate now that the fields are declared as optional additions."""
+    old_payload = {
+        "rating": "Hold",
+        "executive_summary": LONG,
+        "investment_thesis": LONG,
+        "price_target": 65000,
+        "time_horizon": "72h swing",
+    }
+    d = PortfolioDecision(**old_payload)
+    assert d.stop_loss is None
+    assert d.take_profit is None
+    assert d.position_size_pct is None
+
+
+def test_portfolio_decision_position_size_pct_bounded_0_100():
+    with pytest.raises(ValidationError):
+        PortfolioDecision(
+            rating="Buy",
+            executive_summary=LONG,
+            investment_thesis=LONG,
+            time_horizon="72h swing",
+            position_size_pct=125,
+        )
+
+
+@pytest.mark.parametrize("nullish", ["", "n/a", "tbd", "-", "none", "<unavailable>"])
+def test_portfolio_decision_execution_fields_nullish_coerce(nullish):
+    """Mirrors TraderProposal's _nullish coercion pattern for entry_price/etc."""
+    d = PortfolioDecision(
+        rating="Buy",
+        executive_summary=LONG,
+        investment_thesis=LONG,
+        time_horizon="72h swing",
+        stop_loss=nullish,
+        take_profit=nullish,
+        position_size_pct=nullish,
+    )
+    assert d.stop_loss is None
+    assert d.take_profit is None
+    assert d.position_size_pct is None
+
+
+def test_portfolio_decision_execution_fields_accept_valid_values():
+    d = PortfolioDecision(
+        rating="Buy",
+        executive_summary=LONG,
+        investment_thesis=LONG,
+        time_horizon="72h swing",
+        stop_loss="61200 USDT",
+        take_profit=70000,
+        position_size_pct=10,
+    )
+    assert d.stop_loss == pytest.approx(61200.0)
+    assert d.take_profit == pytest.approx(70000.0)
+    assert d.position_size_pct == pytest.approx(10.0)
+
+
 # ------------------------------------------------------------- render round-trip
 
 

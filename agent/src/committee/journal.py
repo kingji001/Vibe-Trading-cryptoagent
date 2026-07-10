@@ -106,6 +106,9 @@ def append_decision(
     rating: str,
     time_horizon: str,
     price_target: float | None = None,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
+    position_size_pct: float | None = None,
     run_id: str | None = None,
     decided_at: datetime | str | None = None,
     path: str | Path | None = None,
@@ -142,6 +145,15 @@ def append_decision(
         "reflection": None,
         "reflected_at": None,
     }
+    # Optional typed execution fields (paper-trading loop Task 1): only write
+    # the key when a value was actually supplied, so entries journaled before
+    # this change (or without these fields) keep their exact byte shape.
+    if stop_loss is not None:
+        entry["stop_loss"] = stop_loss
+    if take_profit is not None:
+        entry["take_profit"] = take_profit
+    if position_size_pct is not None:
+        entry["position_size_pct"] = position_size_pct
     entries.append(entry)
     _write_entries(entries, path)
     return entry
