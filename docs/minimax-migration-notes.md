@@ -92,6 +92,14 @@ This environment has no `MINIMAX_API_KEY`, so the live probes in section
   with `reasoning_split` / `reasoning_details` capture-and-replay) is the
   evidence-backed path** — its replay behavior is pinned by the mocked-stream
   regression tests in `agent/tests/test_minimax_provider_hardening.py`.
+- **Path A assumes `reasoning_details` is a STRING.** Capture, transcript
+  accumulation, and replay all treat the field as a plain string (the mocked
+  regression tests feed string values, and the tolerance for an empty-string /
+  missing field is exercised there). If M3 actually returns `reasoning_details`
+  as a structured **list** (e.g. an array of reasoning blocks), all three stages
+  mishandle it — capture stores the wrong type, accumulation concatenates
+  incorrectly, and replay re-emits a malformed field. Live probe 0.3 must verify
+  the exact wire shape before Path A is trusted for multi-turn tool calls.
 
 ## Known limitations (Phase 2)
 
@@ -107,6 +115,10 @@ This environment has no `MINIMAX_API_KEY`, so the live probes in section
   single-run-at-a-time scheduling; if concurrent runs are required, raise the
   per-task budget (`timeout_seconds` / retries in the preset, which the layer
   deadline is derived from) to absorb the expected gate queueing.
+- **Removed retry-delay knobs.** The old fixed-delay env vars
+  `VT_STREAM_RETRY_DELAY_S` / `SWARM_STREAM_RETRY_DELAY_S` are now **ignored** —
+  Phase 2 replaced the fixed delay with capped exponential backoff + jitter. Use
+  `VT_STREAM_RETRY_BASE_S` (base delay, default 2s) instead.
 
 ## How to run the probes
 
@@ -355,7 +367,11 @@ needed. Four steps:
    config from the table above. Keep both as literal, copy-pasteable blocks
    — `agent/.env.example` already keeps the DeepSeek block commented
    immediately below the MiniMax block for exactly this purpose; do not let
-   the two configs drift by editing one in place.
+   the two configs drift by editing one in place. When restoring the DeepSeek
+   block, restore its frozen LLM parameters together with the provider lines —
+   `LANGCHAIN_TEMPERATURE` (0.0 baseline vs MiniMax's 1.0) plus `TIMEOUT_SECONDS`
+   / `MAX_RETRIES` (120 / 2 baseline vs MiniMax's 180 / 4) — or DeepSeek silently
+   runs at MiniMax's parameters and the A/B comparison is invalid.
 2. **Run daily via the Phase 6 scheduler.** Start the server with
    `VIBE_TRADING_ENABLE_SCHEDULER=1` and register one scheduled-research job
    per asset in the fixed universe (e.g. `BTC-USDT`, `ETH-USDT`, `SOL-USDT`),
@@ -369,6 +385,7 @@ needed. Four steps:
      -H "Content-Type: application/json" \
      -d '{"prompt":"Run the crypto_committee swarm on BTC-USDT for a 72h swing decision.","schedule":"0 1 * * *"}'
    ```
+   (add `-H "Authorization: Bearer $API_AUTH_KEY"` if auth is enabled.)
    Repeat for ETH-USDT and SOL-USDT at staggered times so the LLM gate isn't
    fighting itself. Run for **10-14 days** on the MiniMax build; if quota
    allows, alternate-day baseline (DeepSeek) runs on the same universe give
