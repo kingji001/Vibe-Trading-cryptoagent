@@ -471,6 +471,16 @@ def _build_native_minimax_anthropic(
     ``https://api.minimax.io/anthropic`` (Subscription-Key / ``x-api-key``
     surface). Raises a clear install hint when the optional package is missing.
 
+    KNOWN LIMITATION (Phase 1, deferred): reasoning replay across ReAct tool
+    turns is UNVERIFIED on this path. The loop replays history as OpenAI-format
+    dicts carrying reasoning in ``reasoning_content`` /
+    ``additional_kwargs["reasoning_content"]``; nothing here translates that
+    into Anthropic ``thinking`` content blocks, so M3 reasoning is most likely
+    NOT replayed on Path B. Implementing the translation is deferred until a
+    live Phase 0 probe (``scripts/minimax_probe.py reasoning``) confirms the
+    exact thinking-block round-trip shape. Path A is the evidence-backed path;
+    see "Known limitations" in ``docs/minimax-migration-notes.md``.
+
     Raises:
         RuntimeError: If ``langchain-anthropic`` is not installed.
     """
@@ -712,6 +722,11 @@ def minimax_provider_checks() -> dict[str, Any]:
         "api_key": {"MINIMAX_API_KEY": "set" if key else "unset"},
         "thinking": _minimax_thinking_mode() or "adaptive (default)",
     }
+    if _minimax_uses_anthropic_endpoint():
+        checks["path_b_note"] = (
+            "reasoning replay via Anthropic thinking blocks is unverified/deferred "
+            "(see docs/minimax-migration-notes.md, Known limitations)"
+        )
 
     if not key:
         checks["status"] = "degraded"

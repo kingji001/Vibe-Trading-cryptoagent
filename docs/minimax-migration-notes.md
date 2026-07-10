@@ -79,6 +79,20 @@ This environment has no `MINIMAX_API_KEY`, so the live probes in section
   this is registry/config only, it does not imply the endpoint has been
   verified to authenticate.
 
+## Known limitations (Phase 1)
+
+- **Path B reasoning round-trip is unimplemented/unverified.** Phase 1's Path B
+  (`MINIMAX_BASE_URL` containing `/anthropic`) constructs a stock
+  `langchain-anthropic` `ChatAnthropic` client, but the ReAct loop replays
+  history as OpenAI-format dicts carrying reasoning in `reasoning_content` —
+  nothing translates that into Anthropic `thinking` content blocks, so M3
+  reasoning is most likely **not** replayed across tool turns on Path B.
+  Implementing the translation is deferred until a live probe 0.3 run confirms
+  the exact thinking-block round-trip shape. **Path A (OpenAI-compatible `/v1`
+  with `reasoning_split` / `reasoning_details` capture-and-replay) is the
+  evidence-backed path** — its replay behavior is pinned by the mocked-stream
+  regression tests in `agent/tests/test_minimax_provider_hardening.py`.
+
 ## How to run the probes
 
 Requires `httpx` (already a repo dependency) and a real `MINIMAX_API_KEY`.
