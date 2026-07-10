@@ -266,6 +266,121 @@ def test_tool_append_numeric_strings_coerce_to_floats(jtool, jpath):
     assert on_disk["position_size_pct"] == pytest.approx(10.0)
 
 
+@pytest.mark.parametrize("bad", [-5, 105, -0.01, 100.5])
+def test_tool_append_position_size_pct_out_of_range_rejected(jtool, jpath, bad):
+    """Final review C1(a): the tool layer must reject position_size_pct outside
+    [0, 100] (fail-before-write, like the unparseable path) — otherwise a
+    negative pct reaches the translator and mints cash / negative-qty positions."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Buy",
+            time_horizon="72h swing",
+            position_size_pct=bad,
+            run_id="run-range",
+        )
+    )
+    assert out["status"] == "error"
+    assert "position_size_pct" in out["error"]
+    assert journal.load_entries(jpath) == []  # nothing half-journaled
+
+
+def test_tool_append_position_size_pct_boundaries_accepted(jtool, jpath):
+    """0 and 100 are valid (inclusive bounds)."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Hold",
+            time_horizon="72h swing",
+            position_size_pct=0,
+            run_id="run-b0",
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["entry"]["position_size_pct"] == 0.0
+
+
+def test_tool_append_derives_run_id_from_run_dir(jtool, jpath, monkeypatch):
+    """Final review C3: the swarm runtime injects only run_dir; the tool must
+    derive the run_id from the .swarm/runs/<run_id>/... path when run_id is
+    absent, so PM-retry idempotency (keyed on (run_id, symbol)) actually works."""
+    monkeypatch.setenv("VIBE_PAPER_ENABLED", "")  # isolate: no hook
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Hold",
+            time_horizon="72h swing",
+            run_dir="/tmp/x/.swarm/runs/run-abc123/artifacts/portfolio_manager",
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["entry"]["run_id"] == "run-abc123"
+
+
+def test_tool_append_explicit_run_id_wins_over_run_dir(jtool, jpath, monkeypatch):
+    monkeypatch.setenv("VIBE_PAPER_ENABLED", "")
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Hold",
+            time_horizon="72h swing",
+            run_id="explicit-run",
+            run_dir="/tmp/x/.swarm/runs/derived-run/artifacts/pm",
+        )
+    )
+    assert out["entry"]["run_id"] == "explicit-run"
+
+
+def test_tool_append_retry_same_run_dir_idempotent_hook_runs_once(
+    jtool, jpath, monkeypatch, tmp_path
+):
+    """Final review C3: a retried PM task re-appends with the same run_dir; the
+    derived run_id makes the append idempotent (same decision id) AND the
+    paper-execution hook does not buy twice (ledger length stays 1)."""
+    paper_root = tmp_path / "paper_root"
+    _set_paper_env(monkeypatch, paper_root)  # VIBE_PAPER_ENABLED=1
+
+    from src.tools import crypto_snapshot_tool as snap
+
+    monkeypatch.setattr(
+        snap,
+        "_fetch_row",
+        lambda **k: ({"last": "100.5", "ts": "1700000000000"}, None),
+    )
+
+    run_dir = "/tmp/x/.swarm/runs/run-xyz/artifacts/portfolio_manager"
+    out1 = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="BTC-USDT",
+            rating="Buy",
+            time_horizon="72h swing",
+            run_dir=run_dir,
+        )
+    )
+    out2 = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="BTC-USDT",
+            rating="Buy",
+            time_horizon="72h swing",
+            run_dir=run_dir,
+        )
+    )
+
+    assert out1["entry"]["run_id"] == "run-xyz"
+    assert out1["entry"]["id"] == out2["entry"]["id"]  # idempotent append
+
+    from src.paper.store import PaperStore
+
+    ledger = list(PaperStore(paper_root).iter_ledger())
+    assert len(ledger) == 1  # hook executed exactly once, not twice
+
+
 def test_tool_append_unparseable_execution_value_is_actionable_error(jtool, jpath):
     out = json.loads(
         jtool.execute(

@@ -19,10 +19,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from src.paper.broker import PaperBroker, PriceFn
+from src.paper.broker import PaperBroker, PriceFn, bar_status_vs_entry
 from src.paper.store import PaperStore, paper_root
 
 BarsFn = Callable[[str, datetime], dict[str, Any]]
+
+# Retriable noops older than this are not re-driven by the tick (the spec's
+# "retried on next tick" promise is bounded so stale decisions don't resurrect).
+_RETRY_MAX_AGE = timedelta(days=7)
 
 
 # --------------------------------------------------------------------------- #
@@ -112,6 +116,55 @@ def _fmt_date(now: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _iso(now: datetime) -> str:
+    dt = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    return (
+        dt.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _retriable_decision_ids(store: PaperStore) -> list[str]:
+    """Decision ids in the ledger whose ONLY rows are retriable (price-
+    unavailable) noops — i.e. they were never actually executed and the spec
+    promises a retry. Reuses the translator's retriable-noop semantics."""
+    from src.paper.translator import _is_retriable_noop
+
+    only_retriable: dict[str, bool] = {}
+    for row in store.iter_ledger():
+        did = row.get("decision_id")
+        if not did:
+            continue
+        r = _is_retriable_noop(row)
+        only_retriable[did] = r if did not in only_retriable else (only_retriable[did] and r)
+    return [did for did, ok in only_retriable.items() if ok]
+
+
+def _drive_retries(broker: PaperBroker, now: datetime) -> list[dict]:
+    """Re-run execute_decision for retriable decisions decided within the last
+    7 days whose price is (now) available (review I3). Kill switch is honored by
+    execute_decision itself; results are returned for the tick payload."""
+    from src.committee import journal
+    from src.paper.broker import _parse_iso
+    from src.paper.translator import execute_decision
+
+    retriable = _retriable_decision_ids(broker.store)
+    if not retriable:
+        return []
+    entries = {e["id"]: e for e in journal.load_entries()}
+    results: list[dict] = []
+    for did in retriable:
+        entry = entries.get(did)
+        if entry is None:
+            continue
+        decided = _parse_iso(entry.get("decided_at"))
+        if decided is None or (now - decided) > _RETRY_MAX_AGE:
+            continue
+        results.append(execute_decision(entry, broker))
+    return results
+
+
 def run_tick(
     store: PaperStore | None = None,
     *,
@@ -129,6 +182,20 @@ def run_tick(
     skips the ``equity.jsonl`` append if today's snapshot was already
     recorded — no duplicate rows, nothing overwritten.
     """
+    # Kill switch: no-op fast when disabled (review cleanup 1) — no bar fetches,
+    # no equity append, no account touched.
+    from src.paper.translator import _paper_enabled
+
+    if not _paper_enabled():
+        return {
+            "conditional_fills": [],
+            "equity_snapshot": {},
+            "errors": [],
+            "notes": [],
+            "retried_decisions": [],
+            "disabled": True,
+        }
+
     store = store or PaperStore(paper_root())
     broker = PaperBroker(store, price_fn=price_fn)
     fetch_bar = bars_fn or default_bars_fn
@@ -137,6 +204,7 @@ def run_tick(
 
     conditional_fills: list[dict] = []
     errors: list[dict] = []
+    notes: list[str] = []
     marks: dict[str, float] = {}
 
     for pos in store.load_positions():
@@ -147,17 +215,37 @@ def run_tick(
             errors.append({"symbol": symbol, "error": str(exc)})
             continue
         marks[symbol] = float(bar["close"])
+        # Review C2: the entry-day bar is not evaluated for conditionals — note
+        # it so the skip is visible, then still mark the position to market.
+        if bar_status_vs_entry(pos.get("opened_at"), bar.get("ts")) == "entry_day":
+            notes.append(
+                f"entry-day bar skipped for {symbol} — conservative: "
+                "no same-day conditional fills"
+            )
         conditional_fills.extend(broker.evaluate_conditionals(symbol, bar))
 
-    already_recorded = any(e.get("date") == today for e in store.iter_equity())
+    # Review I3: retry decisions whose only ledger rows are retriable noops,
+    # now that prices may be available again. Bounded to the last 7 days.
+    retried_decisions = _drive_retries(broker, now)
+
+    # Idempotency keys on the persisted row's UTC date (derived from its ts,
+    # which we stamp with the logical tick time). Transient bookkeeping keys
+    # (date / already_recorded) are NOT persisted (review cleanup 4).
+    already_recorded = any(
+        (e.get("ts") or "")[:10] == today for e in store.iter_equity()
+    )
     equity_snapshot = broker.equity(mark_prices=marks)
+    equity_snapshot["ts"] = _iso(now)
+    persist_row = dict(equity_snapshot)
     equity_snapshot["date"] = today
     equity_snapshot["already_recorded"] = already_recorded
     if not already_recorded:
-        store.append_equity(equity_snapshot)
+        store.append_equity(persist_row)
 
     return {
         "conditional_fills": conditional_fills,
         "equity_snapshot": equity_snapshot,
         "errors": errors,
+        "notes": notes,
+        "retried_decisions": retried_decisions,
     }

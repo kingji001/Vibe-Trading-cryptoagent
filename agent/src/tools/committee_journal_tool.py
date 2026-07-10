@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from typing import Any
 
@@ -37,6 +38,21 @@ from src.agent.tools import BaseTool
 
 BENCHMARK_ENV = "VIBE_COMMITTEE_BENCHMARK"
 NOT_EXECUTED_MESSAGE = "not executed — no paper-trading data"
+
+
+def _derive_run_id(run_dir: Any) -> str | None:
+    """Extract the swarm run id from an injected ``run_dir`` path (review C3).
+
+    The swarm worker injects only ``run_dir`` (``.swarm/runs/<run_id>/...``),
+    never ``run_id``. Without a run_id the journal's (run_id, symbol)
+    idempotency can't fire, so a retried PM task re-appends and the paper hook
+    buys again. Pull the id defensively from the path segment after ``runs``;
+    return None when it isn't derivable.
+    """
+    if not run_dir:
+        return None
+    match = re.search(r"[\\/]runs[\\/]([^\\/]+)", str(run_dir))
+    return match.group(1) if match else None
 
 
 def _coerce_optional_float(value: Any) -> float | None:
@@ -192,18 +208,35 @@ class DecisionJournalTool(BaseTool):
                 execution: dict[str, float | None] = {}
                 for field in ("stop_loss", "take_profit", "position_size_pct"):
                     try:
-                        execution[field] = _coerce_optional_float(kwargs.get(field))
+                        value = _coerce_optional_float(kwargs.get(field))
                     except (TypeError, ValueError):
                         return self._err(
                             f"append: {field} must be a number (or a nullish string "
                             f"like 'n/a'), got {kwargs.get(field)!r}"
                         )
+                    # Review C1: an out-of-range position_size_pct must be
+                    # rejected fail-before-write (the schema enforces [0,100] but
+                    # the PM reaches the journal directly through this tool).
+                    if (
+                        field == "position_size_pct"
+                        and value is not None
+                        and not (0.0 <= value <= 100.0)
+                    ):
+                        return self._err(
+                            f"append: position_size_pct must be within [0, 100], "
+                            f"got {value}"
+                        )
+                    execution[field] = value
+                # Review C3: derive run_id from the injected run_dir when the PM
+                # didn't pass one explicitly, so (run_id, symbol) idempotency
+                # protects against retried-task double-execution.
+                run_id = kwargs.get("run_id") or _derive_run_id(kwargs.get("run_dir"))
                 entry = journal.append_decision(
                     symbol=kwargs["symbol"],
                     rating=kwargs["rating"],
                     time_horizon=kwargs["time_horizon"],
                     price_target=kwargs.get("price_target"),
-                    run_id=kwargs.get("run_id"),
+                    run_id=run_id,
                     **execution,
                 )
                 result: dict[str, Any] = {

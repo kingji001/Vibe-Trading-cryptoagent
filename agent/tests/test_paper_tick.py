@@ -22,13 +22,14 @@ Binding fill rules under test (t3 brief / globals.md, repeated for traceability)
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from src.paper.broker import PaperBroker, PriceUnavailable
 from src.paper.store import PaperStore
 from src.paper.tick import run_tick
+from src.paper.translator import RETRIABLE_NOTE
 
 ABS = 1e-8
 
@@ -303,7 +304,11 @@ def test_run_tick_executes_stop_and_records_fill_and_equity(broker):
     assert eq["positions"] == []  # position closed before the mark
     rows = list(broker.store.iter_equity())
     assert len(rows) == 1
-    assert rows[0]["date"] == eq["date"]
+    # Final review cleanup 4: transient bookkeeping keys are NOT persisted; the
+    # row is self-describing via its ts (whose UTC date equals the tick date).
+    assert "date" not in rows[0]
+    assert "already_recorded" not in rows[0]
+    assert rows[0]["ts"][:10] == eq["date"]
 
 
 def test_run_tick_marks_open_positions_at_bar_close_not_stale(broker):
@@ -378,3 +383,177 @@ def test_run_tick_defaults_to_new_store_when_none_passed(monkeypatch, tmp_path, 
     result = run_tick(bars_fn=lambda symbol, now: _bar(), price_fn=price_fn)
     assert result["conditional_fills"] == []
     assert result["errors"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Final review C2 — entry-day bars are NOT evaluated (opened_at respected)     #
+# --------------------------------------------------------------------------- #
+def test_entry_day_bar_does_not_fill_stop(broker):
+    """C2 reproduction: buy at 14:00 UTC (stop 95); the SAME-day bar
+    (open 90 / low 88 / close 104) must NOT fire the stop for a fictitious
+    loss — conditional evaluation begins on the first FULL bar after entry."""
+    _seed_position(
+        broker.store,
+        stop=95.0,
+        take_profits=[],
+        avg_entry=100.05,
+        opened_at="2026-07-10T14:00:00Z",
+    )
+    bar = _bar(open=90.0, high=104.0, low=88.0, close=104.0, ts="2026-07-10T00:00:00Z")
+
+    fills = broker.evaluate_conditionals("BTC-USDT", bar)
+
+    assert fills == []  # same-day bar skipped
+    pos = broker.store.load_positions()[0]
+    assert pos["qty"] == pytest.approx(10.0, abs=ABS)  # untouched
+
+
+def test_first_full_bar_after_entry_fills_stop(broker):
+    """A full bar on the day AFTER entry still fills the stop normally."""
+    _seed_position(
+        broker.store, stop=95.0, take_profits=[], opened_at="2026-07-10T14:00:00Z"
+    )
+    bar = _bar(open=99.0, high=100.0, low=90.0, close=96.0, ts="2026-07-11T00:00:00Z")
+
+    fills = broker.evaluate_conditionals("BTC-USDT", bar)
+
+    assert len(fills) == 1
+    assert fills[0]["order_type"] == "stop"
+    assert broker.store.load_positions() == []
+
+
+def test_run_tick_records_entry_day_skip_note(broker):
+    """C2: run_tick surfaces the entry-day skip as a note (no fill)."""
+    _seed_position(
+        broker.store, stop=95.0, take_profits=[], opened_at="2026-07-10T14:00:00Z"
+    )
+    bar = _bar(open=90.0, high=104.0, low=88.0, close=104.0, ts="2026-07-10T00:00:00Z")
+
+    result = run_tick(
+        broker.store,
+        bars_fn=lambda symbol, now: bar,
+        price_fn=broker.price_fn,
+        now=datetime(2026, 7, 10, 15, 0, tzinfo=timezone.utc),
+    )
+
+    assert result["conditional_fills"] == []
+    notes = result.get("notes", [])
+    assert any("entry-day bar skipped" in n and "BTC-USDT" in n for n in notes)
+
+
+# --------------------------------------------------------------------------- #
+# Final review cleanup 1 — kill switch: run_tick no-ops fast when disabled     #
+# --------------------------------------------------------------------------- #
+def test_run_tick_disabled_no_ops(monkeypatch, tmp_path, price_fn):
+    _set_default_env(monkeypatch, tmp_path, VIBE_PAPER_ENABLED="0")
+    store = PaperStore(tmp_path)
+    result = run_tick(store, bars_fn=lambda s, n: _bar(), price_fn=price_fn)
+    assert result.get("disabled") is True
+    assert result["conditional_fills"] == []
+    assert list(store.iter_equity()) == []
+
+
+# --------------------------------------------------------------------------- #
+# Final review I3 — tick-driven retry of retriable (price-unavailable) noops   #
+# --------------------------------------------------------------------------- #
+def _seed_retriable_decision(store, jpath, monkeypatch, *, decided_at=None):
+    from src.committee import journal
+
+    monkeypatch.setenv(journal.JOURNAL_PATH_ENV, str(jpath))
+    entry = journal.append_decision(
+        symbol="BTC-USDT",
+        rating="Buy",
+        time_horizon="72h swing",
+        path=jpath,
+        run_id="run-retry",
+        decided_at=decided_at,
+    )
+    store.append_ledger(
+        {
+            "ts": "2026-07-11T00:00:00Z",
+            "trade_id": "noop1",
+            "symbol": "BTC-USDT",
+            "side": "buy",
+            "qty": 0.0,
+            "fill_price": None,
+            "slippage_paid": 0.0,
+            "fee_paid": 0.0,
+            "order_type": "noop",
+            "decision_id": entry["id"],
+            "realized_pnl": None,
+            "note": RETRIABLE_NOTE,
+        }
+    )
+    return entry
+
+
+def test_run_tick_retries_retriable_decision_when_price_available(
+    monkeypatch, tmp_path, price_fn
+):
+    _set_default_env(monkeypatch, tmp_path)
+    store = PaperStore(tmp_path)
+    entry = _seed_retriable_decision(
+        store, tmp_path / "journal.jsonl", monkeypatch,
+        decided_at=datetime.now(timezone.utc),
+    )
+
+    result = run_tick(
+        store, bars_fn=lambda s, n: _bar(), price_fn=price_fn,
+        now=datetime.now(timezone.utc),
+    )
+
+    retried = result.get("retried_decisions", [])
+    assert any(r["decision_id"] == entry["id"] for r in retried)
+    # the retried Buy actually opened a position this tick
+    assert len(store.load_positions()) == 1
+
+
+def test_run_tick_does_not_retry_already_executed(monkeypatch, tmp_path, price_fn):
+    _set_default_env(monkeypatch, tmp_path)
+    from src.committee import journal
+
+    jpath = tmp_path / "journal.jsonl"
+    monkeypatch.setenv(journal.JOURNAL_PATH_ENV, str(jpath))
+    store = PaperStore(tmp_path)
+    entry = journal.append_decision(
+        symbol="BTC-USDT", rating="Buy", time_horizon="72h swing",
+        path=jpath, run_id="run-done",
+    )
+    store.append_ledger(
+        {
+            "ts": "2026-07-11T00:00:00Z",
+            "trade_id": "fill1",
+            "symbol": "BTC-USDT",
+            "side": "buy",
+            "qty": 10.0,
+            "fill_price": 100.0,
+            "slippage_paid": 0.0,
+            "fee_paid": 1.0,
+            "order_type": "market",
+            "decision_id": entry["id"],
+            "realized_pnl": None,
+            "note": None,
+        }
+    )
+
+    result = run_tick(
+        store, bars_fn=lambda s, n: _bar(), price_fn=price_fn,
+        now=datetime.now(timezone.utc),
+    )
+    assert result.get("retried_decisions", []) == []
+
+
+def test_run_tick_skips_retriable_older_than_7_days(monkeypatch, tmp_path, price_fn):
+    _set_default_env(monkeypatch, tmp_path)
+    store = PaperStore(tmp_path)
+    _seed_retriable_decision(
+        store, tmp_path / "journal.jsonl", monkeypatch,
+        decided_at=datetime.now(timezone.utc) - timedelta(days=8),
+    )
+
+    result = run_tick(
+        store, bars_fn=lambda s, n: _bar(), price_fn=price_fn,
+        now=datetime.now(timezone.utc),
+    )
+    assert result.get("retried_decisions", []) == []
+    assert store.load_positions() == []

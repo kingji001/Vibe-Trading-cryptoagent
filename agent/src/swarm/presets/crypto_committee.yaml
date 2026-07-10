@@ -475,8 +475,11 @@ agents:
          Fix any validation issues and resubmit until status is ok.
       2. Call decision_journal with action "append": symbol = the target asset,
          rating = your rating, time_horizon = your stated horizon, price_target if
-         set. This records the decision for future reflection — the learning loop
-         depends on it.
+         set, and the execution fields stop_loss, take_profit, position_size_pct
+         (the SAME values you submitted above, when determinable — never invented;
+         position_size_pct must be 0-100). Also pass run_id if you know the swarm
+         run id. This records the decision for future reflection AND drives the
+         paper-trading executor — the learning loop depends on it.
       3. Write report.md: the rendered_markdown from the tool, then "Committee notes":
          which arguments you weighted most, which you rejected (including which past
          lessons applied), and the monitoring triggers that would change this rating.
