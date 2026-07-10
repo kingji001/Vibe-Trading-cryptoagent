@@ -10,6 +10,11 @@ manager) and the main agent can drive the learning loop:
 - lessons      render the prompt-injection block (same-symbol history +
                cross-symbol lessons).
 - list         raw entries for inspection.
+- pnl          decision-level paper-trading PnL (Task 6): was the decision
+               actually executed as a paper trade, and what happened to the
+               money (realized/unrealized PnL, fees, exit_kind). Consumed by
+               the reflection officer to weigh the EXECUTED outcome against
+               the pure directional call.
 
 Learning-loop design adapted from TauricResearch/TradingAgents (Apache-2.0).
 
@@ -31,6 +36,7 @@ from typing import Any
 from src.agent.tools import BaseTool
 
 BENCHMARK_ENV = "VIBE_COMMITTEE_BENCHMARK"
+NOT_EXECUTED_MESSAGE = "not executed — no paper-trading data"
 
 
 def _coerce_optional_float(value: Any) -> float | None:
@@ -108,7 +114,9 @@ class DecisionJournalTool(BaseTool):
         "BTC benchmark for pending entries and returns entries needing a "
         "reflection; 'reflect' attaches a 2-4 sentence lesson (entry_id, "
         "reflection); 'lessons' renders past-decision context for a symbol; "
-        "'list' returns raw entries."
+        "'list' returns raw entries; 'pnl' (decision_id or symbol) returns the "
+        "decision's paper-trading PnL outcome — 'not executed — no "
+        "paper-trading data' when nothing was actually traded."
     )
     is_readonly = False
     repeatable = True
@@ -117,11 +125,17 @@ class DecisionJournalTool(BaseTool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["append", "resolve_due", "reflect", "lessons", "list"],
+                "enum": ["append", "resolve_due", "reflect", "lessons", "list", "pnl"],
             },
             "symbol": {
                 "type": "string",
-                "description": "Asset in loader format, e.g. BTC-USDT (append/lessons).",
+                "description": "Asset in loader format, e.g. BTC-USDT (append/lessons/pnl — "
+                "pnl resolves the most recent EXECUTED decision for the symbol).",
+            },
+            "decision_id": {
+                "type": "string",
+                "description": "Decision (journal entry) id to compute PnL for (pnl). "
+                "Provide either decision_id or symbol.",
             },
             "rating": {
                 "type": "string",
@@ -250,8 +264,12 @@ class DecisionJournalTool(BaseTool):
                     ensure_ascii=False,
                 )
 
+            if action == "pnl":
+                return self._pnl(kwargs, journal)
+
             return self._err(
-                f"Unknown action {action!r}. Valid: append, resolve_due, reflect, lessons, list"
+                "Unknown action {0!r}. Valid: append, resolve_due, reflect, lessons, "
+                "list, pnl".format(action)
             )
         except KeyError as exc:
             return self._err(str(exc))
@@ -259,3 +277,48 @@ class DecisionJournalTool(BaseTool):
     @staticmethod
     def _err(message: str) -> str:
         return json.dumps({"status": "error", "error": message}, ensure_ascii=False)
+
+    def _pnl(self, kwargs: dict[str, Any], journal: Any) -> str:
+        """Handle action='pnl'. Instructive (not an error) when nothing was
+        actually traded: 'not executed — no paper-trading data'."""
+        decision_id = kwargs.get("decision_id")
+        symbol = kwargs.get("symbol")
+        if not decision_id and not symbol:
+            return self._err("pnl requires decision_id or symbol")
+
+        from src.paper.pnl import decision_pnl
+        from src.paper.store import PaperStore, paper_root
+
+        store = PaperStore(paper_root())
+
+        if decision_id:
+            result = decision_pnl(decision_id, store=store)
+            if result.get("executed"):
+                return json.dumps({"status": "ok", **result}, ensure_ascii=False, default=str)
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "decision_id": decision_id,
+                    "executed": False,
+                    "summary": NOT_EXECUTED_MESSAGE,
+                },
+                ensure_ascii=False,
+            )
+
+        # symbol lookup: most recent EXECUTED decision for it, newest first.
+        candidates = [e for e in journal.load_entries() if e.get("symbol") == symbol]
+        candidates.sort(key=lambda e: e.get("decided_at") or "", reverse=True)
+        for entry in candidates:
+            result = decision_pnl(entry["id"], store=store)
+            if result.get("executed"):
+                return json.dumps({"status": "ok", **result}, ensure_ascii=False, default=str)
+
+        return json.dumps(
+            {
+                "status": "ok",
+                "symbol": symbol,
+                "executed": False,
+                "summary": NOT_EXECUTED_MESSAGE,
+            },
+            ensure_ascii=False,
+        )

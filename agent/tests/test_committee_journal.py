@@ -472,3 +472,178 @@ def test_double_resolution_scheduled_then_in_run_is_idempotent(jpath):
     final_entry = journal.load_entries(jpath)[0]
     assert final_entry["status"] == "resolved"
     assert final_entry["reflection"] == "Buy was right; +3% alpha."  # untouched by re-resolution
+
+
+# --------------------------------------------------------------------------- #
+# Task 6 — decision_journal action="pnl"                                      #
+# --------------------------------------------------------------------------- #
+NOT_EXECUTED_MESSAGE = "not executed — no paper-trading data"
+
+
+def _set_paper_env(monkeypatch, paper_root, **overrides):
+    env = {
+        "VIBE_PAPER_ENABLED": "1",
+        "VIBE_PAPER_START_CASH": "100000",
+        "VIBE_PAPER_SLIPPAGE_BPS": "5",
+        "VIBE_PAPER_FEE_BPS": "10",
+        "VIBE_PAPER_MAX_POSITIONS": "3",
+        "VIBE_PAPER_MAX_SYMBOL_PCT": "25",
+        "VIBE_PAPER_DEFAULT_SIZE_PCT": "10",
+        "VIBE_PAPER_DEFAULT_STOP_PCT": "8",
+        "VIBE_PAPER_ROOT": str(paper_root),
+    }
+    env.update(overrides)
+    for key, value in env.items():
+        monkeypatch.setenv(key, str(value))
+
+
+def test_pnl_requires_decision_id_or_symbol(jtool):
+    out = json.loads(jtool.execute(action="pnl"))
+    assert out["status"] == "error"
+
+
+def test_pnl_by_decision_id_no_paper_root_not_executed(jtool, jpath, monkeypatch, tmp_path):
+    monkeypatch.setenv("VIBE_PAPER_ROOT", str(tmp_path / "no-such-paper-root"))
+    entry = _append(jpath)
+
+    out = json.loads(jtool.execute(action="pnl", decision_id=entry["id"]))
+    assert out["status"] == "ok"
+    assert out["executed"] is False
+    assert out["summary"] == NOT_EXECUTED_MESSAGE
+
+
+def test_pnl_by_symbol_no_candidates_not_executed(jtool, monkeypatch, tmp_path):
+    monkeypatch.setenv("VIBE_PAPER_ROOT", str(tmp_path / "no-such-paper-root"))
+    out = json.loads(jtool.execute(action="pnl", symbol="ZZZ-USDT"))
+    assert out["status"] == "ok"
+    assert out["executed"] is False
+    assert out["summary"] == NOT_EXECUTED_MESSAGE
+
+
+def test_pnl_by_decision_id_executed_returns_full_shape(jtool, jpath, monkeypatch, tmp_path):
+    paper_root = tmp_path / "paper_root"
+    _set_paper_env(monkeypatch, paper_root)
+    entry = _append(jpath)
+
+    from src.paper.store import PaperStore
+
+    store = PaperStore(paper_root)
+    store.append_ledger(
+        {
+            "ts": "2026-07-01T00:00:00Z",
+            "trade_id": "t1",
+            "symbol": entry["symbol"],
+            "side": "buy",
+            "qty": 10.0,
+            "fill_price": 100.0,
+            "slippage_paid": 0.0,
+            "fee_paid": 1.0,
+            "order_type": "market",
+            "decision_id": entry["id"],
+            "realized_pnl": None,
+            "note": None,
+        }
+    )
+    store.save_positions(
+        [
+            {
+                "symbol": entry["symbol"],
+                "qty": 10.0,
+                "avg_entry": 100.0,
+                "stop": None,
+                "take_profits": [],
+                "opened_at": "2026-07-01T00:00:00Z",
+                "decision_id": entry["id"],
+            }
+        ]
+    )
+
+    out = json.loads(jtool.execute(action="pnl", decision_id=entry["id"]))
+    assert out["status"] == "ok"
+    assert out["executed"] is True
+    assert out["decision_id"] == entry["id"]
+    assert out["exit_kind"] == "open"
+    assert out["position_open"] is True
+    assert "summary" in out
+
+
+def test_pnl_by_symbol_finds_most_recent_executed(jtool, jpath, monkeypatch, tmp_path):
+    paper_root = tmp_path / "paper_root"
+    _set_paper_env(monkeypatch, paper_root)
+    older = _append(jpath, decided_at=T0, run_id="run-older")
+    newer = _append(jpath, decided_at=T0 + timedelta(hours=5), run_id="run-newer")
+
+    from src.paper.store import PaperStore
+
+    store = PaperStore(paper_root)
+    for decision_id, ts in ((older["id"], "2026-07-01T00:00:00Z"), (newer["id"], "2026-07-01T05:00:00Z")):
+        store.append_ledger(
+            {
+                "ts": ts,
+                "trade_id": f"t-{decision_id}",
+                "symbol": "ETH-USDT",
+                "side": "buy",
+                "qty": 10.0,
+                "fill_price": 100.0,
+                "slippage_paid": 0.0,
+                "fee_paid": 1.0,
+                "order_type": "market",
+                "decision_id": decision_id,
+                "realized_pnl": None,
+                "note": None,
+            }
+        )
+
+    out = json.loads(jtool.execute(action="pnl", symbol="ETH-USDT"))
+    assert out["status"] == "ok"
+    assert out["executed"] is True
+    assert out["decision_id"] == newer["id"]  # most recent, not the older one
+
+
+# --------------------------------------------------------------------------- #
+# Task 6 regression guard — resolve_due/reflect/lessons/list are byte-        #
+# identical whether or not VIBE_PAPER_ROOT points at an empty/nonexistent     #
+# dir: those four actions never touch src.paper at all (only append's hook    #
+# and the new pnl action do), so the paper package's mere presence/absence    #
+# must have zero effect on them.                                              #
+# --------------------------------------------------------------------------- #
+def test_existing_actions_byte_identical_with_empty_paper_root(jtool, jpath, monkeypatch, tmp_path):
+    empty_root = tmp_path / "does-not-exist-yet"
+    monkeypatch.setenv("VIBE_PAPER_ROOT", str(empty_root))
+    assert not empty_root.exists()
+
+    # decided "now" -- no horizon is due yet, so resolve_due's `due` check
+    # short-circuits before ever calling fetch_bars (see journal.resolve_due:
+    # `if not due: continue`), keeping this test network-free without a fake
+    # bars fixture.
+    journal.append_decision(
+        symbol="ETH-USDT",
+        rating="Buy",
+        time_horizon="72h swing",
+        path=jpath,
+        run_id="run-regress",
+    )
+
+    resolve_out = json.loads(jtool.execute(action="resolve_due"))
+    assert resolve_out["status"] == "ok"
+    assert resolve_out["resolved"] == []
+    assert resolve_out["reflection_due"] == []
+    assert resolve_out["errors"] == []
+
+    lessons_out = json.loads(jtool.execute(action="lessons", symbol="ETH-USDT"))
+    assert lessons_out["status"] == "ok"
+    assert "lessons_markdown" in lessons_out
+
+    list_out = json.loads(jtool.execute(action="list"))
+    assert list_out["status"] == "ok"
+    assert len(list_out["entries"]) == 1
+
+    entry_id = list_out["entries"][0]["id"]
+    reflect_out = json.loads(
+        jtool.execute(action="reflect", entry_id=entry_id, reflection="n/a — not yet due")
+    )
+    assert reflect_out == {"status": "ok", "entry_id": entry_id}
+
+    # None of the four actions ever touched the paper package -- the root
+    # directory was never even created.
+    assert not empty_root.exists()

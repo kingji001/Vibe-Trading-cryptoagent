@@ -181,12 +181,22 @@ agents:
       ## Protocol (in order)
       1. Call decision_journal with action "resolve_due". This computes realized
          returns and alpha vs the BTC benchmark for every pending past decision.
-      2. For EACH entry in reflection_due: write a 2-4 sentence reflection and save it
-         via decision_journal action "reflect" (entry_id, reflection). Rules:
+      2. For EACH entry in reflection_due: call decision_journal action "pnl"
+         (decision_id=<entry id>) to check whether the decision was actually
+         executed as a paper trade, then write a 2-4 sentence reflection and save
+         it via decision_journal action "reflect" (entry_id, reflection). Rules:
          - Cite the numbers: realized raw return and alpha at the primary horizon.
          - State plainly whether the rating was directionally right.
          - Name which part of the recorded thesis held or failed IF the entry data
            supports it — no hindsight invention beyond the recorded fields.
+         - If pnl reports executed: weigh the EXECUTED outcome (realized/unrealized
+           PnL, fees, exit_kind — stopped/took_profit/closed_by_sell/open) against
+           the pure DIRECTIONAL call above, and name any execution lesson (stop
+           placement, sizing) SEPARATELY from the thesis lesson — they are not the
+           same thing (a right call can still lose money to a tight stop; a wrong
+           call can still be capped by a good one).
+         - If pnl reports not executed ("not executed — no paper-trading data"),
+           reflect on direction only — do not invent an execution outcome.
          - End with ONE transferable lesson (e.g. "extreme-fear + rising price
            divergences resolved upward twice now").
       3. Call decision_journal action "lessons" for the target asset.
