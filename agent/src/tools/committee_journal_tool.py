@@ -192,10 +192,22 @@ class DecisionJournalTool(BaseTool):
                     run_id=kwargs.get("run_id"),
                     **execution,
                 )
-                return json.dumps(
-                    {"status": "ok", "entry_id": entry["id"], "entry": entry},
-                    ensure_ascii=False,
-                )
+                result: dict[str, Any] = {
+                    "status": "ok",
+                    "entry_id": entry["id"],
+                    "entry": entry,
+                }
+                # Paper-trading execution hook (Task 5): translate the
+                # just-journaled decision into a paper order. Never fails the
+                # append — maybe_execute_paper catches everything and returns
+                # None fast when VIBE_PAPER_ENABLED is falsy, in which case
+                # the paper_execution key is omitted entirely (not null).
+                from src.paper.hook import maybe_execute_paper
+
+                paper_execution = maybe_execute_paper(entry)
+                if paper_execution is not None:
+                    result["paper_execution"] = paper_execution
+                return json.dumps(result, ensure_ascii=False, default=str)
 
             if action == "resolve_due":
                 benchmark = os.getenv(BENCHMARK_ENV, journal.DEFAULT_BENCHMARK)

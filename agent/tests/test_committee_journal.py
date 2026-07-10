@@ -350,6 +350,89 @@ def test_append_decision_omits_execution_keys_when_absent(jpath):
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Task 5 — post-append paper execution hook seam                              #
+#
+# The tool's append success path calls maybe_execute_paper(entry) and, when
+# it returns non-None, adds a paper_execution key to the JSON response. When
+# disabled (VIBE_PAPER_ENABLED falsy), the key is ABSENT — not null. The
+# append's own success semantics (status/entry_id/entry, and the on-disk
+# journal write) must be byte-identical regardless of what the executor does
+# or whether it crashes.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("value", ["0", "false", ""])
+def test_append_disabled_paper_key_absent(jtool, jpath, monkeypatch, value):
+    monkeypatch.setenv("VIBE_PAPER_ENABLED", value)
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Hold",
+            time_horizon="72h swing",
+            run_id="run-paper-1",
+        )
+    )
+    assert out["status"] == "ok"
+    assert "paper_execution" not in out
+
+    on_disk = journal.load_entries(jpath)[0]
+    assert "paper_execution" not in on_disk  # never leaks into the journal file
+
+
+def test_append_enabled_calls_hook_and_adds_key(jtool, jpath, monkeypatch):
+    monkeypatch.setenv("VIBE_PAPER_ENABLED", "1")
+    monkeypatch.setattr(
+        "src.paper.hook.maybe_execute_paper",
+        lambda entry: {"decision_id": entry["id"], "actions": [], "skipped": None},
+    )
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Hold",
+            time_horizon="72h swing",
+            run_id="run-paper-2",
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["paper_execution"]["decision_id"] == out["entry_id"]
+
+
+def test_append_executor_crash_is_isolated_from_append_success(jtool, jpath, monkeypatch):
+    """Monkeypatch execute_decision (not maybe_execute_paper — that function's
+    own contract is to never raise) to prove the hook's try/except actually
+    isolates a downstream crash: the append still succeeds and the response
+    carries paper_execution: {"error": ...} rather than propagating."""
+    monkeypatch.setenv("VIBE_PAPER_ENABLED", "1")
+    monkeypatch.setenv("VIBE_PAPER_ROOT", str(jpath.parent / "paper_root"))
+
+    def boom(entry, broker):
+        raise RuntimeError("executor exploded")
+
+    monkeypatch.setattr("src.paper.translator.execute_decision", boom)
+
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Buy",
+            time_horizon="72h swing",
+            run_id="run-paper-3",
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["entry"]["symbol"] == "ETH-USDT"
+    assert out["paper_execution"] == {"error": "executor exploded"}
+
+    # The append's own success semantics are untouched: the entry landed on
+    # disk exactly as it would have without the hook at all.
+    on_disk = journal.load_entries(jpath)[0]
+    assert on_disk["symbol"] == "ETH-USDT"
+    assert on_disk["rating"] == "Buy"
+
+
 def test_double_resolution_scheduled_then_in_run_is_idempotent(jpath):
     calls: list[str] = []
 
