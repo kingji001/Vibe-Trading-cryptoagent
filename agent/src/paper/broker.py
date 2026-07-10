@@ -30,7 +30,7 @@ import logging
 import os
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, TypedDict
 
 from src.paper.store import PaperStore
@@ -62,7 +62,6 @@ class PriceUnavailable(Exception):
 class BrokerConfig:
     """Broker knobs, defaults per design spec §5 (all additive env vars)."""
 
-    enabled: bool = True
     start_cash: float = 100_000.0
     slippage_bps: float = 5.0
     fee_bps: float = 10.0
@@ -75,7 +74,6 @@ class BrokerConfig:
     def from_env(cls) -> "BrokerConfig":
         env = os.environ
         return cls(
-            enabled=env.get("VIBE_PAPER_ENABLED", "1") != "0",
             start_cash=float(env.get("VIBE_PAPER_START_CASH", "100000")),
             slippage_bps=float(env.get("VIBE_PAPER_SLIPPAGE_BPS", "5")),
             fee_bps=float(env.get("VIBE_PAPER_FEE_BPS", "10")),
@@ -121,6 +119,49 @@ def _fmt_ts(value: object) -> str:
             "+00:00", "Z"
         )
     return str(value)
+
+
+def _parse_iso(value: object) -> datetime | None:
+    """Parse a datetime or ISO-8601 string to a UTC datetime; None if unparseable."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# Daily conditional bars cover a one-UTC-day period starting at the bar ts.
+_BAR_PERIOD = timedelta(days=1)
+
+
+def bar_status_vs_entry(opened_at: object, bar_ts: object) -> str:
+    """Classify a daily bar relative to a position's entry (review C2).
+
+    Returns one of:
+      - ``"evaluate"``  — the bar's whole period is AFTER entry (first full bar
+        after the fill); conditional stops/TPs may be evaluated;
+      - ``"entry_day"`` — the bar's period CONTAINS ``opened_at`` (the partially
+        overlapping entry-day bar); skipped, conservatively, so pre-entry price
+        action within the entry day cannot fire a fictitious stop/TP;
+      - ``"pre_entry"`` — the bar's period ended before ``opened_at`` (entirely
+        before the fill); skipped.
+
+    Falls back to ``"evaluate"`` when either timestamp is missing/unparseable
+    (legacy positions), preserving the pre-review behavior for those.
+    """
+    opened = _parse_iso(opened_at)
+    start = _parse_iso(bar_ts)
+    if opened is None or start is None:
+        return "evaluate"
+    if start > opened:
+        return "evaluate"
+    if start + _BAR_PERIOD <= opened:
+        return "pre_entry"
+    return "entry_day"
 
 
 # --------------------------------------------------------------------------- #
@@ -185,6 +226,16 @@ class PaperBroker:
                 f"cannot open new symbol {symbol}"
             )
 
+        # -- mandate: non-positive notional (review C1) ---------------------- #
+        # A zero/negative notional (e.g. a mis-sized position_size_pct that the
+        # translator turned into 0-or-negative notional) must NEVER mint cash or
+        # a negative-qty position. Reject BEFORE the price fetch / account
+        # creation so a bad first order leaves no account.json behind either.
+        if float(notional_usdt) <= 0:
+            raise MandateViolation(
+                f"non-positive notional for {symbol}: {notional_usdt}"
+            )
+
         # -- live price (never invent one) ----------------------------------- #
         quote = self.price_fn(symbol)  # raises PriceUnavailable -> no state change
         price = float(quote["price"])
@@ -215,6 +266,20 @@ class PaperBroker:
                 f"clamped notional {requested:.8f} -> {notional:.8f} "
                 f"(symbol cap {self.config.max_symbol_pct}% of equity)"
             )
+
+        # -- cash floor: buys never drive cash negative (review I1) ---------- #
+        # Clamp notional so notional + fee <= available cash (mirrors the
+        # symbol-cap clamp: partial fill + a ledger note). Zero/negative cash is
+        # a rejection, not a zero-qty ledger row.
+        cash_avail = account["cash"]
+        if cash_avail <= 0:
+            raise MandateViolation(
+                f"no cash available to buy {symbol} (cash={cash_avail:.8f})"
+            )
+        max_by_cash = cash_avail / (1 + self.config.fee_bps / 10_000)
+        if notional > max_by_cash:
+            notional = max_by_cash
+            note = (note + "; " if note else "") + "clamped to available cash"
 
         qty = notional / fill_price
         fee = self._fee(qty * fill_price)
@@ -383,6 +448,13 @@ class PaperBroker:
         positions = self.store.load_positions()
         held = self._find(positions, symbol)
         if held is None:
+            return []
+
+        # Review C2: conditional evaluation begins on the first FULL bar after
+        # entry. Bars that ended before entry, and the partially-overlapping
+        # entry-day bar, are skipped so pre-entry price action within the entry
+        # day can never fire a fictitious stop/TP (run_tick surfaces the note).
+        if bar_status_vs_entry(held.get("opened_at"), bar.get("ts")) != "evaluate":
             return []
 
         open_ = float(bar["open"])

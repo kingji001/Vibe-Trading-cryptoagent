@@ -226,6 +226,76 @@ def test_oversize_notional_clamped_to_symbol_cap(broker):
     assert account["cash"] == pytest.approx(100_000.0 - 25_000.0 - expected_fee, abs=ABS)
 
 
+def test_market_buy_nonpositive_notional_raises(broker):
+    """Final review C1(b): a computed notional <= 0 must NEVER mint cash or a
+    negative-qty position — it raises MandateViolation, leaves state untouched,
+    and (checked before account creation) never leaves an account.json behind."""
+    for bad in (0.0, -100.0):
+        with pytest.raises(MandateViolation):
+            broker.market_buy("BTC-USDT", bad, decision_id="d0", stop=None, take_profit=None)
+    assert broker.store.load_positions() == []
+    assert list(broker.store.iter_ledger()) == []
+    assert broker.store.load_account() is None
+
+
+def test_buy_clamped_to_available_cash(monkeypatch, tmp_path, price_fn):
+    """Final review I1: buys never drive cash negative. equity 805k / cash 5k
+    -> notional clamped to ~cash-net-of-fee, cash stays >= 0."""
+    _set_default_env(monkeypatch, tmp_path)
+    store = PaperStore(tmp_path)
+    store.create_account(5_000.0, {})
+    store.save_positions(
+        [
+            {
+                "symbol": "AAA-USDT",
+                "qty": 8_000.0,
+                "avg_entry": 100.0,  # 800k position value -> equity 805k
+                "stop": None,
+                "take_profits": [],
+                "opened_at": "2026-07-10T00:00:00Z",
+                "decision_id": "seed",
+            }
+        ]
+    )
+    b = PaperBroker(store, price_fn=price_fn)  # price 100
+    entry = b.market_buy(
+        "BTC-USDT", 100_000.0, decision_id="d1", stop=None, take_profit=None
+    )
+
+    fill = 100.0 * (1 + 5 / 10_000)
+    max_by_cash = 5_000.0 / (1 + 10 / 10_000)  # notional s.t. notional+fee <= cash
+    assert entry["qty"] == pytest.approx(max_by_cash / fill, abs=1e-3)
+    assert "cash" in (entry["note"] or "").lower()
+
+    account = store.load_account()
+    # cash driven to ~0 (never materially negative; float rounding only)
+    assert account["cash"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_buy_rejected_when_no_cash_available(monkeypatch, tmp_path, price_fn):
+    """Final review I1: available cash <= 0 -> MandateViolation, no fill."""
+    _set_default_env(monkeypatch, tmp_path)
+    store = PaperStore(tmp_path)
+    store.create_account(0.0, {})
+    store.save_positions(
+        [
+            {
+                "symbol": "AAA-USDT",
+                "qty": 100.0,
+                "avg_entry": 100.0,
+                "stop": None,
+                "take_profits": [],
+                "opened_at": "2026-07-10T00:00:00Z",
+                "decision_id": "seed",
+            }
+        ]
+    )
+    b = PaperBroker(store, price_fn=price_fn)
+    with pytest.raises(MandateViolation):
+        b.market_buy("BTC-USDT", 1_000.0, decision_id="d1", stop=None, take_profit=None)
+    assert b.store.load_positions() == [store.load_positions()[0]]
+
+
 def test_zero_headroom_at_exposure_cap_raises(broker):
     """Review Minor 2: zero headroom is a rejection, not a zero-qty ledger row."""
     broker.market_buy("BTC-USDT", 25_000.0, decision_id="d1", stop=None, take_profit=None)
@@ -459,7 +529,9 @@ def test_broker_config_from_env(monkeypatch, tmp_path):
     assert cfg.start_cash == pytest.approx(100_000.0, abs=ABS)
     assert cfg.default_size_pct == pytest.approx(10.0, abs=ABS)
     assert cfg.default_stop_pct == pytest.approx(8.0, abs=ABS)
-    assert cfg.enabled is True
+    # Final review cleanup 2: BrokerConfig.enabled was deleted (dead field with
+    # a different truthiness rule than the enforced VIBE_PAPER_ENABLED gate).
+    assert not hasattr(cfg, "enabled")
 
 
 # --------------------------------------------------------------------------- #

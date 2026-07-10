@@ -314,6 +314,12 @@ fee       = fill_notional * VIBE_PAPER_FEE_BPS/10000        (deducted from cash 
 Conditional orders (stop / take-profit), evaluated once per UTC day against
 the latest confirmed daily OHLC bar:
 
+- **entry-day bars are NOT evaluated.** Conditional evaluation begins on the
+  first FULL daily bar *after* the position was opened. The partially
+  overlapping entry-day bar (whose period contains `opened_at`) is skipped —
+  otherwise pre-entry price action within the entry day could fire a
+  fictitious stop/take-profit — and the daily tick records a note
+  (`entry-day bar skipped for SYMBOL …`) so the skip is visible;
 - no slippage on conditional fills (bar prices are already conservative) —
   fee still applies;
 - a bar that gaps THROUGH a stop fills at the bar's OPEN, not the stop price
@@ -348,7 +354,7 @@ Under `~/.vibe-trading/paper/` (override: `VIBE_PAPER_ROOT`), atomic writes
 
 | Var | Default | Meaning |
 |---|---|---|
-| `VIBE_PAPER_ENABLED` | `1` (unset = enabled) | Kill switch for the whole executor. `"0"` / `"false"` / `""` (case-insensitive) disables; anything else enables. Gates the hook/translator only — an already-running daily tick still marks existing positions to market when disabled. |
+| `VIBE_PAPER_ENABLED` | `1` (unset = enabled) | Kill switch for the whole executor. The falsy set is **exactly** `{"0", "false", ""}` (case-insensitive, whitespace-trimmed) — anything else enables, so e.g. `"off"` / `"no"` / `"disabled"` still ENABLE. Gates the hook/translator and the daily tick (`run_tick` / `paper_tick` no-op when disabled). |
 | `VIBE_PAPER_START_CASH` | `100000` | Paper USDT at account creation only. |
 | `VIBE_PAPER_SLIPPAGE_BPS` | `5` | Market-fill slippage against the trader (basis points). |
 | `VIBE_PAPER_FEE_BPS` | `10` | Taker fee on notional, both sides. |
