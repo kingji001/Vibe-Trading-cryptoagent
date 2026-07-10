@@ -250,7 +250,11 @@ def _expand_debate(debate: dict, tasks_by_id: dict[str, SwarmTask]) -> list[Swar
 
             input_from = dict(seed_inputs)
             input_from.update(transcript)
-            if is_entry:
+            if idx == 0:
+                # The opening seat cites entry_inputs (e.g. research_plan) in
+                # EVERY round, not just round 1 — its rebuttal prompt is written
+                # to reference that grounding. Applied last (over the transcript)
+                # exactly as round 1 does, so round-1 wiring stays byte-for-byte.
                 input_from.update(entry_inputs)
 
             depends_on = list(entry_depends) if is_entry else [last_task_id]

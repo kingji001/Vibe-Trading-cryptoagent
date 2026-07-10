@@ -234,6 +234,17 @@ def test_risk_round2_pm_sees_full_rotation(monkeypatch):
     assert "risk_adjudication_r2" in pm.input_from
 
 
+def test_risk_round2_aggressive_keeps_research_plan(monkeypatch):
+    """Regression: entry_inputs (research_plan) must reach the opening seat's
+    r2+ task, not just round 1. The risky seat's rebuttal prompt is written to
+    cite the research plan, so dropping it at rounds >= 2 starves the prompt."""
+    monkeypatch.setenv("VIBE_RISK_ROUNDS", "2")
+    run = build_run_from_preset(PRESET, USER_VARS)
+    tasks = _task_map(run)
+    agg_r2 = tasks["task-risk-aggressive-r2"]
+    assert agg_r2.input_from.get("research_plan") == "task-research-plan"
+
+
 # ----------------------------------------------------------------- determinism
 
 

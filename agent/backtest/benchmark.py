@@ -161,9 +161,19 @@ def _fetch_benchmark(
     if market == "crypto":
         from backtest.loaders.registry import fetch_ohlcv_with_fallback
 
-        return fetch_ohlcv_with_fallback(
-            ["okx", "ccxt"], ticker, start_date, end_date, interval=interval
-        )
+        try:
+            df = fetch_ohlcv_with_fallback(
+                ["okx", "ccxt"], ticker, start_date, end_date, interval=interval
+            )
+        except Exception:
+            df = None
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+        # The loader path is primary for crypto-shaped tickers, but an
+        # explicitly-passed ticker like ``BTC-USD`` is a valid *yfinance*
+        # symbol that OKX/ccxt cannot resolve — fall through to yfinance
+        # rather than let ``resolve_benchmark`` swallow the failure and drop
+        # the benchmark line.
 
     loader = YfinanceLoader()
     result = loader.fetch([ticker], start_date, end_date, interval=interval)

@@ -155,6 +155,35 @@ def test_resolve_benchmark_crypto_end_to_end():
     assert result.total_ret == pytest.approx(104.0 / 101.0 - 1.0)
 
 
+def test_fetch_benchmark_explicit_yfinance_ticker_falls_back(monkeypatch):
+    """Regression: an explicitly-passed ``BTC-USD`` is crypto-shaped (routes
+    through the okx/ccxt loader path) but is a valid *yfinance* ticker that
+    worked before this branch. When the loader path fails, ``_fetch_benchmark``
+    must fall back to yfinance rather than silently losing the benchmark."""
+    from backtest.loaders.base import NoAvailableSourceError
+
+    calls = []
+
+    class _FakeYfinance:
+        def fetch(self, codes, start_date, end_date, interval="1D"):
+            calls.append((tuple(codes), start_date, end_date, interval))
+            return {codes[0]: _ohlcv_frame()}
+
+    def _boom(*args, **kwargs):
+        raise NoAvailableSourceError("no crypto loader resolves BTC-USD")
+
+    monkeypatch.setattr("backtest.benchmark.YfinanceLoader", _FakeYfinance)
+    monkeypatch.setattr(
+        "backtest.loaders.registry.fetch_ohlcv_with_fallback", _boom
+    )
+
+    df = _fetch_benchmark("BTC-USD", "2026-01-01", "2026-01-03", "1D")
+
+    assert not df.empty
+    assert "close" in df.columns
+    assert calls == [(("BTC-USD",), "2026-01-01", "2026-01-03", "1D")]
+
+
 def test_fetch_benchmark_non_crypto_still_uses_yfinance(monkeypatch):
     """Guardrail: the routing fix must not touch the existing yfinance path
     for equities/other markets."""
