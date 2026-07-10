@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import src.providers.backoff as backoff_mod
 from src.providers.chat import LLMResponse, ToolCallRequest
 from src.swarm.models import SwarmAgentSpec, SwarmEvent, SwarmTask, WorkerResult
 import src.swarm.worker as worker_mod
@@ -64,7 +65,7 @@ def _run(
     event_callback=None,
     max_iterations: int = 5,
 ) -> WorkerResult:
-    monkeypatch.setattr(worker_mod, "_STREAM_RETRY_DELAY_S", 0.0)
+    monkeypatch.setattr(backoff_mod.time, "sleep", lambda *_: None)
     agent = SwarmAgentSpec(
         id="analyst",
         role="Synthesis analyst",

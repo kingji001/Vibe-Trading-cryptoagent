@@ -8,6 +8,7 @@ with cancellation and event callback support.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 from concurrent.futures import (
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from src.config.schema import AgentConfig
+from src.core.token_budget import log_token_burn
 from src.swarm import grounding
 from src.swarm.models import (
     RunStatus,
@@ -43,6 +45,42 @@ from src.tools.redaction import redact_internal_paths
 from src.swarm.worker import run_worker
 
 logger = logging.getLogger(__name__)
+
+_LAYER_DEADLINE_BUFFER_S = 60
+
+
+def compute_layer_deadline(
+    *,
+    layer_budget: int,
+    runnable_tasks: int,
+    max_workers: int,
+    buffer_s: int = _LAYER_DEADLINE_BUFFER_S,
+) -> int | None:
+    """Return the hard wall-clock deadline for collecting a layer's results.
+
+    ``layer_budget`` is the worst-case budget for a *single* task
+    (``timeout_seconds × (max_retries + 1)``). The previous fixed
+    ``layer_budget + buffer`` implicitly assumed every task starts at once; at
+    a reduced worker cap a layer with more runnable tasks than workers runs in
+    serialized waves, so wave-2+ tasks start late and a one-wave deadline
+    falsely times out healthy work. Scale by the number of waves =
+    ``ceil(runnable_tasks / max_workers)`` (Phase 2 §4).
+
+    Args:
+        layer_budget: Worst-case single-task budget in seconds across the layer.
+        runnable_tasks: Number of tasks actually submitted to the pool.
+        max_workers: Concurrent worker cap.
+        buffer_s: Fixed grace added on top of the scaled budget.
+
+    Returns:
+        The deadline in seconds, or ``None`` when ``layer_budget`` is falsy
+        (no runnable work — collection should not impose a timeout).
+    """
+    if not layer_budget:
+        return None
+    workers = max_workers if max_workers > 0 else 1
+    waves = math.ceil(runnable_tasks / workers) if runnable_tasks else 1
+    return layer_budget * waves + buffer_s
 
 
 class SwarmRuntime:
@@ -382,7 +420,30 @@ class SwarmRuntime:
                     break
 
         self._store.update_run(run)
-        self._emit_event(run_id, self._make_event("run_completed", data={"status": final_status.value}))
+
+        # Per-run cumulative token summary (+ optional soft-budget warning).
+        # Observability only — the run has already finished here.
+        total_tokens = run.total_input_tokens + run.total_output_tokens
+        log_token_burn(
+            logger,
+            scope="swarm",
+            run_id=run_id,
+            input_tokens=run.total_input_tokens,
+            output_tokens=run.total_output_tokens,
+            total_tokens=total_tokens,
+        )
+        self._emit_event(
+            run_id,
+            self._make_event(
+                "run_completed",
+                data={
+                    "status": final_status.value,
+                    "input_tokens": run.total_input_tokens,
+                    "output_tokens": run.total_output_tokens,
+                    "total_tokens": total_tokens,
+                },
+            ),
+        )
 
         # Cleanup cancel event and live callback
         with self._lock:
@@ -590,9 +651,13 @@ class SwarmRuntime:
 
             # Collect results with a hard layer-level deadline — defends against
             # worker threads stuck in C extensions / blocked I/O that bypass the
-            # in-loop timeout check (issue #42).
-            deadline_buffer = 60
-            layer_deadline = layer_budget + deadline_buffer if layer_budget else None
+            # in-loop timeout check (issue #42). The deadline scales with the
+            # number of serialized waves at the current worker cap (Phase 2 §4).
+            layer_deadline = compute_layer_deadline(
+                layer_budget=layer_budget,
+                runnable_tasks=len(futures),
+                max_workers=self._max_workers,
+            )
 
             try:
                 for future in as_completed(futures, timeout=layer_deadline):
