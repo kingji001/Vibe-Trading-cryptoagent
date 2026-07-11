@@ -803,6 +803,110 @@ def test_1h_empty_bar_list_leaves_watermark_untouched(monkeypatch, tmp_path, pri
     assert store.load_tick_state()["last_bar_ts"]["BTC-USDT"] == "2026-07-11T02:00:00Z"
 
 
+def test_1h_tp_partial_then_stop_closes_remaining_across_bars(
+    monkeypatch, tmp_path, price_fn
+):
+    """TP in bar 03:00 sells HALF (5 of 10); bar 04:00 is quiet; the stop in
+    bar 05:00 closes the REMAINING 5 — partial state carries correctly across
+    the multi-bar loop, with exact realized numbers for both fills."""
+    store = _mk_1h_store(monkeypatch, tmp_path)
+    _seed_position(
+        store,
+        stop=95.0,
+        take_profits=[{"price": 110.0, "fraction": 0.5}],
+        opened_at="2026-07-09T00:00:00Z",
+    )
+    store.save_tick_state(
+        {"last_bar_ts": {"BTC-USDT": "2026-07-11T02:00:00Z"},
+         "last_event_trigger_ts": {}, "last_price": {}}
+    )
+    bars = [
+        _hbar("2026-07-11T03:00:00Z", open=101.0, high=112.0, low=99.0, close=111.0),  # TP
+        _hbar("2026-07-11T04:00:00Z", open=108.0, high=109.0, low=105.0, close=107.0),  # quiet
+        _hbar("2026-07-11T05:00:00Z", open=99.0, high=100.0, low=90.0, close=94.0),  # stop
+    ]
+    result = run_tick(
+        store, bars_fn=lambda s, n: bars, price_fn=price_fn,
+        now=datetime(2026, 7, 11, 6, 0, tzinfo=timezone.utc),
+    )
+
+    fills = result["conditional_fills"]
+    assert [f["order_type"] for f in fills] == ["take_profit", "stop"]
+
+    tp = fills[0]
+    assert tp["fill_price"] == pytest.approx(110.0, abs=ABS)  # no gap: fills at TP price
+    assert tp["qty"] == pytest.approx(5.0, abs=ABS)  # fraction 0.5 of 10
+    tp_fee = (5.0 * 110.0) * 10 / 10_000
+    assert tp["fee_paid"] == pytest.approx(tp_fee, abs=ABS)
+    assert tp["realized_pnl"] == pytest.approx((110.0 - 100.0) * 5.0 - tp_fee, abs=ABS)
+
+    stop = fills[1]
+    assert stop["fill_price"] == pytest.approx(95.0, abs=ABS)  # open(99) > stop(95): no gap
+    assert stop["qty"] == pytest.approx(5.0, abs=ABS)  # only the REMAINING half
+    stop_fee = (5.0 * 95.0) * 10 / 10_000
+    assert stop["fee_paid"] == pytest.approx(stop_fee, abs=ABS)
+    assert stop["realized_pnl"] == pytest.approx((95.0 - 100.0) * 5.0 - stop_fee, abs=ABS)
+
+    assert store.load_positions() == []  # fully closed
+    st = store.load_tick_state()
+    assert st["last_bar_ts"]["BTC-USDT"] == "2026-07-11T05:00:00Z"
+
+
+def test_1h_multi_symbol_fetch_failure_isolated_per_symbol(
+    monkeypatch, tmp_path, price_fn
+):
+    """bars_fn raising for symbol A must not stop symbol B: B's conditional
+    fill executes and B's watermark advances; A's error is recorded and A's
+    watermark (and position) stay untouched."""
+    store = _mk_1h_store(monkeypatch, tmp_path)
+    store.save_positions(
+        [
+            {
+                "symbol": "BTC-USDT", "qty": 10.0, "avg_entry": 100.0,
+                "stop": 95.0, "take_profits": [],
+                "opened_at": "2026-07-09T00:00:00Z", "decision_id": "dA",
+            },
+            {
+                "symbol": "ETH-USDT", "qty": 10.0, "avg_entry": 100.0,
+                "stop": 95.0, "take_profits": [],
+                "opened_at": "2026-07-09T00:00:00Z", "decision_id": "dB",
+            },
+        ]
+    )
+    store.save_tick_state(
+        {"last_bar_ts": {"BTC-USDT": "2026-07-11T02:00:00Z",
+                         "ETH-USDT": "2026-07-11T02:00:00Z"},
+         "last_event_trigger_ts": {}, "last_price": {}}
+    )
+
+    def bars_fn(symbol, now):
+        if symbol == "BTC-USDT":
+            raise RuntimeError("no 1H bars for BTC-USDT via okx/ccxt")
+        return [_hbar("2026-07-11T03:00:00Z", open=99.0, high=100.0, low=90.0, close=94.0)]
+
+    result = run_tick(
+        store, bars_fn=bars_fn, price_fn=price_fn,
+        now=datetime(2026, 7, 11, 4, 0, tzinfo=timezone.utc),
+    )
+
+    # B's stop fired despite A's failure
+    assert len(result["conditional_fills"]) == 1
+    assert result["conditional_fills"][0]["symbol"] == "ETH-USDT"
+    assert result["conditional_fills"][0]["order_type"] == "stop"
+
+    # A's error recorded; A's position untouched
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["symbol"] == "BTC-USDT"
+    positions = store.load_positions()
+    assert [p["symbol"] for p in positions] == ["BTC-USDT"]  # ETH closed, BTC intact
+    assert positions[0]["qty"] == pytest.approx(10.0, abs=ABS)
+
+    # A's watermark untouched; B's advanced
+    st = store.load_tick_state()
+    assert st["last_bar_ts"]["BTC-USDT"] == "2026-07-11T02:00:00Z"
+    assert st["last_bar_ts"]["ETH-USDT"] == "2026-07-11T03:00:00Z"
+
+
 def test_1h_equity_snapshot_one_per_utc_date(monkeypatch, tmp_path, price_fn):
     store = _mk_1h_store(monkeypatch, tmp_path)
     _seed_position(store, stop=None, take_profits=[], opened_at="2026-07-09T00:00:00Z")
