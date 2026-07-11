@@ -725,11 +725,35 @@ which launchd will retry per its own backoff. Still out of scope: this sketch
 is not tested, not wired into `run72.sh`, and does not change the "power
 loss/reboot honestly fails the window" limit above.
 
-### Post-run report
+### Getting the report — while the run is still up
 
 ```bash
-vibe-trading ops report --window 72h
+vibe-trading ops report
 ```
+
+Run this **before** `run72.sh stop`, against the still-running supervisor.
+Prefer the plain form above (no `--window`): the default window starts at
+the last supervisor `start` event, so it always covers exactly the run
+currently in progress. Only add an explicit `--window 72h` once the run has
+genuinely been up for **more than 72 hours** — requesting it earlier just
+extends the window past the `start` event for no benefit.
+
+This ordering is not a style preference, it is required: one of the verdict
+conditions above is "no supervisor `stop` event in-window." `run72.sh stop`
+always appends a `stop` event to `supervisor.jsonl`, so **any report
+generated after `stop` has run will see that event and report
+`INTERRUPTED/DEGRADED`** ("supervisor start/stop cycle inside the window --
+the run was not continuous"), regardless of how clean the heartbeat and
+restart history were. This is intentional anti-overstate design, not a
+limitation to work around: `stop` is the harness's own signal that
+supervision has ended, so a report pulled afterward is, correctly, reporting
+on a session that is already over — it must not be able to claim
+"uninterrupted" for a window that includes its own teardown.
+
+If you need a report on a run that has already been stopped (a postmortem,
+say), expect and read the `INTERRUPTED/DEGRADED` stop-cycle reason as
+accurate, not a bug — generate the report before stopping next time if you
+want a shot at `UNINTERRUPTED`.
 
 Prints a one-screen terminal summary (verdict, heartbeat uptime/gap,
 restart count, scheduled-firing counts) and writes the full Markdown report
@@ -762,7 +786,11 @@ keep the smoke fast) and `VIBE_TRADING_ENABLE_SCHEDULER=0` (the committee
 must not fire during a plumbing check). It ran the real `vibe-trading
 serve` — no `VIBE_OPS_SERVE_CMD` override — for about 30 seconds, through
 `start` → a few heartbeats → `status` → `stop`, then `vibe-trading ops
-report`:
+report`. **This capture predates the current "report before `stop`"
+guidance above** — it is kept here purely to illustrate the startup-grace
+rule below, not as an ordering to copy; see the corrected verdict note
+right after the sample output for why reporting in this order can no longer
+earn `UNINTERRUPTED`:
 
 ```
 ## Verdict: INTERRUPTED/DEGRADED
@@ -792,11 +820,19 @@ above), that single cold-start `ok:false` — within 120 seconds of the
 `start` event and before the first healthy beat — is classified *startup
 grace*: still recorded and rendered with its own count
 (`N startup-grace reading(s) excluded from verdict per
-VIBE_OPS_STARTUP_GRACE_S=120`), but excluded from the uptime condition. The
-same run today, with everything else identical (0 restarts, max gap under
-2× interval, edge coverage within threshold), renders `UNINTERRUPTED`. An
-`ok:false` appearing *after* the first healthy beat, or beyond the grace
-horizon with the server still unhealthy, degrades exactly as before.
+VIBE_OPS_STARTUP_GRACE_S=120`), but excluded from the uptime condition.
+Reported **before** `stop` — as the corrected guidance above recommends —
+the same run, with everything else identical (0 restarts, max gap under 2×
+interval, edge coverage within threshold), renders `UNINTERRUPTED` today.
+Reported **after** `stop`, exactly as this capture was, it instead renders
+`INTERRUPTED/DEGRADED` under the separate, independent stop-cycle condition
+("supervisor start/stop cycle inside the window — the run was not
+continuous") — that failure has nothing to do with startup grace and no
+amount of grace tuning changes it. This capture is a startup-grace
+illustration only; reported in the order it actually was, it cannot and
+does not demonstrate an `UNINTERRUPTED` verdict. An `ok:false` appearing
+*after* the first healthy beat, or beyond the grace horizon with the server
+still unhealthy, still degrades exactly as described above.
 
 **Port already in use:** the real server binds `127.0.0.1:8000` by default
 (`vibe-trading serve --host 127.0.0.1 --port 8000`). If something else is
