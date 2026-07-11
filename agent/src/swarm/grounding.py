@@ -141,6 +141,115 @@ def extract_symbols_from_user_vars(user_vars: dict[str, str]) -> list[str]:
     return list(explicit) + [s for s in promoted if s not in explicit]
 
 
+# --------------------------------------------------------------------------- #
+# Instrument identity anchor (Phase 5)
+# --------------------------------------------------------------------------- #
+#
+# For most presets, a symbol that fails to resolve simply drops out of the
+# grounding block (the behavior above) — the {var} is often free-text advisory
+# context (e.g. investment_committee's {target} is a whole prompt snippet),
+# so hard-failing the run on a bad match would be a false-positive footgun.
+#
+# The crypto committee is different: {target} IS the instrument the other
+# eleven agents unanimously analyze and vote on for the rest of the run — a
+# silently-ungrounded {target} means eleven agents debate and a PM issues a
+# binding decision_journal entry for an asset nobody actually looked up
+# (TradingAgents' "hallucinated the wrong company from chart shape" failure
+# mode). So for presets listed here ONLY, failing to resolve the identity
+# symbol fails the run at start instead of degrading silently.
+#
+# Scoped to a preset allow-list (not "any preset with a symbol-shaped var")
+# so ad-hoc / exploratory swarm runs — including other presets that also
+# declare a {target} variable but use it as free-text framing rather than a
+# single voted-on instrument — keep today's graceful degradation.
+IDENTITY_ANCHOR_VARS: dict[str, str] = {
+    "crypto_committee": "target",
+}
+
+# Human-readable venue label per detected market, used in the anchor line.
+# Only "crypto" is exercised today (the only preset in IDENTITY_ANCHOR_VARS
+# is crypto-only), but the mapping is kept general rather than hardcoding a
+# crypto-only formatter.
+_VENUE_LABELS: dict[str, str] = {
+    "crypto": "OKX spot",
+}
+
+
+def identity_anchor_var(preset_name: str) -> str | None:
+    """Return the ``user_vars`` key whose symbol must resolve for *preset_name*.
+
+    ``None`` means this preset keeps the legacy silent-drop behavior — see
+    module comment above :data:`IDENTITY_ANCHOR_VARS`.
+    """
+    return IDENTITY_ANCHOR_VARS.get(preset_name)
+
+
+class InstrumentResolutionError(RuntimeError):
+    """Raised when a committee's required identity symbol fails to resolve.
+
+    Carries enough context for the runtime to fail the run at start with an
+    operator-facing message instead of letting every agent silently analyze
+    an ungrounded symbol.
+    """
+
+    def __init__(self, symbol: str, reason: str) -> None:
+        self.symbol = symbol
+        self.reason = reason
+        super().__init__(f"could not resolve instrument {symbol!r}: {reason}")
+
+
+def resolve_identity_symbol(raw_value: str) -> str | None:
+    """Extract the single instrument symbol from a ``{var}`` raw value.
+
+    Reuses the same suffixed/bare-ticker extraction as
+    :func:`extract_symbols_from_user_vars` so "BTC-USDT" and a stray
+    free-text value are handled identically. Returns ``None`` if no
+    recognizable symbol is present.
+    """
+    found = extract_symbols_from_user_vars({"_anchor": raw_value})
+    return found[0] if found else None
+
+
+def _format_anchor_price(value: float) -> str:
+    """Format a price with thousands separators and 1-2 decimal places."""
+    if value >= 100:
+        return f"{value:,.1f}"
+    if value >= 1:
+        return f"{value:,.2f}"
+    formatted = f"{value:.6f}".rstrip("0").rstrip(".")
+    return formatted or "0"
+
+
+def format_identity_anchor(symbol: str, rows: list[dict]) -> str:
+    """Render the one-line instrument identity anchor for *symbol*.
+
+    ``rows`` is the bars list already fetched for this symbol by
+    :func:`fetch_grounding_data` — this function does no I/O. Uses the most
+    recent bar's close and date as the "last price @ timestamp".
+
+    Raises ``ValueError`` if ``rows`` is empty; callers must only invoke this
+    after confirming the symbol actually resolved.
+    """
+    if not rows:
+        raise ValueError(f"format_identity_anchor called with no data for {symbol!r}")
+
+    from backtest.runner import _detect_market
+
+    try:
+        market = _detect_market(symbol)
+    except Exception:
+        market = ""
+    venue = _VENUE_LABELS.get(market, market.replace("_", " ") if market else "market data")
+
+    last = rows[-1]
+    price = _format_anchor_price(float(last["close"]))
+    timestamp = str(last["trade_date"])
+    return (
+        f"You are analyzing **{symbol}** ({venue}, last {price} @ {timestamp}). "
+        "Do not substitute any other instrument."
+    )
+
+
 def max_grounding_symbols() -> int:
     """Return the configured cap for symbols fetched into worker prompts."""
     raw = os.getenv(MAX_SYMBOLS_ENV, "").strip()
@@ -228,14 +337,26 @@ def fetch_grounding_data(
     return out
 
 
-def format_grounding_block(grounding: dict[str, list[dict]]) -> str:
+def format_grounding_block(
+    grounding: dict[str, list[dict]],
+    *,
+    identity_anchor: str | None = None,
+) -> str:
     """Render *grounding* as a markdown block ready to splice into a prompt.
 
-    Returns the empty string if no symbol has any data — callers can use
-    that as a falsy guard so the section is omitted entirely instead of
-    rendering an empty heading.
+    Args:
+        grounding: Symbol -> bars mapping from :func:`fetch_grounding_data`.
+        identity_anchor: Optional one-line instrument identity anchor from
+            :func:`format_identity_anchor`, prepended above the OHLCV
+            table(s) as its own callout. ``None`` (the default) preserves
+            legacy output byte-for-byte for presets that don't use the
+            identity-anchor mechanism.
+
+    Returns the empty string only when there is neither grounding data nor
+    an identity anchor — callers can use that as a falsy guard so the
+    section is omitted entirely instead of rendering an empty heading.
     """
-    if not grounding:
+    if not grounding and not identity_anchor:
         return ""
 
     sections: list[str] = []
@@ -267,8 +388,13 @@ def format_grounding_block(grounding: dict[str, list[dict]]) -> str:
         )
         sections.append("\n".join(lines))
 
-    if not sections:
+    if not sections and not identity_anchor:
         return ""
+
+    anchor_block = f"**Instrument identity:** {identity_anchor}" if identity_anchor else ""
+
+    if not sections:
+        return anchor_block
 
     header = (
         "## Ground Truth — Recent Market Data\n\n"
@@ -278,4 +404,5 @@ def format_grounding_block(grounding: dict[str, list[dict]]) -> str:
         "call `get_market_data` for the relevant range. When you state a "
         "price, cite the date from this table."
     )
-    return header + "\n\n" + "\n\n".join(sections)
+    body = header + "\n\n" + "\n\n".join(sections)
+    return f"{anchor_block}\n\n{body}" if anchor_block else body

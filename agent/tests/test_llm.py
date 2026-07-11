@@ -176,10 +176,15 @@ class TestSyncProviderEnv:
 
 
 class TestMinimaxTemperature:
-    """MiniMax requires temperature > 0; build_llm should clamp the default."""
+    """MiniMax requires temperature > 0; build_llm applies M3's defaults."""
 
-    def test_minimax_temperature_clamped_from_zero(self) -> None:
-        """When LANGCHAIN_TEMPERATURE=0.0 and provider=minimax, temperature must be clamped to 0.01."""
+    def test_minimax_temperature_defaults_to_m3_recommended(self) -> None:
+        """When LANGCHAIN_TEMPERATURE=0.0 and provider=minimax, apply M3 defaults.
+
+        Phase 1: rather than silently rescuing to 0.01, MiniMax defaults to its
+        documented sampling settings (temperature=1.0, top_p=0.95) when the user
+        left the global 0.0 default in place.
+        """
         import src.providers.llm as llm_mod
         llm_mod._dotenv_loaded = True
 
@@ -188,6 +193,8 @@ class TestMinimaxTemperature:
         class _FakeChatOpenAI:
             def __init__(self, **kwargs: object) -> None:
                 captured["temperature"] = float(kwargs.get("temperature", -1))
+                if "top_p" in kwargs:
+                    captured["top_p"] = float(kwargs["top_p"])
 
         env = {
             "LANGCHAIN_PROVIDER": "minimax",
@@ -199,9 +206,10 @@ class TestMinimaxTemperature:
         with patch.dict(os.environ, env, clear=True):
             with patch.object(llm_mod, "ChatOpenAIWithReasoning", _FakeChatOpenAI):
                 build_llm()
-        assert captured["temperature"] == 0.01, (
-            "MiniMax temperature must be clamped to 0.01 when 0.0 is configured"
+        assert captured["temperature"] == 1.0, (
+            "MiniMax temperature must default to 1.0 when 0.0 is configured"
         )
+        assert captured["top_p"] == 0.95
 
     def test_minimax_positive_temperature_preserved(self) -> None:
         """When an explicit positive temperature is set, it should be preserved."""

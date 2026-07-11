@@ -163,3 +163,58 @@ def test_env_var_overrides_path(jpath, monkeypatch):
     monkeypatch.setenv(journal.JOURNAL_PATH_ENV, str(jpath))
     journal.append_decision(symbol="BTC-USDT", rating="Hold", time_horizon="72h")
     assert len(journal.load_entries()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 — idempotency regression: the scheduled reflection job now calls
+# resolve_due/reflect independently of a committee run's reflection officer,
+# so the same (run_id, symbol) entry can be resolved by BOTH the daily
+# scheduled trigger and a same-day in-run trigger. Both drive the exact same
+# journal.resolve_due/write_reflection functions (no separate code path), so
+# this pins that double-firing them against the same journal file never
+# double-resolves a horizon, never re-surfaces an already-reflected entry for
+# a second reflection, and — since resolve_due short-circuits before ever
+# calling fetch_bars once nothing is due — never makes a redundant network
+# call either.
+# --------------------------------------------------------------------------- #
+
+
+def test_double_resolution_scheduled_then_in_run_is_idempotent(jpath):
+    calls: list[str] = []
+
+    def counting_bars(symbol, start, end):
+        calls.append(symbol)
+        return fake_bars(symbol, start, end)
+
+    entry = _append(jpath)
+
+    # 1) The scheduled job fires first: resolves 24h+72h, then the officer
+    #    (real or scheduled-agent) writes the primary-horizon reflection.
+    scheduled_result = journal.resolve_due(counting_bars, now=T0 + timedelta(hours=80), path=jpath)
+    assert {h for _, h in scheduled_result["resolved"]} == {"24h", "72h"}
+    assert [e["id"] for e in scheduled_result["reflection_due"]] == [entry["id"]]
+    journal.write_reflection(entry["id"], "Buy was right; +3% alpha.", path=jpath)
+    after_scheduled = journal.load_entries(jpath)
+
+    # 2) A same-day in-run trigger (committee's own reflection officer, or a
+    #    second scheduler tick) calls resolve_due again before 7d is due.
+    calls.clear()
+    in_run_result = journal.resolve_due(counting_bars, now=T0 + timedelta(hours=81), path=jpath)
+    assert in_run_result["resolved"] == []  # nothing newly due
+    assert in_run_result["reflection_due"] == []  # already reflected, not re-surfaced
+    assert not in_run_result["errors"]
+    assert calls == []  # no due horizons -> fetch_bars never called again
+    assert journal.load_entries(jpath) == after_scheduled  # byte-for-byte unchanged
+
+    # 3) Only one journal entry ever exists for this (run_id, symbol) pair —
+    #    double-firing resolve_due/reflect never appended a duplicate.
+    assert len(journal.load_entries(jpath)) == 1
+
+    # 4) A later trigger (next day's scheduled tick) resolves the final 7d
+    #    horizon; the already-written reflection is still not re-surfaced.
+    final_result = journal.resolve_due(counting_bars, now=T0 + timedelta(hours=200), path=jpath)
+    assert {h for _, h in final_result["resolved"]} == {"7d"}
+    assert final_result["reflection_due"] == []
+    final_entry = journal.load_entries(jpath)[0]
+    assert final_entry["status"] == "resolved"
+    assert final_entry["reflection"] == "Buy was right; +3% alpha."  # untouched by re-resolution

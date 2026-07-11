@@ -20,6 +20,7 @@ from src.agent.skills import SkillsLoader
 from src.agent.tools import ToolRegistry
 from src.config.schema import AgentConfig
 from src.governance.errors import PolicyDenied
+from src.providers.backoff import run_with_stream_retry
 from src.providers.chat import ChatLLM, LLMResponse, ProviderStreamError
 from src.providers.content_filter import (
     CONTENT_FILTER_SKIP_MESSAGE,
@@ -55,22 +56,7 @@ def _heartbeat_interval_s() -> float:
         return 3.0
 
 
-def _stream_retry_delay_s() -> float:
-    """Resolve the delay before the single stream retry, robust to garbage.
-
-    Returns:
-        Seconds to sleep between a failed ``stream_chat`` attempt and its one
-        retry. Configurable via ``SWARM_STREAM_RETRY_DELAY_S``; a bad value
-        falls back to 1.0s instead of crashing import.
-    """
-    try:
-        return float(os.getenv("SWARM_STREAM_RETRY_DELAY_S", "1.0"))
-    except ValueError:
-        return 1.0
-
-
 _HEARTBEAT_INTERVAL_S = _heartbeat_interval_s()
-_STREAM_RETRY_DELAY_S = _stream_retry_delay_s()
 _MAX_TOKEN_ESTIMATE = 60_000
 
 
@@ -515,28 +501,41 @@ def run_worker(
                         on_text_chunk=_on_text_chunk,
                     )
 
-            # A transient mid-stream hiccup (connection reset) used to be
-            # absorbed by ChatLLM's silent non-streaming fallback; it now
-            # surfaces as ProviderStreamError, so retry the stream exactly
-            # once before taking the existing failure path. Deterministic
-            # 4xx errors skip the retry and fail immediately.
-            try:
-                response = _stream_once()
-            except ProviderStreamError as stream_exc:
-                if not stream_exc.retryable:
-                    raise
+            # A transient mid-stream hiccup (connection reset), a 5xx, or a
+            # 429 throttle surfaces as a retryable ProviderStreamError. Retry
+            # the stream with capped exponential backoff + jitter, honoring
+            # Retry-After (shared policy in providers.backoff). Deterministic
+            # 4xx errors and exhausted attempts re-raise into the failure path.
+            def _on_stream_retry(
+                attempt: int, delay: float, exc: ProviderStreamError
+            ) -> None:
                 logger.warning(
                     "Provider stream failed for agent=%s task=%s iteration=%d "
-                    "(provider=%s model=%s); retrying once: %s",
+                    "(provider=%s model=%s); retry %d in %.1fs: %s",
                     agent_id,
                     task_id,
                     iteration,
-                    stream_exc.provider,
-                    stream_exc.model,
-                    stream_exc,
+                    exc.provider,
+                    exc.model,
+                    attempt,
+                    delay,
+                    exc,
                 )
-                time.sleep(_STREAM_RETRY_DELAY_S)
-                response = _stream_once()
+                _emit(
+                    event_callback,
+                    "stream_retry",
+                    agent_id,
+                    task_id,
+                    {
+                        "iteration": iteration,
+                        "attempt": attempt,
+                        "delay_s": round(delay, 2),
+                        "provider": exc.provider,
+                        "model": exc.model,
+                    },
+                )
+
+            response = run_with_stream_retry(_stream_once, on_retry=_on_stream_retry)
         except Exception as exc:
             error_msg = f"LLM call failed at iteration {iteration}: {exc}"
             logger.warning(error_msg)
@@ -552,6 +551,18 @@ def run_worker(
                 content_filter_warnings=compute_content_filter_warnings(
                     content_filter_count, iteration + 1,
                 ),
+            )
+
+        # Surface time spent queued on the global LLM gate so a slow layer is
+        # diagnosable as "waiting for an LLM slot" vs "provider slow".
+        gate_wait = getattr(response, "gate_wait_seconds", 0.0) or 0.0
+        if gate_wait > 0:
+            _emit(
+                event_callback,
+                "llm_gate_wait",
+                agent_id,
+                task_id,
+                {"iteration": iteration, "gate_wait_s": round(gate_wait, 2)},
             )
 
         # Accumulate token counts

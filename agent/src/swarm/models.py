@@ -175,6 +175,13 @@ class SwarmRun(BaseModel):
             original symbol string; each value is the list of bars returned
             by the loader. ``None`` when no symbols were detected or every
             fetch failed.
+        identity_anchor: One-line instrument identity anchor (e.g. "You are
+            analyzing **BTC-USDT** (OKX spot, last 67,432.1 @ ...). Do not
+            substitute any other instrument.") for presets registered in
+            :data:`src.swarm.grounding.IDENTITY_ANCHOR_VARS`. ``None`` for
+            every other preset, or if this preset's required symbol failed
+            to resolve — in which case the run fails at start instead
+            (see :meth:`SwarmRuntime._execute_run`).
     """
 
     id: str
@@ -191,6 +198,7 @@ class SwarmRun(BaseModel):
     provider: str | None = None
     model: str | None = None
     grounding_data: dict[str, list[dict]] | None = None
+    identity_anchor: str | None = None
 
 
 class WorkerResult(BaseModel):

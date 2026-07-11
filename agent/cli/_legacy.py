@@ -3148,10 +3148,19 @@ def cmd_live_authorize(broker: str) -> int:
 
 
 def cmd_provider_doctor() -> int:
-    """Print redacted provider diagnostics."""
-    from src.providers.llm import provider_diagnostics
+    """Print redacted provider diagnostics.
 
-    console.print_json(data=provider_diagnostics())
+    For MiniMax, also runs provider-specific checks (Path A/B selection, key
+    presence, endpoint reachability, and a reasoning round-trip self-test).
+    These degrade gracefully — a missing MINIMAX_API_KEY reports "no key
+    configured" rather than failing.
+    """
+    from src.providers.llm import minimax_provider_checks, provider_diagnostics
+
+    diagnostics = provider_diagnostics()
+    if str(diagnostics.get("provider", "")).lower() == "minimax":
+        diagnostics["minimax"] = minimax_provider_checks()
+    console.print_json(data=diagnostics)
     return EXIT_SUCCESS
 
 

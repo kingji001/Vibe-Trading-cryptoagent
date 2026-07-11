@@ -8,6 +8,7 @@ with cancellation and event callback support.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 from concurrent.futures import (
@@ -21,6 +22,8 @@ from pathlib import Path
 from typing import Callable
 
 from src.config.schema import AgentConfig
+from src.core.token_budget import log_token_burn
+from src.providers.chat import llm_gate_limit
 from src.swarm import grounding
 from src.swarm.models import (
     RunStatus,
@@ -43,6 +46,52 @@ from src.tools.redaction import redact_internal_paths
 from src.swarm.worker import run_worker
 
 logger = logging.getLogger(__name__)
+
+_LAYER_DEADLINE_BUFFER_S = 60
+
+
+def compute_layer_deadline(
+    *,
+    layer_budget: int,
+    runnable_tasks: int,
+    max_workers: int,
+    buffer_s: int = _LAYER_DEADLINE_BUFFER_S,
+) -> int | None:
+    """Return the hard wall-clock deadline for collecting a layer's results.
+
+    ``layer_budget`` is the worst-case budget for a *single* task
+    (``timeout_seconds × (max_retries + 1)``). The previous fixed
+    ``layer_budget + buffer`` implicitly assumed every task starts at once; at
+    a reduced worker cap a layer with more runnable tasks than workers runs in
+    serialized waves, so wave-2+ tasks start late and a one-wave deadline
+    falsely times out healthy work. Scale by the number of waves =
+    ``ceil(runnable_tasks / effective_parallelism)`` (Phase 2 §4).
+
+    Effective parallelism is ``max_workers`` bounded by the global LLM gate
+    cap (``VIBE_LLM_MAX_CONCURRENT``) when the gate is enabled: a run's
+    threads can never make more simultaneous LLM progress than the gate
+    allows, so wave math assuming ``max_workers > cap`` would reintroduce the
+    false-timeout bug the scaling exists to fix. With the gate disabled
+    (cap 0) the divisor is ``max_workers``, unchanged from upstream.
+
+    Args:
+        layer_budget: Worst-case single-task budget in seconds across the layer.
+        runnable_tasks: Number of tasks actually submitted to the pool.
+        max_workers: Concurrent worker cap for this run's thread pool.
+        buffer_s: Fixed grace added on top of the scaled budget.
+
+    Returns:
+        The deadline in seconds, or ``None`` when ``layer_budget`` is falsy
+        (no runnable work — collection should not impose a timeout).
+    """
+    if not layer_budget:
+        return None
+    workers = max_workers if max_workers > 0 else 1
+    gate_cap = llm_gate_limit()
+    if gate_cap > 0:
+        workers = min(workers, gate_cap)
+    waves = math.ceil(runnable_tasks / workers) if runnable_tasks else 1
+    return layer_budget * waves + buffer_s
 
 
 class SwarmRuntime:
@@ -237,7 +286,30 @@ class SwarmRuntime:
         self._store.update_run(run)
         self._emit_event(run_id, self._make_event("run_started"))
 
-        self._prefetch_grounding_data(run)
+        # Presets registered in grounding.IDENTITY_ANCHOR_VARS (today: just
+        # crypto_committee) fail the run right here if their {target} symbol
+        # doesn't resolve to real market data — see _prefetch_grounding_data's
+        # docstring for why this is scoped to an allow-list rather than every
+        # preset. Every other preset keeps silently dropping an unresolved
+        # symbol, unaffected by this branch.
+        instrument_error: grounding.InstrumentResolutionError | None = None
+        try:
+            self._prefetch_grounding_data(run)
+        except grounding.InstrumentResolutionError as exc:
+            instrument_error = exc
+            logger.warning("Run %s failed instrument resolution: %s", run_id, exc)
+            self._emit_event(
+                run_id,
+                self._make_event(
+                    "run_error",
+                    data={
+                        "error": str(exc),
+                        "phase": "grounding",
+                        "symbol": exc.symbol,
+                        "reason": exc.reason,
+                    },
+                ),
+            )
 
         # Initialize task store
         task_store = TaskStore(run_dir)
@@ -249,16 +321,30 @@ class SwarmRuntime:
 
         # Render the grounding block once and pass it to every worker on
         # this run. The block is empty when no symbols were detected, in
-        # which case workers see no extra section.
-        grounding_block = grounding.format_grounding_block(run.grounding_data or {})
+        # which case workers see no extra section. identity_anchor is only
+        # ever set when _prefetch_grounding_data succeeded for an
+        # IDENTITY_ANCHOR_VARS preset.
+        grounding_block = grounding.format_grounding_block(
+            run.grounding_data or {}, identity_anchor=run.identity_anchor
+        )
 
         # Compute execution layers
         layers = topological_layers(run.tasks)
         task_summaries: dict[str, str] = {}
-        all_succeeded = True
+        all_succeeded = instrument_error is None
+
+        if instrument_error is not None:
+            # No worker may see an ungrounded {target}: mark every task
+            # cancelled up front (instead of leaving them at "pending"
+            # forever) and skip the layer loop below entirely — the
+            # `layers if instrument_error is None else []` guard on the
+            # `for` statement makes this a zero-iteration loop.
+            self._cancel_remaining_tasks(task_store, [], run.tasks)
 
         try:
-            for layer_idx, layer_task_ids in enumerate(layers):
+            for layer_idx, layer_task_ids in enumerate(
+                layers if instrument_error is None else []
+            ):
                 # Check cancellation between layers
                 if cancel_event.is_set():
                     logger.info("Run %s cancelled at layer %d", run_id, layer_idx)
@@ -382,7 +468,30 @@ class SwarmRuntime:
                     break
 
         self._store.update_run(run)
-        self._emit_event(run_id, self._make_event("run_completed", data={"status": final_status.value}))
+
+        # Per-run cumulative token summary (+ optional soft-budget warning).
+        # Observability only — the run has already finished here.
+        total_tokens = run.total_input_tokens + run.total_output_tokens
+        log_token_burn(
+            logger,
+            scope="swarm",
+            run_id=run_id,
+            input_tokens=run.total_input_tokens,
+            output_tokens=run.total_output_tokens,
+            total_tokens=total_tokens,
+        )
+        self._emit_event(
+            run_id,
+            self._make_event(
+                "run_completed",
+                data={
+                    "status": final_status.value,
+                    "input_tokens": run.total_input_tokens,
+                    "output_tokens": run.total_output_tokens,
+                    "total_tokens": total_tokens,
+                },
+            ),
+        )
 
         # Cleanup cancel event and live callback
         with self._lock:
@@ -404,8 +513,35 @@ class SwarmRuntime:
             logger.warning("Layer-boundary run.json sync failed", exc_info=True)
 
     def _prefetch_grounding_data(self, run: SwarmRun) -> None:
-        """Fetch run-level grounding data without blocking ``start_run``."""
+        """Fetch run-level grounding data without blocking ``start_run``.
+
+        Raises:
+            grounding.InstrumentResolutionError: Only for presets registered
+                in :data:`grounding.IDENTITY_ANCHOR_VARS` (today: just
+                ``crypto_committee``) whose required ``{var}`` symbol could
+                not be resolved to real market data. Every other preset keeps
+                the legacy behavior of silently dropping an unresolved
+                symbol from the grounding block. Callers MUST fail the run
+                at start on this exception rather than proceed to task
+                execution — see ``_execute_run``.
+        """
         symbols = grounding.extract_symbols_from_user_vars(run.user_vars)
+
+        anchor_var = grounding.identity_anchor_var(run.preset_name)
+        anchor_symbol: str | None = None
+        if anchor_var:
+            raw_value = run.user_vars.get(anchor_var, "")
+            anchor_symbol = grounding.resolve_identity_symbol(
+                raw_value if isinstance(raw_value, str) else ""
+            )
+            if anchor_symbol is None:
+                raise grounding.InstrumentResolutionError(
+                    raw_value if isinstance(raw_value, str) else repr(raw_value),
+                    f"no recognizable instrument symbol found in {{{anchor_var}}}",
+                )
+            if anchor_symbol not in symbols:
+                symbols = [anchor_symbol] + symbols
+
         if not symbols:
             return
 
@@ -418,6 +554,12 @@ class SwarmRuntime:
                 symbol_limit,
             )
             symbols = symbols[:symbol_limit]
+            # The identity-anchor symbol must survive the cap even if many
+            # other symbols were mentioned elsewhere in user_vars — it is
+            # the one every agent on the committee analyzes, not incidental
+            # context.
+            if anchor_symbol and anchor_symbol not in symbols:
+                symbols = symbols[: max(0, symbol_limit - 1)] + [anchor_symbol]
 
         # Multi-symbol grounding fetch can take 30s+ on slow loaders. Wrap it
         # in a heartbeat so events.jsonl gets fresh entries during the fetch
@@ -439,6 +581,7 @@ class SwarmRuntime:
         except ValueError:
             interval = 3.0
 
+        fetched: dict[str, list[dict]] = {}
         try:
             with HeartbeatTimer(
                 tool_name=f"grounding:{len(symbols)}symbols",
@@ -453,7 +596,18 @@ class SwarmRuntime:
                 symbols,
                 exc_info=True,
             )
-            return
+            # fetched stays {} — fall through so the anchor check below still
+            # raises InstrumentResolutionError when required.
+
+        if anchor_symbol:
+            anchor_rows = fetched.get(anchor_symbol)
+            if not anchor_rows:
+                raise grounding.InstrumentResolutionError(
+                    anchor_symbol,
+                    "no market data returned (network failure, wrong loader, "
+                    "or an unlisted/delisted symbol)",
+                )
+            run.identity_anchor = grounding.format_identity_anchor(anchor_symbol, anchor_rows)
 
         if fetched:
             run.grounding_data = fetched
@@ -590,9 +744,22 @@ class SwarmRuntime:
 
             # Collect results with a hard layer-level deadline — defends against
             # worker threads stuck in C extensions / blocked I/O that bypass the
-            # in-loop timeout check (issue #42).
-            deadline_buffer = 60
-            layer_deadline = layer_budget + deadline_buffer if layer_budget else None
+            # in-loop timeout check (issue #42). The deadline scales with the
+            # number of serialized waves at the effective parallelism — this
+            # run's worker cap bounded by the global LLM gate (Phase 2 §4).
+            #
+            # Known residual: the wave math models ONE run owning the gate. N
+            # simultaneous runs share VIBE_LLM_MAX_CONCURRENT slots, so under
+            # multi-run contention a layer can queue on the gate beyond any
+            # single run's deadline and still be marked timed out. Documented
+            # in docs/minimax-migration-notes.md "Known limitations" — prefer
+            # single-run-at-a-time scheduling (or a larger per-task budget)
+            # for multi-run deployments.
+            layer_deadline = compute_layer_deadline(
+                layer_budget=layer_budget,
+                runnable_tasks=len(futures),
+                max_workers=self._max_workers,
+            )
 
             try:
                 for future in as_completed(futures, timeout=layer_deadline):

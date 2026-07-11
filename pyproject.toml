@@ -100,6 +100,12 @@ ibkr = [
 deepseek = [
     "langchain-deepseek>=1.0.0,<2",
 ]
+minimax = [
+    # MiniMax Path B (Anthropic-compatible /anthropic endpoint) native adapter.
+    # Only needed when MINIMAX_BASE_URL points at .../anthropic; the default
+    # OpenAI-compatible /v1 path (Path A) needs no extra dependency.
+    "langchain-anthropic>=1.0.0,<2",
+]
 ashare = [
     # Free, no-auth A-share source over BaoStock's TCP protocol; bypasses the
     # HTTP CDN IP blocks that affect eastmoney-backed sources. The Tencent

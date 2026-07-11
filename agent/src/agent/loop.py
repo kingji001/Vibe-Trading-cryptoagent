@@ -31,6 +31,7 @@ from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
 from src.agent.tools import ToolRegistry
 from src.agent.trace import TraceWriter
 from src.core.state import RunStateStore
+from src.core.token_budget import log_token_burn
 from src.goal.context import (
     format_goal_continuation_prompt,
     get_current_goal_context,
@@ -38,6 +39,7 @@ from src.goal.context import (
     goal_progress_tuple,
 )
 from src.governance.errors import PolicyDenied
+from src.providers.backoff import run_with_stream_retry
 from src.providers.chat import ChatLLM, ProviderStreamError
 from src.providers.content_filter import (
     CONTENT_FILTER_SKIP_MESSAGE,
@@ -54,7 +56,6 @@ KEEP_RECENT = 3
 TOOL_RESULT_LIMIT = 10_000
 HEARTBEAT_INTERVAL_S = float(os.getenv("VT_HEARTBEAT_INTERVAL_S", "3.0"))
 REASONING_DELTA_MIN_INTERVAL_S = float(os.getenv("VT_REASONING_DELTA_MIN_INTERVAL_S", "1.0"))
-STREAM_RETRY_DELAY_S = float(os.getenv("VT_STREAM_RETRY_DELAY_S", "1.0"))
 TOOL_TIMEOUT_SECONDS = float(os.getenv("VIBE_TRADING_TOOL_TIMEOUT_SECONDS", "1800"))
 GOAL_MAX_CONTINUATIONS = int(os.getenv("VIBE_TRADING_GOAL_MAX_CONTINUATIONS", "3"))
 LLM_USAGE_ARTIFACT = "llm_usage.json"
@@ -132,18 +133,31 @@ def _record_llm_usage(
     summary: dict[str, Any],
     usage: Any,
     iteration: int,
+    gate_wait_seconds: float = 0.0,
 ) -> dict[str, int] | None:
-    """Accumulate and persist one provider-reported usage event."""
+    """Accumulate and persist one provider-reported usage event.
+
+    Also folds LLM-gate wait time into the run summary so time spent queued
+    for a concurrency slot is auditable alongside token burn. Returns the
+    normalized token delta (``None`` when the provider reported no usage),
+    unchanged so callers can keep gating the ``llm_usage`` event on it.
+    """
     normalized = _normalize_llm_usage(usage)
-    if normalized is None:
+    gate_wait = gate_wait_seconds if gate_wait_seconds and gate_wait_seconds > 0 else 0.0
+    if normalized is None and not gate_wait:
         return None
 
     totals = summary.setdefault("totals", {})
-    totals["input_tokens"] = int(totals.get("input_tokens") or 0) + normalized["input_tokens"]
-    totals["output_tokens"] = int(totals.get("output_tokens") or 0) + normalized["output_tokens"]
-    totals["total_tokens"] = int(totals.get("total_tokens") or 0) + normalized["total_tokens"]
-    totals["calls"] = int(totals.get("calls") or 0) + 1
-    summary.setdefault("per_iteration", []).append({"iter": iteration, **normalized})
+    if gate_wait:
+        totals["gate_wait_seconds"] = round(
+            float(totals.get("gate_wait_seconds") or 0.0) + gate_wait, 3
+        )
+    if normalized is not None:
+        totals["input_tokens"] = int(totals.get("input_tokens") or 0) + normalized["input_tokens"]
+        totals["output_tokens"] = int(totals.get("output_tokens") or 0) + normalized["output_tokens"]
+        totals["total_tokens"] = int(totals.get("total_tokens") or 0) + normalized["total_tokens"]
+        totals["calls"] = int(totals.get("calls") or 0) + 1
+        summary.setdefault("per_iteration", []).append({"iter": iteration, **normalized})
     summary["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     try:
@@ -518,6 +532,9 @@ class AgentLoop:
         self._previous_summary: str = ""
         self._persistent_memory = persistent_memory
         self._run_iteration: int = 0
+        # Lazily-built ChatLLM for the optional VIBE_COMPACT_MODEL utility
+        # tier (Phase 3); see _auto_compact. None until first used.
+        self._compact_llm: Optional[ChatLLM] = None
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -698,25 +715,34 @@ class AgentLoop:
                 if is_last_iteration:
                     trace.write({"type": "forced_text_only", "iter": current_iter})
 
-                try:
-                    response = self.llm.stream_chat(
+                def _stream_once() -> Any:
+                    """Run one streaming LLM attempt (recomputed per retry)."""
+                    return self.llm.stream_chat(
                         messages,
                         tools=tool_defs,
                         on_text_chunk=_on_text_chunk,
                         on_reasoning_chunk=_on_reasoning_chunk,
                         should_cancel=self._cancel_event.is_set,
                     )
-                except ProviderStreamError as exc:
-                    # One retry for transient mid-stream failures (connection
-                    # reset, relay hiccup) — mirrors the swarm worker policy.
-                    # Deterministic 4xx errors fail immediately. Deltas from
-                    # the failed attempt are dropped so the trace does not
-                    # contain duplicated thinking text.
-                    if not exc.retryable:
-                        raise
+
+                def _on_stream_retry(
+                    attempt: int, delay: float, exc: ProviderStreamError
+                ) -> None:
+                    """Reset partial-stream state and emit before a backoff wait.
+
+                    Retryable mid-stream failures (connection reset, relay
+                    hiccup, 5xx, 429 throttle) are retried with capped
+                    exponential backoff + jitter, honoring Retry-After (shared
+                    policy in providers.backoff). Deltas from the failed attempt
+                    are dropped so the trace holds no duplicated thinking text.
+                    Deterministic 4xx errors never reach here — they re-raise.
+                    """
+                    nonlocal reasoning_chars, last_reasoning_emit
                     logger.warning(
-                        "Provider stream failed (iter %s), retrying once: %s",
+                        "Provider stream failed (iter %s), retry %d in %.1fs: %s",
                         current_iter,
+                        attempt,
+                        delay,
                         exc,
                     )
                     self._emit(
@@ -726,19 +752,15 @@ class AgentLoop:
                             "reason": "provider_stream_retry",
                             "provider": exc.provider,
                             "model": exc.model,
+                            "attempt": attempt,
+                            "delay_s": round(delay, 2),
                         },
                     )
                     thinking_chunks.clear()
                     reasoning_chars = 0
                     last_reasoning_emit = None
-                    _time.sleep(STREAM_RETRY_DELAY_S)
-                    response = self.llm.stream_chat(
-                        messages,
-                        tools=tool_defs,
-                        on_text_chunk=_on_text_chunk,
-                        on_reasoning_chunk=_on_reasoning_chunk,
-                        should_cancel=self._cancel_event.is_set,
-                    )
+
+                response = run_with_stream_retry(_stream_once, on_retry=_on_stream_retry)
 
                 # Cancelled mid-stream: discard this turn's partial response and
                 # end the run now, without executing any of its tool calls.
@@ -746,11 +768,13 @@ class AgentLoop:
                     break
 
                 usage = getattr(response, "usage_metadata", None)
+                gate_wait = getattr(response, "gate_wait_seconds", 0.0) or 0.0
                 usage_delta = _record_llm_usage(
                     run_dir,
                     llm_usage_summary,
                     usage,
                     current_iter,
+                    gate_wait_seconds=gate_wait,
                 )
                 if usage_delta:
                     self._emit(
@@ -759,6 +783,13 @@ class AgentLoop:
                             **usage_delta,
                             "iter": current_iter,
                         },
+                    )
+                if gate_wait > 0:
+                    # Distinguish "queued waiting for an LLM slot" from
+                    # "provider slow" in the event stream.
+                    self._emit(
+                        "llm_gate_wait",
+                        {"iter": current_iter, "gate_wait_s": round(gate_wait, 2)},
                     )
                 if active_goal_id and session_id:
                     token_delta = int(usage_delta.get("total_tokens") or 0) if usage_delta else 0
@@ -1023,6 +1054,20 @@ class AgentLoop:
         )
         if cf_warnings:
             result["content_filter_warnings"] = cf_warnings
+
+        # Per-run cumulative token summary (+ optional soft-budget warning).
+        # Observability only — the run is already finished.
+        _usage_totals = llm_usage_summary.get("totals", {})
+        log_token_burn(
+            logger,
+            scope="agent",
+            run_id=run_dir.name,
+            input_tokens=int(_usage_totals.get("input_tokens") or 0),
+            output_tokens=int(_usage_totals.get("output_tokens") or 0),
+            total_tokens=int(_usage_totals.get("total_tokens") or 0) or None,
+            calls=int(_usage_totals.get("calls") or 0) or None,
+            gate_wait_seconds=float(_usage_totals.get("gate_wait_seconds") or 0.0) or None,
+        )
 
         return result
 
@@ -1530,7 +1575,16 @@ class AgentLoop:
         else:
             prompt = _STRUCTURED_SUMMARY_PROMPT.format(focus_section=focus_section) + conv_text
 
-        summary_resp = self.llm.chat([{"role": "user", "content": prompt}])
+        # Phase 3 optional utility tier: route the summarization call through
+        # a cheaper same-provider model when VIBE_COMPACT_MODEL is set.
+        # Unset (default) keeps the upstream behavior of using the main model.
+        compact_model = os.getenv("VIBE_COMPACT_MODEL", "").strip()
+        summary_llm = self.llm
+        if compact_model:
+            if self._compact_llm is None or self._compact_llm.model_name != compact_model:
+                self._compact_llm = ChatLLM(model_name=compact_model)
+            summary_llm = self._compact_llm
+        summary_resp = summary_llm.chat([{"role": "user", "content": prompt}])
         summary = summary_resp.content or ""
         self._previous_summary = summary
 

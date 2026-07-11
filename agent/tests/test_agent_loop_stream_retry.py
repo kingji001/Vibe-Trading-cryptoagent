@@ -1,10 +1,13 @@
-"""AgentLoop single stream retry on ProviderStreamError.
+"""AgentLoop throttle-aware stream retry on ProviderStreamError.
 
 Mirrors the swarm worker policy: a transient mid-stream failure (connection
-reset, relay hiccup, 5xx) is retried exactly once; a deterministic 4xx fails
-the run immediately with error_code=provider_stream_error and no wasted
-request. Deltas from the failed attempt are dropped so the trace does not
-contain duplicated thinking text.
+reset, relay hiccup, 5xx, 429 throttle) is retried with capped exponential
+backoff + jitter (shared policy in ``src.providers.backoff``); a deterministic
+4xx fails the run immediately with error_code=provider_stream_error and no
+wasted request. Deltas from the failed attempt are dropped so the trace does
+not contain duplicated thinking text. These tests pin ``VT_STREAM_RETRY_MAX``
+to 2 so the max-attempts boundary is exercised with the historical call counts;
+the backoff schedule itself is covered in ``test_concurrency_governance.py``.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from typing import Any, Callable
 import pytest
 
 import src.agent.loop as loop_mod
+import src.providers.backoff as backoff_mod
 from src.providers.chat import LLMResponse, ProviderStreamError
 
 
@@ -125,7 +129,8 @@ def _run(
     from src.memory.persistent import PersistentMemory
     from src.tools import build_registry
 
-    monkeypatch.setattr(loop_mod, "STREAM_RETRY_DELAY_S", 0.0)
+    monkeypatch.setenv("VT_STREAM_RETRY_MAX", "2")
+    monkeypatch.setattr(backoff_mod.time, "sleep", lambda *_: None)
     pm = PersistentMemory()
     agent = AgentLoop(
         registry=build_registry(persistent_memory=pm, include_shell_tools=False),

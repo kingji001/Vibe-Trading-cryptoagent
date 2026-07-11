@@ -216,6 +216,54 @@ It is designed for research, simulation, and backtesting — and, when you choos
 
 ---
 
+## 🔀 Fork Divergence
+
+This fork adds a crypto investment committee and a MiniMax M3 provider
+migration on top of upstream [HKUDS/Vibe-Trading](https://github.com/HKUDS/Vibe-Trading).
+Full architecture and operator reference: [`docs/crypto-committee.md`](docs/crypto-committee.md);
+provider findings and config: [`docs/minimax-migration-notes.md`](docs/minimax-migration-notes.md).
+
+- **Crypto investment committee** (`crypto_committee` swarm preset, 13 seats):
+  a TradingAgents-style pipeline — reflection officer, 4 analysts
+  (technical/on-chain/news/sentiment), bull/bear debate judged by a research
+  manager, a trader, a 3-way risk rotation, and a portfolio manager whose
+  final rating is journaled. Typed, schema-validated decisions
+  (`agent/src/committee/schemas.py`) instead of free-text parsing.
+- **MiniMax M3 provider support**: a hardened `minimax` provider with
+  automatic Path A (OpenAI-compatible `/v1`, reasoning capture/replay via
+  `reasoning_split`) / Path B (Anthropic-compatible `/anthropic`) selection
+  based on `MINIMAX_BASE_URL`, `MINIMAX_THINKING` control, temperature/top_p
+  defaulting, and `vibe-trading provider doctor` diagnostics.
+- **Concurrency governance**: a process-wide LLM request gate
+  (`VIBE_LLM_MAX_CONCURRENT`) with gate-wait telemetry, layer-deadline wave
+  scaling bounded by the gate, and throttle-aware exponential backoff
+  (`Retry-After`-honoring) for 408/429/5xx errors.
+- **Model tiering**: provider-agnostic `VIBE_DEEP_MODEL` / `VIBE_QUICK_MODEL`
+  / `VIBE_COMPACT_MODEL` placeholders so swarm presets route judge seats to a
+  stronger tier and everything else to a cheaper one, on any provider.
+- **Multi-round debate**: `VIBE_DEBATE_ROUNDS` / `VIBE_RISK_ROUNDS` unroll
+  the committee's bull/bear and risk-rotation debates into deeper adversarial
+  exchanges (capped at 4 rounds); unset reproduces the original single-pass
+  behavior exactly.
+- **Anti-hallucination tools**: `get_verified_crypto_snapshot` and
+  `get_crypto_sentiment_data` fetch deterministic, LLM-free market/sentiment
+  data as the committee's source of truth, plus a fail-fast identity anchor
+  that aborts a committee run at start if its target symbol can't be
+  resolved to real market data — rather than letting agents debate an
+  ungrounded asset.
+- **Learning loop**: an append-only decision journal
+  (`~/.vibe-trading/committee/journal.jsonl`) records every decision and
+  resolves 24h/72h/7d realized return + alpha against a crypto benchmark;
+  an optional daily scheduled job (`VIBE_TRADING_ENABLE_SCHEDULER=1`)
+  resolves outcomes and writes reflections even on days with no committee
+  run.
+
+A DeepSeek-baseline config is kept as a permanently-commented block in
+[`agent/.env.example`](agent/.env.example) as the rollback escape hatch —
+switching providers is a pure `.env` change, no code involved.
+
+---
+
 ## ✨ What You Can Do
 
 | Task | Output |

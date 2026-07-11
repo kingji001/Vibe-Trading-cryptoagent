@@ -8,11 +8,91 @@ from __future__ import annotations
 import html
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from src.providers.content_filter import is_content_filter_triggered
 from src.providers.llm import build_llm
+
+
+# --------------------------------------------------------------------------- #
+# Global LLM concurrency gate (Phase 2 §4)
+# --------------------------------------------------------------------------- #
+#
+# Every LLM call in the process — swarm workers, the main ReAct agent, context
+# compaction — funnels through ``ChatLLM``. A single module-level
+# ``BoundedSemaphore`` here is therefore the one chokepoint that can enforce a
+# hard ceiling on *simultaneous in-flight requests*, regardless of how many
+# swarm runs or threads exist. ``SWARM_MAX_WORKERS`` is only a scheduling hint.
+#
+# Sized by ``VIBE_LLM_MAX_CONCURRENT`` (default 0 = disabled → the gate is
+# never acquired and upstream behavior is byte-identical). The semaphore is
+# acquired *before* the HTTP request timer starts (inside ``stream_chat`` /
+# ``chat``, ahead of the provider call), so queue-wait time never counts
+# against the per-call ``TIMEOUT_SECONDS``. The measured wait is surfaced on
+# ``LLMResponse.gate_wait_seconds`` so "queued 47s waiting for an LLM slot" is
+# distinguishable from "provider slow" in run telemetry.
+
+_GATE_LOCK = threading.Lock()
+_GATE_CACHE: Dict[int, "threading.BoundedSemaphore"] = {}
+
+
+def _resolve_gate_limit() -> int:
+    """Return the configured concurrency ceiling, robust to garbage values."""
+    try:
+        limit = int(os.getenv("VIBE_LLM_MAX_CONCURRENT", "0") or "0")
+    except (TypeError, ValueError):
+        return 0
+    return limit if limit > 0 else 0
+
+
+def llm_gate_limit() -> int:
+    """Return the configured global LLM concurrency cap (0 = gate disabled).
+
+    Public accessor for schedulers that must not assume more parallelism than
+    the gate allows (e.g. swarm layer-deadline math).
+    """
+    return _resolve_gate_limit()
+
+
+def get_llm_gate() -> Optional["threading.BoundedSemaphore"]:
+    """Return the process-wide LLM semaphore, or ``None`` when disabled.
+
+    Returns ``None`` (the zero-overhead path) when ``VIBE_LLM_MAX_CONCURRENT``
+    is unset or ``<= 0``. Otherwise returns a per-limit-cached
+    ``BoundedSemaphore`` so every caller in the process shares one gate.
+    """
+    limit = _resolve_gate_limit()
+    if limit <= 0:
+        return None
+    with _GATE_LOCK:
+        gate = _GATE_CACHE.get(limit)
+        if gate is None:
+            gate = threading.BoundedSemaphore(limit)
+            _GATE_CACHE[limit] = gate
+        return gate
+
+
+def reset_llm_gate() -> None:
+    """Clear the cached semaphores (test hook; not used in production)."""
+    with _GATE_LOCK:
+        _GATE_CACHE.clear()
+
+
+def _acquire_gate(gate: Optional["threading.BoundedSemaphore"]) -> float:
+    """Acquire ``gate`` (blocking) and return the seconds spent waiting.
+
+    Returns ``0.0`` when ``gate`` is ``None`` (the disabled, zero-overhead
+    path). The wait is measured before the provider request begins so it is
+    reported separately and never charged against the HTTP call timeout.
+    """
+    if gate is None:
+        return 0.0
+    started = time.monotonic()
+    gate.acquire()
+    return time.monotonic() - started
 
 
 def _dedupe_finish_reason(raw: str) -> str:
@@ -72,6 +152,9 @@ class LLMResponse:
     finish_reason: str = "stop"
     usage_metadata: Optional[Dict[str, int]] = None
     content_filter_triggered: bool = False
+    gate_wait_seconds: float = 0.0
+    """Seconds spent blocked on the global LLM concurrency gate before this
+    call's request began. ``0.0`` when the gate is disabled or was free."""
 
     @property
     def has_tool_calls(self) -> bool:
@@ -240,10 +323,18 @@ class ChatLLM:
         Returns:
             LLMResponse.
         """
-        llm = self._llm.bind_tools(tools) if tools else self._llm
-        config = {"timeout": timeout} if timeout else {}
-        ai_message = llm.invoke(messages, config=config)
-        return self._parse_response(ai_message)
+        gate = get_llm_gate()
+        gate_wait = _acquire_gate(gate)
+        try:
+            llm = self._llm.bind_tools(tools) if tools else self._llm
+            config = {"timeout": timeout} if timeout else {}
+            ai_message = llm.invoke(messages, config=config)
+            response = self._parse_response(ai_message)
+            response.gate_wait_seconds = gate_wait
+            return response
+        finally:
+            if gate is not None:
+                gate.release()
 
     def stream_chat(
         self,
@@ -273,6 +364,8 @@ class ChatLLM:
         Returns:
             Parsed ``LLMResponse``.
         """
+        gate = get_llm_gate()
+        gate_wait = _acquire_gate(gate)
         try:
             llm = self._llm.bind_tools(tools) if tools else self._llm
             config = {"timeout": timeout} if timeout else {}
@@ -298,8 +391,11 @@ class ChatLLM:
                     on_reasoning_chunk(reasoning)
                 accumulated = chunk if accumulated is None else accumulated + chunk
             if accumulated is None:
-                return LLMResponse(content="", tool_calls=[], finish_reason="stop")
+                empty = LLMResponse(content="", tool_calls=[], finish_reason="stop")
+                empty.gate_wait_seconds = gate_wait
+                return empty
             response = self._parse_response(accumulated)
+            response.gate_wait_seconds = gate_wait
             if pending_text and not (response.has_tool_calls and response.content == ""):
                 on_text_chunk(pending_text)
             return response
@@ -307,6 +403,9 @@ class ChatLLM:
             provider = os.getenv("LANGCHAIN_PROVIDER", "openai").strip().lower() or "openai"
             model = self.model_name or os.getenv("LANGCHAIN_MODEL_NAME", "").strip() or "(unset)"
             raise ProviderStreamError(provider=provider, model=model, original=exc) from exc
+        finally:
+            if gate is not None:
+                gate.release()
 
     @staticmethod
     def _tool_call_thought_signature_maps(ai_message: Any) -> tuple[dict[str, str], dict[int, str]]:

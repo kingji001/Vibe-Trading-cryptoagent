@@ -104,8 +104,14 @@ if ChatOpenAI is not None:
             if not isinstance(src, dict):
                 return
             caps = self._capabilities()
-            if caps.capture_reasoning and (value := src.get("reasoning_content") or src.get("reasoning")):
-                msg.additional_kwargs["reasoning_content"] = value
+            if caps.capture_reasoning:
+                value = src.get("reasoning_content") or src.get("reasoning")
+                # MiniMax M3 (reasoning_split) surfaces reasoning under the
+                # ``reasoning_details`` field rather than ``reasoning_content``.
+                if not value and caps.reasoning_split_extra_body:
+                    value = src.get("reasoning_details")
+                if value:
+                    msg.additional_kwargs["reasoning_content"] = value
             if caps.gemini_thought_signatures and (
                 signatures := self._collect_tool_call_thought_signatures(src.get("tool_calls"))
             ):
@@ -271,7 +277,25 @@ if ChatOpenAI is not None:
                 if caps.normalize_assistant_content and m.get("content") is None:
                     m["content"] = ""
                 if caps.send_reasoning_content:
-                    m["reasoning_content"] = source_message.additional_kwargs.get("reasoning_content", "")
+                    reasoning = source_message.additional_kwargs.get("reasoning_content", "")
+                    if caps.reasoning_split_extra_body:
+                        # MiniMax M3 expects reasoning replayed under its own
+                        # ``reasoning_details`` field as a TYPED LIST of
+                        # ``{"type": "reasoning.text", "text": ...}`` objects.
+                        # Live-verified (api.minimaxi.com/v1): a plain or empty
+                        # string is rejected with 400 "Mismatch type
+                        # []*open_platform_oai.ReasoningDetail"; on turns with
+                        # no reasoning the key must be omitted entirely.
+                        m.pop("reasoning_content", None)
+                        m.pop("reasoning_details", None)
+                        if reasoning and isinstance(reasoning, list):
+                            m["reasoning_details"] = reasoning
+                        elif reasoning:
+                            m["reasoning_details"] = [
+                                {"type": "reasoning.text", "text": reasoning}
+                            ]
+                    else:
+                        m["reasoning_content"] = reasoning
                 else:
                     m.pop("reasoning_content", None)
                 if caps.gemini_thought_signatures:
@@ -412,6 +436,95 @@ def _build_native_deepseek(
         api_key=api_key or None,
         base_url=base_url or None,
     )
+
+
+def _minimax_base_url() -> str:
+    """Return the configured MiniMax base URL (provider-specific → OPENAI_* fallback)."""
+    return (
+        os.getenv("MINIMAX_BASE_URL", "")
+        or os.getenv("OPENAI_BASE_URL", "")
+        or os.getenv("OPENAI_API_BASE", "")
+    ).strip()
+
+
+def _minimax_uses_anthropic_endpoint() -> bool:
+    """Return True when MiniMax should use Path B (Anthropic-compatible adapter).
+
+    Selection rule (Phase 1 Adaptation): a base URL containing ``/anthropic``
+    selects the native ``langchain-anthropic`` adapter (Path B); anything else
+    (default ``https://api.minimax.io/v1``) keeps the OpenAI-compatible
+    ``ChatOpenAIWithReasoning`` path (Path A).
+    """
+    return "/anthropic" in _minimax_base_url().lower()
+
+
+def _minimax_thinking_mode() -> str | None:
+    """Return the configured MiniMax ``thinking`` mode, or None when unset.
+
+    ``MINIMAX_THINKING`` accepts ``adaptive`` (M3 default; upstream behavior)
+    or ``disabled`` (quick tier — turn thinking off). Unset/unknown → None so
+    the request defaults to upstream behavior.
+    """
+    mode = os.getenv("MINIMAX_THINKING", "").strip().lower()
+    return mode if mode in {"adaptive", "disabled"} else None
+
+
+def _build_native_minimax_anthropic(
+    *,
+    model: str,
+    temperature: float,
+    top_p: float | None = None,
+    callbacks: Any = None,
+) -> Any:
+    """Build the MiniMax Path B adapter (Anthropic-compatible endpoint).
+
+    Uses the optional ``langchain-anthropic`` package pointed at
+    ``https://api.minimax.io/anthropic`` (Subscription-Key / ``x-api-key``
+    surface). Raises a clear install hint when the optional package is missing.
+
+    KNOWN LIMITATION (Phase 1, deferred): reasoning replay across ReAct tool
+    turns is UNVERIFIED on this path. The loop replays history as OpenAI-format
+    dicts carrying reasoning in ``reasoning_content`` /
+    ``additional_kwargs["reasoning_content"]``; nothing here translates that
+    into Anthropic ``thinking`` content blocks, so M3 reasoning is most likely
+    NOT replayed on Path B. Implementing the translation is deferred until a
+    live Phase 0 probe (``scripts/minimax_probe.py reasoning``) confirms the
+    exact thinking-block round-trip shape. Path A is the evidence-backed path;
+    see "Known limitations" in ``docs/minimax-migration-notes.md``.
+
+    Raises:
+        RuntimeError: If ``langchain-anthropic`` is not installed.
+    """
+    try:
+        module = import_module("langchain_anthropic")
+        chat_anthropic = getattr(module, "ChatAnthropic")
+    except Exception as exc:  # noqa: BLE001 - surface a clear install hint
+        raise RuntimeError(
+            "MiniMax Path B (Anthropic-compatible endpoint) requires the optional "
+            "'langchain-anthropic' package. Install it with: "
+            'pip install "vibe-trading-ai[minimax]" '
+            "(or: uv pip install langchain-anthropic), or point MINIMAX_BASE_URL "
+            f"back at the OpenAI-compatible /v1 endpoint. Import error: {exc}"
+        ) from exc
+
+    key_env, _ = provider_env_names("minimax", model)
+    api_key = os.getenv(key_env or "", "") or os.getenv("OPENAI_API_KEY", "")
+    base_url = _minimax_base_url()
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "temperature": temperature,
+        "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
+        "max_retries": int(os.getenv("MAX_RETRIES", "2")),
+        "max_tokens": int(os.getenv("MINIMAX_MAX_TOKENS", "4096")),
+        "callbacks": callbacks,
+        "api_key": api_key or None,
+        "base_url": base_url or None,
+    }
+    if top_p is not None:
+        kwargs["top_p"] = top_p
+    if _minimax_thinking_mode() == "disabled":
+        kwargs["thinking"] = {"type": "disabled"}
+    return chat_anthropic(**kwargs)
 
 
 def _load_env_file(path: Path) -> None:
@@ -559,8 +672,99 @@ def provider_diagnostics() -> dict[str, Any]:
             "send_reasoning_content": caps.send_reasoning_content,
             "gemini_thought_signatures": caps.gemini_thought_signatures,
             "openrouter_reasoning_body": caps.openrouter_reasoning_body,
+            "reasoning_split_extra_body": caps.reasoning_split_extra_body,
         },
     }
+
+
+def _minimax_endpoint_reachable(base_url: str) -> str:
+    """Best-effort MiniMax endpoint reachability probe (never raises)."""
+    try:
+        import httpx
+
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(base_url)
+        # Any HTTP response (even 401/404) proves the host is reachable.
+        return f"reachable (HTTP {resp.status_code})"
+    except Exception as exc:  # noqa: BLE001 - doctor must degrade, never crash
+        return f"unreachable ({type(exc).__name__})"
+
+
+def _minimax_reasoning_self_test() -> str:
+    """Best-effort M3 reasoning round-trip self-test (never raises).
+
+    Sends a tiny prompt and asserts reasoning was captured, exercising the
+    Path A reasoning_split / Path B thinking-block capture end to end.
+    """
+    try:
+        from src.providers.chat import ChatLLM
+
+        client = ChatLLM()
+        response = client.chat(
+            [{"role": "user", "content": "Think briefly, then reply with the single word OK."}],
+            timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
+        )
+        if response.reasoning_content:
+            return "ok (reasoning captured)"
+        return "degraded (completed but no reasoning field returned)"
+    except Exception as exc:  # noqa: BLE001 - doctor must degrade, never crash
+        return f"degraded ({type(exc).__name__})"
+
+
+def minimax_provider_checks() -> dict[str, Any]:
+    """Return MiniMax-specific ``provider doctor`` checks.
+
+    Degrades gracefully: with no ``MINIMAX_API_KEY`` configured it reports a
+    ``degraded`` status and skips all network checks (never a hard failure).
+    With a key it adds endpoint reachability and a reasoning round-trip
+    self-test. Path A vs Path B is reported from the configured base URL.
+    """
+    _sync_provider_env()
+    key = os.getenv("MINIMAX_API_KEY", "").strip()
+    base_url = _minimax_base_url() or "https://api.minimax.io/v1"
+    path = (
+        "B (Anthropic-compatible /anthropic)"
+        if _minimax_uses_anthropic_endpoint()
+        else "A (OpenAI-compatible /v1)"
+    )
+    checks: dict[str, Any] = {
+        "path": path,
+        "base_url": _redact_base_url_for_log(base_url),
+        "api_key": {"MINIMAX_API_KEY": "set" if key else "unset"},
+        "thinking": _minimax_thinking_mode() or "adaptive (default)",
+    }
+    if _minimax_uses_anthropic_endpoint():
+        checks["path_b_note"] = (
+            "reasoning replay via Anthropic thinking blocks is unverified/deferred "
+            "(see docs/minimax-migration-notes.md, Known limitations)"
+        )
+
+    if not key:
+        checks["status"] = "degraded"
+        checks["note"] = (
+            "no MINIMAX_API_KEY configured; skipping endpoint reachability and "
+            "reasoning self-test"
+        )
+        checks["endpoint_reachable"] = "skipped (no key configured)"
+        checks["reasoning_round_trip"] = "skipped (no key configured)"
+        return checks
+
+    # Token Plan Subscription Keys are documented as Anthropic-endpoint-only;
+    # pay-as-you-go keys authenticate the OpenAI-compatible /v1 surface. We
+    # cannot detect the key *type* offline, so surface the operative note.
+    checks["key_type_note"] = (
+        "Token Plan Subscription Keys authenticate the /anthropic endpoint "
+        "(Path B); pay-as-you-go keys use /v1 (Path A). Active path: " + path
+    )
+    checks["endpoint_reachable"] = _minimax_endpoint_reachable(base_url)
+    reasoning = _minimax_reasoning_self_test()
+    checks["reasoning_round_trip"] = reasoning
+    checks["status"] = (
+        "ok"
+        if checks["endpoint_reachable"].startswith("reachable") and reasoning.startswith("ok")
+        else "degraded"
+    )
+    return checks
 
 
 def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any:
@@ -609,12 +813,27 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
                     "VIBE_TRADING_DEEPSEEK_ADAPTER=native requires langchain-deepseek"
                 )
 
+    # MiniMax requires temperature strictly > 0. When the user left
+    # LANGCHAIN_TEMPERATURE at the global 0.0 default, apply M3's documented
+    # defaults (temperature=1.0, top_p=0.95) rather than silently running at
+    # 0.01 — the recommended sampling settings, not just an error rescue.
+    top_p: float | None = None
+    if provider == "minimax" and temperature <= 0.0:
+        temperature = 1.0
+        top_p = 0.95
+
+    # MiniMax Path B: an Anthropic-compatible base URL (`/anthropic`) selects
+    # the native langchain-anthropic adapter instead of ChatOpenAI.
+    if provider == "minimax" and _minimax_uses_anthropic_endpoint():
+        return _build_native_minimax_anthropic(
+            model=name,
+            temperature=temperature,
+            top_p=top_p,
+            callbacks=callbacks,
+        )
+
     if ChatOpenAI is None:
         raise RuntimeError("langchain-openai is not installed")
-    # MiniMax requires temperature in (0.0, 1.0] — clamp to 0.01 when the
-    # default 0.0 is used to avoid an API validation error.
-    if provider == "minimax" and temperature <= 0.0:
-        temperature = 0.01
     # Moonshot kimi-k2.x reasoning models reject any temperature other than 1
     # ("invalid temperature: only 1 is allowed for this model").
     if caps.name == "moonshot" and name.lower().startswith("kimi-k2") and temperature != 1.0:
@@ -623,15 +842,28 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
     # Optional reasoning activation for relays requiring opt-in (e.g. OpenRouter).
     # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
     effort = os.getenv("LANGCHAIN_REASONING_EFFORT", "").strip().lower()
+    extra_body: dict[str, Any] | None = (
+        {"reasoning": {"effort": effort}} if effort and caps.openrouter_reasoning_body else None
+    )
+    # MiniMax M3 (Path A): opt into reasoning capture via reasoning_split and,
+    # optionally, disable thinking for a quick tier via MINIMAX_THINKING.
+    if caps.reasoning_split_extra_body:
+        extra_body = dict(extra_body or {})
+        extra_body["reasoning_split"] = True
+        thinking = _minimax_thinking_mode()
+        if thinking == "disabled":
+            extra_body["thinking"] = {"type": "disabled"}
     kwargs: dict[str, Any] = {
         "model": name,
         "temperature": temperature,
         "timeout": int(os.getenv("TIMEOUT_SECONDS", "120")),
         "max_retries": int(os.getenv("MAX_RETRIES", "2")),
         "callbacks": callbacks,
-        "extra_body": {"reasoning": {"effort": effort}} if effort and caps.openrouter_reasoning_body else None,
+        "extra_body": extra_body,
         "vibe_provider": provider,
     }
+    if top_p is not None:
+        kwargs["top_p"] = top_p
     if caps.default_headers:
         headers = dict(caps.default_headers)
         if caps.name == "moonshot":

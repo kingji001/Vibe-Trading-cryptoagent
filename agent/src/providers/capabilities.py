@@ -24,6 +24,10 @@ class ProviderCapabilities:
             be normalized to ``""`` for strict providers.
         openrouter_reasoning_body: Whether ``extra_body.reasoning`` is a valid
             OpenRouter request option.
+        reasoning_split_extra_body: Whether the provider uses MiniMax M3's
+            ``extra_body={"reasoning_split": True}`` request convention and
+            returns reasoning under ``reasoning_details`` (distinct from the
+            DeepSeek/Kimi ``reasoning_content`` convention).
         default_headers: Provider-scoped headers passed to ChatOpenAI.
         native_adapter_package: Optional native adapter package to report.
     """
@@ -36,6 +40,7 @@ class ProviderCapabilities:
     gemini_thought_signatures: bool = False
     normalize_assistant_content: bool = False
     openrouter_reasoning_body: bool = False
+    reasoning_split_extra_body: bool = False
     default_headers: Mapping[str, str] = field(default_factory=dict)
     native_adapter_package: Optional[str] = None
 
@@ -104,7 +109,20 @@ _PROVIDERS: dict[str, ProviderCapabilities] = {
     "glm": _ZHIPU_CAPABILITIES,
     "moonshot": _MOONSHOT_CAPABILITIES,
     "kimi": _MOONSHOT_CAPABILITIES,
-    "minimax": ProviderCapabilities("minimax", "MINIMAX_API_KEY", "MINIMAX_BASE_URL"),
+    "minimax": ProviderCapabilities(
+        "minimax",
+        "MINIMAX_API_KEY",
+        "MINIMAX_BASE_URL",
+        # Path A (OpenAI-compatible /v1): M3 emits reasoning under
+        # ``reasoning_details`` when ``extra_body={"reasoning_split": True}`` is
+        # sent, and it must be replayed across ReAct tool-loop turns.
+        capture_reasoning=True,
+        send_reasoning_content=True,
+        reasoning_split_extra_body=True,
+        # Path B (Anthropic-compatible /anthropic): optional native adapter,
+        # selected at runtime when MINIMAX_BASE_URL contains ``/anthropic``.
+        native_adapter_package="langchain-anthropic",
+    ),
     "mimo": ProviderCapabilities("mimo", "MIMO_API_KEY", "MIMO_BASE_URL"),
     "zai": ProviderCapabilities("zai", "ZAI_API_KEY", "ZAI_BASE_URL"),
     "ollama": ProviderCapabilities("ollama", None, "OLLAMA_BASE_URL"),

@@ -224,3 +224,53 @@ def get_loader_cls_with_fallback(source: str) -> Type[Any]:
     raise NoAvailableSourceError(
         f"Data source '{source}' is unavailable and no fallback found."
     )
+
+
+def fetch_ohlcv_with_fallback(
+    sources: list[str],
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    interval: str = "1D",
+):
+    """Fetch OHLCV for one symbol, trying each source in *sources* in order.
+
+    Returns the first non-empty DataFrame; a source that errors, is
+    unavailable, or returns no rows for *symbol* is skipped in favor of the
+    next one. This generalizes the okx-then-ccxt fallback pattern the
+    committee decision journal uses for its alpha calc
+    (``src.tools.committee_journal_tool._loader_fetch_bars``) so other
+    callers — e.g. ``backtest.benchmark`` — can route crypto-format symbols
+    (``BTC-USDT``) through the loader registry instead of yfinance, which
+    cannot resolve every OKX-format ticker.
+
+    Args:
+        sources: Ordered loader source names to try (e.g. ``["okx", "ccxt"]``).
+        symbol: Instrument symbol in the loader's native format.
+        start_date: Start date (YYYY-MM-DD).
+        end_date: End date (YYYY-MM-DD).
+        interval: Bar interval (loader-specific, e.g. "1D"/"1H").
+
+    Returns:
+        A pandas ``DataFrame`` with OHLCV columns.
+
+    Raises:
+        NoAvailableSourceError: When every source in *sources* fails, is
+            unavailable, or returns no data for *symbol*.
+    """
+    _ensure_registered()
+    last_exc: Exception | None = None
+    for source in sources:
+        try:
+            loader = get_loader_cls_with_fallback(source)()
+            frames = loader.fetch([symbol], start_date, end_date, None, interval=interval)
+        except Exception as exc:  # try the next source
+            last_exc = exc
+            continue
+        df = frames.get(symbol)
+        if df is not None and not df.empty:
+            return df
+    raise NoAvailableSourceError(
+        f"No OHLCV data for '{symbol}' via any of {sources}. Last error: {last_exc}"
+    )

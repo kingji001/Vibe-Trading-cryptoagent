@@ -1,11 +1,14 @@
-"""Tests for the single stream retry on ProviderStreamError in run_worker.
+"""Tests for the throttle-aware stream retry on ProviderStreamError in run_worker.
 
 ``ChatLLM.stream_chat`` used to silently fall back to non-streaming ``chat()``
 on any exception; it now raises ``ProviderStreamError``. A swarm worker that
 previously survived a transient mid-stream hiccup (connection reset) via the
 silent fallback would now fail outright, so ``run_worker`` retries the stream
-exactly once for ``ProviderStreamError`` — and only for it — before the
-existing failure path.
+with capped exponential backoff + jitter (shared policy in
+``src.providers.backoff``) for *retryable* ``ProviderStreamError``s — and only
+for them — before the existing failure path. These tests pin ``VT_STREAM_RETRY_MAX``
+to 2 so the max-attempts boundary is exercised with the historical call counts;
+the schedule itself is covered in ``test_concurrency_governance.py``.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import src.providers.backoff as backoff_mod
 from src.providers.chat import LLMResponse, ProviderStreamError
 from src.swarm.models import SwarmAgentSpec, SwarmTask, WorkerResult
 import src.swarm.worker as worker_mod
@@ -108,7 +112,8 @@ def _run(monkeypatch, tmp_path: Path, llm: _FlakyChatLLM) -> WorkerResult:
     Returns:
         The WorkerResult from ``run_worker``.
     """
-    monkeypatch.setattr(worker_mod, "_STREAM_RETRY_DELAY_S", 0.0)
+    monkeypatch.setenv("VT_STREAM_RETRY_MAX", "2")
+    monkeypatch.setattr(backoff_mod.time, "sleep", lambda *_: None)
     agent = SwarmAgentSpec(
         id="analyst",
         role="Synthesis analyst",

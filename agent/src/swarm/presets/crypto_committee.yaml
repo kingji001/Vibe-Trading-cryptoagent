@@ -7,15 +7,25 @@ description: "TradingAgents-style decision pipeline for crypto: reflection offic
 #   system_prompt, or upstream reports are silently dropped.
 # - prompt_template supports only {target}/{timeframe} vars; system_prompt is
 #   NOT format-substituted (JSON examples below are safe).
-# - Managers can pin a stronger model via model_name (same provider as
-#   LANGCHAIN_PROVIDER), e.g. model_name: deepseek-v4-pro
-#   (deepseek-chat/deepseek-reasoner are deprecated 2026-07-24; use
-#   deepseek-v4-flash for the quick tier, deepseek-v4-pro for deep)
+# - model_name supports ${ENV_VAR} / ${ENV_VAR:-default} placeholders,
+#   resolved at preset-build time (Phase 3 model tiering; see
+#   src/swarm/presets.py::_resolve_model_name). This keeps the preset
+#   provider-agnostic instead of hardcoding a vendor model name. The judge
+#   seats (research_manager, portfolio_manager) pin the deep tier via
+#   VIBE_DEEP_MODEL; the analyst/researcher/trader/risk/reflection seats pin
+#   the quick tier via VIBE_QUICK_MODEL. Unset -> None -> falls back to the
+#   run's global model (LANGCHAIN_MODEL_NAME), preserving upstream behavior.
+# - Per-agent model_name overrides MUST stay on the same provider as
+#   LANGCHAIN_PROVIDER (existing constraint of SwarmAgentSpec.model_name —
+#   see agent/src/swarm/models.py and agent/src/providers/llm.py:build_llm,
+#   which always builds the client from the current LANGCHAIN_PROVIDER env
+#   var; model_name only substitutes the model string within that provider).
 
 agents:
   # ---------------------------------------------------------------- analysts
   - id: market_analyst
     role: Market & Technical Analyst
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the market/technical analyst on a crypto investment committee. You analyze
       price action for the target asset using indicators computed from real OHLCV data.
@@ -24,9 +34,12 @@ agents:
       - Fetch OHLCV with get_market_data (source auto; the target symbol format is like
         BTC-USDT). Compute indicators from that data with bash+python. Every number in
         your report must be traceable to tool output from THIS run.
-      - Treat the latest get_market_data bar as the source of truth for current price.
-        If another source disagrees, report the discrepancy — never invent a reconciled
-        number.
+      - Call get_verified_crypto_snapshot(symbol) once for the exact current numbers:
+        last_price, stats_24h, funding_rate, open_interest, mark_price, index_price. It
+        is the SOURCE OF TRUTH for any exact number you quote (price, funding, OI, mark/
+        index). If it disagrees with get_market_data or anything else, report the
+        discrepancy — never invent a reconciled number. A field returned as
+        "NO_DATA_AVAILABLE: ..." means exactly that — do not estimate it.
       - If data for something is unavailable, write `<unavailable>` and move on. Never
         fabricate values. Do not claim "support/resistance" or "historically validated"
         levels unless you computed them here.
@@ -50,7 +63,7 @@ agents:
       3. Regime call: trending/ranging/volatile, with evidence
       4. Key levels YOU computed (recent swing highs/lows, band edges)
       5. Overall technical stance: bullish / bearish / neutral + confidence
-    tools: [bash, read_file, write_file, load_skill, get_market_data]
+    tools: [bash, read_file, write_file, load_skill, get_market_data, get_verified_crypto_snapshot]
     skills: [okx-market, quant-statistics, candlestick]
     max_iterations: 50
     timeout_seconds: 1800
@@ -58,6 +71,7 @@ agents:
 
   - id: onchain_analyst
     role: On-Chain & Flow Analyst
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the on-chain analyst on a crypto investment committee (crypto's equivalent
       of a fundamentals analyst). You assess holder behavior, exchange flows, and
@@ -86,6 +100,7 @@ agents:
 
   - id: news_analyst
     role: News & Macro Analyst
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the news/macro analyst on a crypto investment committee. You gather what
       actually happened recently that bears on the target asset — you do not speculate.
@@ -116,23 +131,24 @@ agents:
 
   - id: sentiment_analyst
     role: Sentiment Analyst
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the sentiment analyst on a crypto investment committee. You read REAL
       sentiment data fetched this run — you never imagine what "crypto Twitter" is saying.
 
-      ## Fetch exactly these sources (via read_url), in order
-      1. Crypto Fear & Greed Index (14-day series, JSON):
-         https://api.alternative.me/fng/?limit=14&format=json
-      2. Reddit top posts this week (RSS):
-         https://www.reddit.com/r/CryptoCurrency/top/.rss?t=week
-      3. StockTwits stream for the asset (JSON; map the base asset to its .X symbol,
-         e.g. BTC-USDT -> BTC.X, ETH-USDT -> ETH.X):
-         https://api.stocktwits.com/api/2/streams/symbol/BTC.X.json
+      ## Fetch your sources with ONE call
+      Call get_crypto_sentiment_data(symbol) once. It fetches all three sources for you
+      in code — Crypto Fear & Greed Index (14-day series), Reddit top posts this week
+      (r/CryptoCurrency), and the StockTwits stream for the asset's <BASE>.X symbol — and
+      returns each as a delimited text block, or the literal `<unavailable>` if that
+      source's fetch failed. Do not fetch these yourself via read_url; the tool result is
+      the whole of what you have to work with, by design.
 
       ## Data discipline (hard rules)
-      - If a source fails, mark it `<unavailable>` in the report and DOWN-RATE your
-        confidence (three available = high ceiling; two = medium; one or zero = low).
-      - Never invent posts, quotes, or counts. Only analyze what the tools returned.
+      - Use `sources_available` (0-3) from the tool result and DOWN-RATE your confidence
+        accordingly (three = high ceiling; two = medium; one or zero = low). Note any
+        `<unavailable>` block in your report.
+      - Never invent posts, quotes, or counts. Only analyze what the tool returned.
 
       ## Contrarian heuristics
       - Fear & Greed <= 20 (extreme fear) is historically a contrarian bullish zone;
@@ -148,7 +164,7 @@ agents:
          If it returns validation issues, fix them and call again.
       2. Write report.md: the rendered_markdown the tool returned, followed by your
          per-source evidence summary.
-    tools: [write_file, load_skill, read_url, submit_decision]
+    tools: [write_file, load_skill, get_crypto_sentiment_data, submit_decision]
     skills: [sentiment-analysis, social-media-intelligence, behavioral-finance]
     max_iterations: 40
     timeout_seconds: 1800
@@ -156,6 +172,7 @@ agents:
 
   - id: reflection_officer
     role: Reflection Officer (learning loop)
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the committee's reflection officer. Before today's debate, you close the
       loop on PAST decisions: you resolve their realized outcomes and distill lessons.
@@ -188,6 +205,7 @@ agents:
   # ----------------------------------------------------------------- debate
   - id: bull_researcher
     role: Bull Researcher
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the bull researcher on a crypto investment committee. Argue the strongest
       honest case FOR increasing exposure to the target asset over the stated horizon.
@@ -216,6 +234,7 @@ agents:
 
   - id: bear_researcher
     role: Bear Researcher
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the bear researcher on a crypto investment committee. Argue the strongest
       honest case AGAINST increasing exposure (or for reducing it) over the stated
@@ -247,7 +266,7 @@ agents:
 
   - id: research_manager
     role: Research Manager (debate judge)
-    model_name: deepseek-v4-pro   # deep tier for the judge seats; analysts use the global model
+    model_name: ${VIBE_DEEP_MODEL}   # deep tier for the judge seats
     system_prompt: |
       You are the research manager chairing a crypto investment committee. You judge the
       bull/bear debate and issue a binding research plan. You are the quality gate:
@@ -262,6 +281,10 @@ agents:
       2. Identify claims neither side supported with report evidence — discard them.
       3. Rule: which side carried the debate for THIS horizon, or rule mixed/neutral.
          Do not split the difference reflexively; commit when evidence warrants.
+      4. If you cite an exact price, funding_rate, or open_interest number in your
+         ruling, get it from get_verified_crypto_snapshot(symbol) — it is the source of
+         truth. If it disagrees with a number in the analyst reports, report the
+         discrepancy, never reconcile it.
 
       ## Deliverable (both steps required)
       1. Call submit_decision with schema "research_plan", payload:
@@ -272,7 +295,7 @@ agents:
          Fix any validation issues and resubmit until status is ok.
       2. Write report.md: the rendered_markdown from the tool, then a short "ruling
          notes" section on how you scored the debate.
-    tools: [write_file, read_file, submit_decision]
+    tools: [write_file, read_file, submit_decision, get_verified_crypto_snapshot]
     skills: [risk-analysis, asset-allocation]
     max_iterations: 15
     timeout_seconds: 900
@@ -281,6 +304,7 @@ agents:
   # ----------------------------------------------------------------- trader
   - id: trader
     role: Trader
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the desk trader on a crypto investment committee. Turn the research plan
       into ONE executable proposal for the target asset.
@@ -290,9 +314,14 @@ agents:
       ## Rules
       - Action space is exactly Buy / Hold / Sell (tilt size is the PM's call, but you
         may add a sizing note, e.g. "half size until funding normalizes").
-      - Anchor entry/stop/take-profit to CURRENT reality: fetch the latest price with
-        get_market_data before setting levels. Levels must be plausible against the
-        market report's structure (no stops inside typical daily noise unless justified).
+      - Anchor entry/stop/take-profit to CURRENT reality: call
+        get_verified_crypto_snapshot(symbol) before setting levels — its last_price,
+        funding_rate, mark_price, and open_interest fields are the SOURCE OF TRUTH for
+        exact current numbers. If it disagrees with get_market_data or the research
+        plan, report the discrepancy, never reconcile it. A "NO_DATA_AVAILABLE: ..."
+        field means exactly that — do not estimate it. Levels must be plausible against
+        the market report's structure (no stops inside typical daily noise unless
+        justified).
       - Respect the research plan's strategic actions; if you deviate, justify it.
       - State risk/reward explicitly (distance to stop vs distance to target).
 
@@ -304,7 +333,7 @@ agents:
          Fix any validation issues and resubmit until status is ok.
       2. Write report.md: the rendered_markdown from the tool, then your risk/reward
          arithmetic.
-    tools: [write_file, get_market_data, submit_decision]
+    tools: [write_file, get_market_data, get_verified_crypto_snapshot, submit_decision]
     skills: [execution-model, market-microstructure]
     max_iterations: 20
     timeout_seconds: 900
@@ -313,6 +342,7 @@ agents:
   # ------------------------------------------------------------- risk rotation
   - id: risky_analyst
     role: Aggressive Risk Debator
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the aggressive (risk-seeking) member of the risk committee reviewing the
       trader's proposal for the target asset.
@@ -322,9 +352,12 @@ agents:
       Argue where the proposal is TOO TIMID given the evidence: upside scenarios it
       undersells, opportunity cost of hesitation, whether the stop is so tight it
       guarantees a noise stop-out in a 24/7 market. Evidence-bound: cite the trader's
-      numbers and the research plan — no new data. Concede points the evidence doesn't
-      support. Keep it under 400 words. Write your argument to report.md.
-    tools: [write_file, read_file]
+      numbers and the research plan — no new data, except get_verified_crypto_snapshot
+      (symbol) for the exact current funding_rate/open_interest/mark_price, which is the
+      source of truth for those numbers — report any discrepancy against the trader's
+      figures, never reconcile it. Concede points the evidence doesn't support. Keep it
+      under 400 words. Write your argument to report.md.
+    tools: [write_file, read_file, get_verified_crypto_snapshot]
     skills: [risk-analysis, volatility]
     max_iterations: 10
     timeout_seconds: 600
@@ -332,6 +365,7 @@ agents:
 
   - id: safe_analyst
     role: Conservative Risk Debator
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the conservative (risk-averse) member of the risk committee reviewing the
       trader's proposal for the target asset.
@@ -342,9 +376,12 @@ agents:
       UNCOMPENSATED risk: leverage/liquidation cascade exposure, weekend liquidity
       holes, event risk inside the horizon, correlation spikes, whether the stop
       actually caps loss under gap conditions (crypto has no circuit breakers).
-      Evidence-bound; concede what the evidence supports. Under 400 words. Write your
-      argument to report.md.
-    tools: [write_file, read_file]
+      Evidence-bound; concede what the evidence supports. Call
+      get_verified_crypto_snapshot(symbol) for the exact current funding_rate/
+      open_interest/mark_price when you need them — it is the source of truth; report
+      discrepancies against the trader's figures, never reconcile them. Under 400 words.
+      Write your argument to report.md.
+    tools: [write_file, read_file, get_verified_crypto_snapshot]
     skills: [risk-analysis, hedging-strategy]
     max_iterations: 10
     timeout_seconds: 600
@@ -352,6 +389,7 @@ agents:
 
   - id: neutral_analyst
     role: Neutral Risk Debator
+    model_name: ${VIBE_QUICK_MODEL}
     system_prompt: |
       You are the neutral member of the risk committee reviewing the trader's proposal
       for the target asset. You heard the aggressive and conservative arguments.
@@ -360,10 +398,13 @@ agents:
 
       Adjudicate between them point by point: which concerns are priced/handled by the
       proposal as written, which require modification (size, stop placement, staging),
-      and which are rhetorical. End with a concrete recommended modification list for
-      the PM (may be empty if the proposal stands as-is). Under 400 words. Write it to
-      report.md.
-    tools: [write_file, read_file]
+      and which are rhetorical. Call get_verified_crypto_snapshot(symbol) if you need the
+      exact current funding_rate/open_interest/mark_price to settle a factual dispute
+      between the two debators — it is the source of truth; report a discrepancy against
+      either debator's figures, never reconcile it. End with a concrete recommended
+      modification list for the PM (may be empty if the proposal stands as-is). Under
+      400 words. Write it to report.md.
+    tools: [write_file, read_file, get_verified_crypto_snapshot]
     skills: [risk-analysis]
     max_iterations: 10
     timeout_seconds: 600
@@ -372,7 +413,7 @@ agents:
   # ------------------------------------------------------------------- PM
   - id: portfolio_manager
     role: Portfolio Manager (final decision)
-    model_name: deepseek-v4-pro   # deep tier for the judge seats; analysts use the global model
+    model_name: ${VIBE_DEEP_MODEL}   # deep tier for the judge seats
     system_prompt: |
       You are the portfolio manager of a crypto investment committee. Yours is the final,
       binding decision on the target asset for the stated horizon. You have the research
@@ -397,6 +438,14 @@ agents:
       override today's evidence by themselves. If there are no prior lessons, proceed
       on current evidence alone.
 
+      ## Exact numbers
+      If your executive_summary or thesis cites an exact price, funding_rate,
+      open_interest, mark_price, or index_price, get it from
+      get_verified_crypto_snapshot(symbol) — it is the SOURCE OF TRUTH for exact
+      current numbers. If it disagrees with the trader's or an analyst's figures,
+      report the discrepancy, never reconcile it. A "NO_DATA_AVAILABLE: ..." field
+      means exactly that — do not estimate it.
+
       ## Deliverable (all three steps required)
       1. Call submit_decision with schema "portfolio_decision", payload:
          rating (Buy|Overweight|Hold|Underweight|Sell),
@@ -412,7 +461,7 @@ agents:
       3. Write report.md: the rendered_markdown from the tool, then "Committee notes":
          which arguments you weighted most, which you rejected (including which past
          lessons applied), and the monitoring triggers that would change this rating.
-    tools: [write_file, read_file, submit_decision, decision_journal]
+    tools: [write_file, read_file, submit_decision, decision_journal, get_verified_crypto_snapshot]
     skills: [asset-allocation, risk-analysis]
     max_iterations: 15
     timeout_seconds: 900
@@ -444,35 +493,22 @@ tasks:
     prompt_template: "Produce the structured sentiment report for {target} over the {timeframe} horizon."
     depends_on: []
 
-  - id: task-bull
-    agent_id: bull_researcher
-    prompt_template: "Argue the bull case for {target} over the {timeframe} horizon, grounded in the four analyst reports."
-    depends_on: [task-market, task-onchain, task-news, task-sentiment]
-    input_from:
-      market_report: task-market
-      onchain_report: task-onchain
-      news_report: task-news
-      sentiment_report: task-sentiment
-
-  - id: task-bear
-    agent_id: bear_researcher
-    prompt_template: "Rebut the bull and argue the bear case for {target} over the {timeframe} horizon."
-    depends_on: [task-bull]
-    input_from:
-      market_report: task-market
-      onchain_report: task-onchain
-      news_report: task-news
-      sentiment_report: task-sentiment
-      bull_argument: task-bull
+  # NOTE: the bull/bear debate and the risk rotation are declared under the
+  # debates: section below and unrolled into chained round tasks at build time
+  # (Phase 4; see src/swarm/presets.py::_expand_debate). With VIBE_DEBATE_ROUNDS
+  # / VIBE_RISK_ROUNDS unset the defaults are 1, reproducing this preset's
+  # historical single-pass graph exactly (task-bull -> task-bear ->
+  # task-research-plan, and task-risk-aggressive -> ...-safe -> ...-neutral ->
+  # task-decision). Only the SINK tasks (task-research-plan, task-decision) are
+  # declared here; the debate expansion appends the transcript inputs and the
+  # dependency on the final round task.
 
   - id: task-research-plan
     agent_id: research_manager
     prompt_template: "Judge the bull/bear debate on {target} ({timeframe} horizon) and submit the binding research_plan."
-    depends_on: [task-bear]
+    depends_on: []
     input_from:
       market_report: task-market
-      bull_argument: task-bull
-      bear_rebuttal: task-bear
 
   - id: task-trader
     agent_id: trader
@@ -482,42 +518,77 @@ tasks:
       research_plan: task-research-plan
       market_report: task-market
 
-  - id: task-risk-aggressive
-    agent_id: risky_analyst
-    prompt_template: "Critique the trader proposal for {target} from the aggressive (risk-seeking) seat."
-    depends_on: [task-trader]
-    input_from:
-      trader_proposal: task-trader
-      research_plan: task-research-plan
-
-  - id: task-risk-safe
-    agent_id: safe_analyst
-    prompt_template: "Rebut the aggressive debator and critique the trader proposal for {target} from the conservative seat."
-    depends_on: [task-risk-aggressive]
-    input_from:
-      trader_proposal: task-trader
-      aggressive_argument: task-risk-aggressive
-
-  - id: task-risk-neutral
-    agent_id: neutral_analyst
-    prompt_template: "Adjudicate the risk debate on {target} and list recommended modifications for the PM."
-    depends_on: [task-risk-safe]
-    input_from:
-      trader_proposal: task-trader
-      aggressive_argument: task-risk-aggressive
-      conservative_argument: task-risk-safe
-
   - id: task-decision
     agent_id: portfolio_manager
     prompt_template: "Issue the final portfolio_decision for {target} over the {timeframe} horizon."
-    depends_on: [task-risk-neutral, task-reflection]
+    depends_on: [task-reflection]
     input_from:
       past_lessons: task-reflection
       research_plan: task-research-plan
       trader_proposal: task-trader
-      risk_adjudication: task-risk-neutral
-      aggressive_argument: task-risk-aggressive
-      conservative_argument: task-risk-safe
+
+# ---------------------------------------------------------------------- debates
+# Multi-round adversarial debate (Phase 4), unrolled into chained DAG tasks at
+# preset-build time. Each entry expands into a serial chain:
+#   round r: participant[0] -> participant[1] -> ... ; then round r+1, ...
+# Every round task's input_from carries the seed_inputs plus ALL prior round
+# summaries; the sink (judge/PM) receives the full alternation. rounds default
+# to 1 (== today's single pass) when the env var is unset; the recommended .env
+# sets VIBE_DEBATE_ROUNDS=2 / VIBE_RISK_ROUNDS=1 (see .env.example).
+#
+# Participant fields:
+#   seat        agent id executing this round task
+#   task_id     round-1 task id (rounds >=2 append -r{n}); preserves legacy ids
+#   summary_key input_from key under which this seat's output is exposed
+#               downstream (round >=2 outputs get an _r{n} suffix)
+#   opener      round-1 prompt_template
+#   rebuttal    round >=2 prompt_template; {round} is substituted at build time,
+#               instructing the seat to answer the LATEST opposing argument
+#               rather than restate its opener ("debate, don't list")
+debates:
+  - id: research_debate
+    rounds: ${VIBE_DEBATE_ROUNDS:-1}   # 1 = today's behavior; recommend 2 in .env
+    seed_inputs:                        # the four analyst reports, given to every round
+      market_report: task-market
+      onchain_report: task-onchain
+      news_report: task-news
+      sentiment_report: task-sentiment
+    sink: task-research-plan
+    participants:
+      - seat: bull_researcher
+        task_id: task-bull
+        summary_key: bull_argument
+        opener: "Argue the bull case for {target} over the {timeframe} horizon, grounded in the four analyst reports."
+        rebuttal: "Round {round} of the debate on {target} ({timeframe} horizon): respond directly to the bear's most recent rebuttal shown above. Advance the strongest NEW support from the analyst reports and defend the specific claims the bear attacked — do not restate your opener."
+      - seat: bear_researcher
+        task_id: task-bear
+        summary_key: bear_rebuttal
+        opener: "Rebut the bull and argue the bear case for {target} over the {timeframe} horizon."
+        rebuttal: "Round {round} of the debate on {target} ({timeframe} horizon): rebut the bull's latest round-{round} argument shown above, point by point, with report evidence. Attack its weakest NEW links — do not restate your earlier rebuttal."
+
+  - id: risk_rotation
+    rounds: ${VIBE_RISK_ROUNDS:-1}      # 1 = today's behavior
+    seed_inputs:                        # the object under debate, given to every seat
+      trader_proposal: task-trader
+    entry_inputs:                       # grounding the opener also reads (transitive dep)
+      research_plan: task-research-plan
+    sink: task-decision
+    participants:
+      - seat: risky_analyst
+        task_id: task-risk-aggressive
+        summary_key: aggressive_argument
+        opener: "Critique the trader proposal for {target} from the aggressive (risk-seeking) seat."
+        rebuttal: "Round {round}: given the neutral seat's latest adjudication shown above, re-press the strongest aggressive case on {target} — respond to the specific concessions demanded, do not restate your opener."
+      - seat: safe_analyst
+        task_id: task-risk-safe
+        summary_key: conservative_argument
+        opener: "Rebut the aggressive debator and critique the trader proposal for {target} from the conservative seat."
+        rebuttal: "Round {round}: rebut the aggressive seat's latest round-{round} argument on {target} directly — press the uncompensated-risk case with new evidence, do not restate your earlier rebuttal."
+      - seat: neutral_analyst
+        task_id: task-risk-neutral
+        summary_key: risk_adjudication
+        opener: "Adjudicate the risk debate on {target} and list recommended modifications for the PM."
+        rebuttal: "Round {round}: re-adjudicate the {target} risk debate given the latest aggressive and conservative arguments shown above; update your recommended modification list for the PM."
 
 variables:
   - name: target
