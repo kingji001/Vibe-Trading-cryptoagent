@@ -634,8 +634,21 @@ with the specific broken condition(s) listed otherwise:
   interval (an exactly-2× gap fails; note a plain 2× *delta* between two
   healthy beats is never recorded as a gap in the first place, so it can't
   trip this — the two rules coexist deliberately).
-- 100% heartbeat uptime — any `ok:false` reading, however brief, degrades
-  the verdict.
+- 100% heartbeat uptime **outside startup grace** — any `ok:false` reading,
+  however brief, degrades the verdict, EXCEPT readings classified as
+  *startup grace*: the heartbeat loop starts before `uvicorn` finishes
+  booting, so the first beat(s) after every supervisor `start`/`restart`
+  event honestly record `ok:false`. An `ok:false` reading is startup grace
+  when it follows a start/restart event, no `ok:true` has been seen since
+  that event, and it lies within `VIBE_OPS_STARTUP_GRACE_S` (default 120
+  seconds, inclusive) of the event. Grace readings are still recorded and
+  rendered (with their own count and label) — they are only excluded from
+  this verdict condition and from unhealthy-span gap math. Bounds: an
+  `ok:false` after the first healthy beat is real unhealthiness even inside
+  the grace horizon; an `ok:false` beyond the horizon with no healthy beat
+  yet means the server never came up — also real; each start/restart opens
+  its own fresh grace window; and grace never touches the edge-coverage
+  condition below, so it cannot hide a stream that went silent.
 - Window-edge coverage is complete (uncovered time before the first beat or
   after the last beat is ≤ 2× the interval).
 - Every expected `committee-run` firing (per the persisted/`VIBE_COMMITTEE_SCHEDULE`
@@ -755,12 +768,24 @@ report`:
 - HTTP 429 responses: 0
 ```
 
-This is the harness working exactly as designed: the very first heartbeat
-fired while `uvicorn` was still starting up (before `Application startup
-complete`), so it recorded `ok:false` — a real, honest degradation, not a
-bug. `Supervisor: 0 restart(s)`, no `serve_cmd_overridden`, no malformed
-lines. On a genuinely long, unattended run started once the server is
-already warm, a clean window renders `UNINTERRUPTED` instead.
+The very first heartbeat fired while `uvicorn` was still starting up
+(before `Application startup complete`), so it recorded `ok:false`.
+`Supervisor: 0 restart(s)`, no `serve_cmd_overridden`, no malformed lines.
+
+**Note — this capture predates the startup-grace rule.** This exact smoke
+exposed the structural flaw in the original verdict condition: because the
+heartbeat loop always fires at least once before the server finishes
+booting, "uptime < 100% ⇒ never UNINTERRUPTED" meant **no genuine run could
+ever earn the verdict**. Under the current rule (see the verdict conditions
+above), that single cold-start `ok:false` — within 120 seconds of the
+`start` event and before the first healthy beat — is classified *startup
+grace*: still recorded and rendered with its own count
+(`N startup-grace reading(s) excluded from verdict per
+VIBE_OPS_STARTUP_GRACE_S=120`), but excluded from the uptime condition. The
+same run today, with everything else identical (0 restarts, max gap under
+2× interval, edge coverage within threshold), renders `UNINTERRUPTED`. An
+`ok:false` appearing *after* the first healthy beat, or beyond the grace
+horizon with the server still unhealthy, degrades exactly as before.
 
 **Port already in use:** the real server binds `127.0.0.1:8000` by default
 (`vibe-trading serve --host 127.0.0.1 --port 8000`). If something else is

@@ -5093,6 +5093,7 @@ def cmd_ops_report(*, window: Optional[str] = None, json_mode: bool = False) -> 
         window_start, window_start_source = default_window_start(ops_root, now)
 
     heartbeat_interval_s = float(os.environ.get("VIBE_OPS_HEARTBEAT_S", "").strip() or 60)
+    startup_grace_s = float(os.environ.get("VIBE_OPS_STARTUP_GRACE_S", "").strip() or 120)
     committee_schedule = _resolve_committee_schedule()
 
     report = build_evidence_report(
@@ -5103,6 +5104,7 @@ def cmd_ops_report(*, window: Optional[str] = None, json_mode: bool = False) -> 
         paper_root=paper_root(),
         journal_path=committee_journal_path(),
         heartbeat_interval_s=heartbeat_interval_s,
+        startup_grace_s=startup_grace_s,
         committee_schedule=committee_schedule,
         window_start_source=window_start_source,
         generated_at=now,

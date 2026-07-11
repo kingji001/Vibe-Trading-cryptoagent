@@ -516,6 +516,161 @@ def test_verdict_flips_on_overridden_serve_cmd_seam(fx):
 
 
 # --------------------------------------------------------------------------- #
+# Startup-grace rule: cold-start ok:false beats must not forbid UNINTERRUPTED
+# --------------------------------------------------------------------------- #
+def test_cold_start_first_beat_false_within_grace_still_uninterrupted(fx):
+    # Task 3 smoke repro: the heartbeat loop starts before uvicorn finishes
+    # booting, so the FIRST beat of every real run is ok:false. Under the
+    # pre-grace rule ("uptime < 100% => never UNINTERRUPTED") no genuine 72h
+    # run could ever earn the verdict. An ok:false reading after a start
+    # event, before the first ok:true, within the grace window, is startup
+    # grace: excluded from the verdict and from unhealthy-span gap math.
+    fx.window_end = _dt("2026-07-01T00:04:05")
+    _write_jsonl(fx.ops_root / "supervisor.jsonl", [_sup_start("2026-07-01T00:00:00Z")])
+    rows = [
+        _hb_row("2026-07-01T00:00:05Z", ok=False, http=None),  # cold start
+        _hb_row("2026-07-01T00:01:05Z", ok=True),
+        _hb_row("2026-07-01T00:02:05Z", ok=True),
+        _hb_row("2026-07-01T00:03:05Z", ok=True),
+        _hb_row("2026-07-01T00:04:05Z", ok=True),
+    ]
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    report = fx.build()
+    hb = report["heartbeat"]
+    assert hb["startup_grace_rows"] == 1
+    assert hb["unhealthy_rows"] == 0
+    assert hb["gaps"] == []  # grace beats excluded from unhealthy-span gap math
+    assert report["verdict"] == {"status": "UNINTERRUPTED", "reasons": []}
+
+    markdown = render_markdown(report)
+    assert (
+        "1 startup-grace reading(s) excluded from verdict per "
+        "VIBE_OPS_STARTUP_GRACE_S=120" in markdown
+    )
+
+
+def test_ok_false_beyond_grace_window_with_no_healthy_beat_yet_degrades(fx):
+    # Server never became healthy within the grace window: readings past the
+    # 120s grace horizon are real unhealthiness even though no ok:true has
+    # been seen yet. The 120s reading itself (exactly at the horizon) is
+    # still grace (inclusive bound).
+    fx.window_end = _dt("2026-07-01T00:05:00")
+    _write_jsonl(fx.ops_root / "supervisor.jsonl", [_sup_start("2026-07-01T00:00:00Z")])
+    rows = [
+        _hb_row("2026-07-01T00:00:00Z", ok=False, http=None),  # +0s   grace
+        _hb_row("2026-07-01T00:01:00Z", ok=False, http=None),  # +60s  grace
+        _hb_row("2026-07-01T00:02:00Z", ok=False, http=None),  # +120s grace (inclusive)
+        _hb_row("2026-07-01T00:03:00Z", ok=False, http=None),  # +180s BEYOND -> unhealthy
+        _hb_row("2026-07-01T00:04:00Z", ok=True),
+        _hb_row("2026-07-01T00:05:00Z", ok=True),
+    ]
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    report = fx.build()
+    hb = report["heartbeat"]
+    assert hb["startup_grace_rows"] == 3
+    assert hb["unhealthy_rows"] == 1
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+    assert any("unhealthy" in r for r in report["verdict"]["reasons"])
+
+
+def test_ok_false_after_first_healthy_beat_is_never_grace(fx):
+    # Once the server has answered healthy, any later ok:false is real
+    # unhealthiness -- even if it lands within 120s of the start event.
+    fx.window_end = _dt("2026-07-01T00:03:00")
+    _write_jsonl(fx.ops_root / "supervisor.jsonl", [_sup_start("2026-07-01T00:00:00Z")])
+    rows = [
+        _hb_row("2026-07-01T00:00:00Z", ok=True),
+        _hb_row("2026-07-01T00:01:00Z", ok=False, http=503),  # within 120s of start, but after ok:true
+        _hb_row("2026-07-01T00:02:00Z", ok=True),
+        _hb_row("2026-07-01T00:03:00Z", ok=True),
+    ]
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    report = fx.build()
+    assert report["heartbeat"]["startup_grace_rows"] == 0
+    assert report["heartbeat"]["unhealthy_rows"] == 1
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+
+
+def test_restart_event_opens_a_new_grace_window(fx):
+    # Each start AND restart event gets its own grace window: the beat right
+    # after a crash-restart is a cold uvicorn again. The restart itself still
+    # degrades the verdict (restart count), but no unhealthy-reading reason
+    # may be added for the grace beat.
+    fx.window_end = _dt("2026-07-01T00:05:00")
+    _write_jsonl(
+        fx.ops_root / "supervisor.jsonl",
+        [
+            _sup_start("2026-07-01T00:00:00Z"),
+            _sup_restart("2026-07-01T00:02:30Z", 1, 1),
+        ],
+    )
+    rows = [
+        _hb_row("2026-07-01T00:00:00Z", ok=True),
+        _hb_row("2026-07-01T00:01:00Z", ok=True),
+        _hb_row("2026-07-01T00:02:00Z", ok=True),
+        _hb_row("2026-07-01T00:03:00Z", ok=False, http=None),  # 30s after restart, pre-first-true
+        _hb_row("2026-07-01T00:04:00Z", ok=True),
+        _hb_row("2026-07-01T00:05:00Z", ok=True),
+    ]
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    report = fx.build()
+    assert report["heartbeat"]["startup_grace_rows"] == 1
+    assert report["heartbeat"]["unhealthy_rows"] == 0
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"  # the restart itself
+    assert any("restart" in r for r in report["verdict"]["reasons"])
+    assert not any("unhealthy" in r for r in report["verdict"]["reasons"])
+
+
+def test_grace_beats_never_hide_a_real_edge_gap(fx):
+    # Startup grace only reclassifies unhealthy READINGS; the coverage /
+    # edge-gap math is untouched, so a stream that goes silent after a graced
+    # cold start still fails the window.
+    _write_jsonl(fx.ops_root / "supervisor.jsonl", [_sup_start("2026-07-01T00:00:00Z")])
+    rows = [_hb_row("2026-07-01T00:00:30Z", ok=False, http=None)]  # graced cold start
+    rows += [_hb_row(f"2026-07-01T00:{m:02d}:30Z") for m in range(1, 11)]  # 10 min, then silence
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    report = fx.build()  # 72h window
+    assert report["heartbeat"]["startup_grace_rows"] == 1
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+    assert any("window end" in r for r in report["verdict"]["reasons"])
+    assert not any("unhealthy" in r for r in report["verdict"]["reasons"])
+
+
+def test_startup_grace_horizon_is_configurable(fx):
+    # With the grace horizon pinned to 30s, a cold-start beat at +60s is NOT
+    # grace and must degrade.
+    fx.window_end = _dt("2026-07-01T00:03:00")
+    _write_jsonl(fx.ops_root / "supervisor.jsonl", [_sup_start("2026-07-01T00:00:00Z")])
+    rows = [
+        _hb_row("2026-07-01T00:01:00Z", ok=False, http=None),  # +60s > 30s grace
+        _hb_row("2026-07-01T00:02:00Z", ok=True),
+        _hb_row("2026-07-01T00:03:00Z", ok=True),
+    ]
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    report = fx.build(startup_grace_s=30.0)
+    assert report["heartbeat"]["startup_grace_rows"] == 0
+    assert report["heartbeat"]["unhealthy_rows"] == 1
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+
+
+def test_no_supervisor_events_means_no_grace(fx):
+    # Without a start/restart anchor there is nothing to grace against: an
+    # ok:false first beat stays a real degradation (and the missing
+    # supervisor evidence degrades independently anyway).
+    fx.window_end = _dt("2026-07-01T00:02:00")
+    rows = [
+        _hb_row("2026-07-01T00:00:00Z", ok=False, http=None),
+        _hb_row("2026-07-01T00:01:00Z", ok=True),
+        _hb_row("2026-07-01T00:02:00Z", ok=True),
+    ]
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    report = fx.build()
+    assert report["heartbeat"]["startup_grace_rows"] == 0
+    assert report["heartbeat"]["unhealthy_rows"] == 1
+    assert any("unhealthy" in r for r in report["verdict"]["reasons"])
+
+
+# --------------------------------------------------------------------------- #
 # Huge restart count must degrade cleanly (no choking)
 # --------------------------------------------------------------------------- #
 def test_huge_restart_count_renders_without_choking(fx):
@@ -713,6 +868,17 @@ class TestOpsReportCli:
         assert rc == EXIT_SUCCESS
         payload = json.loads(out)
         assert payload["scheduled_firings"]["schedule"] == "0 */6 * * *"
+
+    def test_startup_grace_env_is_honored(self, monkeypatch, tmp_path, capsys):
+        from cli._legacy import EXIT_SUCCESS, cmd_ops_report
+
+        self._set_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("VIBE_OPS_STARTUP_GRACE_S", "45")
+        rc = cmd_ops_report(window="4h", json_mode=True)
+        out = capsys.readouterr().out
+        assert rc == EXIT_SUCCESS
+        payload = json.loads(out)
+        assert payload["heartbeat"]["startup_grace_s"] == 45.0
 
     def test_default_window_reads_last_supervisor_start_event(self, monkeypatch, tmp_path, capsys):
         from cli._legacy import EXIT_SUCCESS, cmd_ops_report

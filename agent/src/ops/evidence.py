@@ -12,6 +12,12 @@ always override with an explicit keyword argument.
 Cross-referenced sources and the claims each supports:
 
 - ``ops/heartbeat.jsonl``   -- uptime %, continuity gaps, first/last beat.
+  Cold-start ``ok:false`` beats recorded while uvicorn is still booting are
+  classified "startup grace" and excluded from the verdict (see
+  :func:`build_heartbeat_section`'s STARTUP GRACE rule and
+  ``VIBE_OPS_STARTUP_GRACE_S``, default 120s) -- without this, no genuine
+  run could ever earn UNINTERRUPTED, because the heartbeat loop always
+  fires at least once before the server finishes starting.
 - ``ops/supervisor.jsonl``  -- restart count/times, start events, and whether
   any in-window ``start`` event ran against an overridden serve command
   (``VIBE_OPS_SERVE_CMD`` test seam -- see ``scripts/ops/run72.sh``). A
@@ -64,6 +70,13 @@ from src.paper.store import PaperStore
 from src.scheduled_research.executor import next_due
 
 DEFAULT_HEARTBEAT_INTERVAL_S = 60.0
+# Startup grace horizon (seconds after a supervisor start/restart event):
+# the heartbeat loop starts before uvicorn finishes booting, so the FIRST
+# beat of every real run records ok:false. Without a grace rule, "uptime <
+# 100% => never UNINTERRUPTED" would make the verdict unearnable by any
+# genuine run. Overridable via VIBE_OPS_STARTUP_GRACE_S (resolved by the CLI
+# layer; this module stays env-free).
+DEFAULT_STARTUP_GRACE_S = 120.0
 COMMITTEE_PRESET_NAME = "crypto_committee"
 # Head+tail sample size for potentially-huge event logs (e.g. a restart
 # storm): keep the report readable and fast to render without ever hiding the
@@ -161,6 +174,8 @@ def build_heartbeat_section(
     window_end: datetime,
     *,
     fallback_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
+    startup_grace_s: float = DEFAULT_STARTUP_GRACE_S,
+    grace_anchors: list[datetime] | None = None,
 ) -> dict[str, Any]:
     """Uptime %, continuity gaps, and malformed-line count for ``heartbeat.jsonl``.
 
@@ -182,13 +197,29 @@ def build_heartbeat_section(
       window span); the verdict degrades when the total uncovered edge time
       exceeds 2x the interval even if neither single edge does.
     - UNHEALTHY span ("health check failing (ok:false)"): a contiguous span
-      of ``ok: false`` rows -- a service answering /health on schedule but
-      unhealthy, which the delta check alone would miss. Duration is first
-      to last row plus one interval, so even a single bad reading
-      contributes roughly one interval of known-bad time. ANY unhealthy row
-      degrades the verdict regardless of span length (uptime < 100% is
-      never "uninterrupted"), so short spans whose duration happens to fall
-      at or under 2x the interval still count.
+      of non-grace ``ok: false`` rows -- a service answering /health on
+      schedule but unhealthy, which the delta check alone would miss.
+      Duration is first to last row plus one interval, so even a single bad
+      reading contributes roughly one interval of known-bad time. ANY
+      non-grace unhealthy row degrades the verdict regardless of span length
+      (uptime < 100% outside startup grace is never "uninterrupted"), so
+      short spans whose duration happens to fall at or under 2x the interval
+      still count.
+
+    STARTUP GRACE (report-side classification -- no supervisor changes, no
+    data loss): the heartbeat loop starts before uvicorn finishes booting,
+    so the first beat(s) after every start/restart honestly record
+    ``ok:false``. An ok:false row is classified "startup grace" when ALL of:
+    (a) a start/restart anchor from ``grace_anchors`` precedes it, (b) no
+    ok:true row has been seen since that anchor, and (c) it lies within
+    ``startup_grace_s`` (inclusive) of the anchor. Grace rows are counted in
+    ``startup_grace_rows``, excluded from ``unhealthy_rows`` (the verdict
+    condition) and from unhealthy-span gap math -- but they still count as
+    beats for edge-coverage math, so grace can never manufacture or hide a
+    coverage hole. Bounds: ok:false AFTER the first ok:true since the anchor
+    is real unhealthiness; ok:false beyond the grace horizon with no ok:true
+    yet means the server never became healthy -- also real; each
+    start/restart anchor opens its own fresh grace window.
     """
     path = Path(ops_root) / "heartbeat.jsonl"
     if not path.exists():
@@ -209,6 +240,9 @@ def build_heartbeat_section(
             "last_ts": None,
             "coverage_pct": None,
             "uncovered_edge_s": None,
+            "startup_grace_rows": 0,
+            "unhealthy_rows": 0,
+            "startup_grace_s": startup_grace_s,
         }
 
     rows, malformed = _read_jsonl(path)
@@ -219,6 +253,35 @@ def build_heartbeat_section(
     ok_rows = sum(1 for r in in_window if r.get("ok") is True)
     uptime_pct = (ok_rows / total * 100.0) if total else None
     http_429_count = sum(1 for r in in_window if r.get("http") == 429)
+
+    # Startup-grace classification (see docstring): walk rows and anchors in
+    # timestamp order; each anchor resets the "healthy seen" flag, opening a
+    # fresh grace window.
+    anchors = sorted(grace_anchors or [])
+    grace_flags: list[bool] = []
+    anchor_idx = -1
+    healthy_seen_since_anchor = True  # nothing to grace before the first anchor
+    for row in in_window:
+        ts = _parse_ts(row["ts"])
+        while anchor_idx + 1 < len(anchors) and anchors[anchor_idx + 1] <= ts:
+            anchor_idx += 1
+            healthy_seen_since_anchor = False
+        is_grace = False
+        if row.get("ok") is True:
+            healthy_seen_since_anchor = True
+        elif row.get("ok") is False:
+            is_grace = (
+                anchor_idx >= 0
+                and not healthy_seen_since_anchor
+                and (ts - anchors[anchor_idx]).total_seconds() <= startup_grace_s
+            )
+        grace_flags.append(is_grace)
+    startup_grace_rows = sum(grace_flags)
+    unhealthy_rows = sum(
+        1
+        for row, graced in zip(in_window, grace_flags)
+        if row.get("ok") is not True and not graced
+    )
 
     deltas = [
         (_parse_ts(b["ts"]) - _parse_ts(a["ts"])).total_seconds()
@@ -276,10 +339,16 @@ def build_heartbeat_section(
             )
 
     idx, n = 0, len(in_window)
+
+    def _is_unhealthy(i: int) -> bool:
+        # Grace rows are excluded from unhealthy-span gap math (see the
+        # STARTUP GRACE docstring block) -- but not from edge-coverage math.
+        return in_window[i].get("ok") is False and not grace_flags[i]
+
     while idx < n:
-        if in_window[idx].get("ok") is False:
+        if _is_unhealthy(idx):
             j = idx
-            while j + 1 < n and in_window[j + 1].get("ok") is False:
+            while j + 1 < n and _is_unhealthy(j + 1):
                 j += 1
             start_ts = _parse_ts(in_window[idx]["ts"])
             end_ts = _parse_ts(in_window[j]["ts"])
@@ -327,6 +396,9 @@ def build_heartbeat_section(
         "last_ts": _iso(_parse_ts(in_window[-1]["ts"])) if in_window else None,
         "coverage_pct": coverage_pct if in_window else None,
         "uncovered_edge_s": uncovered_edge_s if in_window else None,
+        "startup_grace_rows": startup_grace_rows,
+        "unhealthy_rows": unhealthy_rows,
+        "startup_grace_s": startup_grace_s,
     }
 
 
@@ -702,10 +774,13 @@ def compute_verdict(
     scheduled_firings: dict[str, Any],
 ) -> dict[str, Any]:
     """UNINTERRUPTED iff 0 restarts, max recorded gap < 2x interval, every
-    heartbeat healthy (uptime 100% -- any ok:false span degrades regardless
-    of its length), window-edge coverage complete (total uncovered edge time
-    <= 2x interval), every expected committee-run firing accounted for, AND
-    no overridden-serve-cmd start events in-window. Any missing/unparseable
+    heartbeat healthy outside startup grace (any NON-GRACE ok:false reading
+    degrades regardless of span length; startup-grace readings -- ok:false
+    within the grace horizon of a start/restart, before the first healthy
+    beat -- are excluded, see ``build_heartbeat_section``), window-edge
+    coverage complete (total uncovered edge time <= 2x interval), every
+    expected committee-run firing accounted for, AND no overridden-serve-cmd
+    start events in-window. Any missing/unparseable
     source, or any malformed line, also degrades the verdict (never invent
     continuity that can't be verified) -- each condition below flips the
     verdict independently.
@@ -764,10 +839,18 @@ def compute_verdict(
             )
         total_rows = heartbeat.get("total_rows") or 0
         ok_rows = heartbeat.get("ok_rows") or 0
-        if total_rows and ok_rows < total_rows:
+        unhealthy_rows = heartbeat.get("unhealthy_rows")
+        if unhealthy_rows is None:  # defensive fallback for older dict shapes
+            unhealthy_rows = total_rows - ok_rows
+        if unhealthy_rows:
+            grace_rows = heartbeat.get("startup_grace_rows") or 0
+            grace_note = (
+                f" ({grace_rows} startup-grace reading(s) excluded)" if grace_rows else ""
+            )
             reasons.append(
-                f"{total_rows - ok_rows} unhealthy (ok:false) heartbeat reading(s) in window "
-                "-- uptime below 100% is never uninterrupted"
+                f"{unhealthy_rows} unhealthy (ok:false) heartbeat reading(s) in window"
+                f"{grace_note} -- uptime below 100% outside startup grace is never "
+                "uninterrupted"
             )
         uncovered_edge_s = heartbeat.get("uncovered_edge_s")
         if uncovered_edge_s is not None and uncovered_edge_s > 2 * interval_s:
@@ -811,6 +894,7 @@ def build_evidence_report(
     paper_root: Path,
     journal_path: Path,
     heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
+    startup_grace_s: float = DEFAULT_STARTUP_GRACE_S,
     committee_schedule: str | None = None,
     window_start_source: str = "explicit",
     generated_at: datetime | None = None,
@@ -820,10 +904,31 @@ def build_evidence_report(
     Pure: every source is an explicit argument (a root path or a schedule
     string) -- no environment reads, no implicit clock use besides the
     optional ``generated_at`` override. See the module docstring for the
-    median-interval gap-math rule and the honesty/degradation rules.
+    median-interval gap-math rule and the honesty/degradation rules, and
+    ``build_heartbeat_section`` for the startup-grace rule
+    (``startup_grace_s``; CLI resolves it from ``VIBE_OPS_STARTUP_GRACE_S``,
+    default 120).
     """
+    # Grace anchors: every supervisor start/restart event whose grace window
+    # can overlap the report window (an anchor slightly before window_start
+    # can still grace an in-window cold-start beat).
+    supervisor_rows, _ = _read_jsonl(Path(ops_root) / "supervisor.jsonl")
+    anchor_low = window_start - timedelta(seconds=startup_grace_s)
+    grace_anchors = [
+        ts
+        for r in supervisor_rows
+        if r.get("event") in ("start", "restart")
+        and (ts := _try_parse_ts(r.get("ts"))) is not None
+        and anchor_low <= ts <= window_end
+    ]
+
     heartbeat = build_heartbeat_section(
-        ops_root, window_start, window_end, fallback_interval_s=heartbeat_interval_s
+        ops_root,
+        window_start,
+        window_end,
+        fallback_interval_s=heartbeat_interval_s,
+        startup_grace_s=startup_grace_s,
+        grace_anchors=grace_anchors,
     )
     supervisor = build_supervisor_section(ops_root, window_start, window_end)
     scheduled_firings = build_scheduled_firings_section(
@@ -892,6 +997,12 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"(uncovered edge time: {hb['uncovered_edge_s']:.0f}s)"
             )
         lines.append(f"- First/last beat: {hb['first_ts']} / {hb['last_ts']}")
+        if hb.get("startup_grace_rows"):
+            lines.append(
+                f"- Startup grace: {hb['startup_grace_rows']} startup-grace reading(s) "
+                f"excluded from verdict per VIBE_OPS_STARTUP_GRACE_S={hb['startup_grace_s']:.0f} "
+                "(ok:false after a start/restart, before the first healthy beat)"
+            )
         lines.append(f"- Malformed lines: {hb['malformed_lines']}")
         lines.append(f"- HTTP 429 responses: {hb['http_429_count']}")
         if hb["gaps"]:
