@@ -26,7 +26,10 @@ class PaperTickTool(BaseTool):
         "conditional orders for every open paper position against the latest "
         "confirmed daily bar, then marks the paper account to market and "
         "records an equity snapshot. Idempotent per UTC day. No parameters. "
-        "Returns a summary of fills, current equity, stale positions, and any "
+        "Also runs the deterministic event check (price-move / funding) for the "
+        "watched symbols and returns any 'event_triggers' — flagged symbols the "
+        "caller should fire an ad-hoc committee run on. Returns a summary of "
+        "fills, current equity, stale positions, event_triggers, and any "
         "per-symbol bar-fetch errors (those positions are left untouched and "
         "retried on the next tick)."
     )
@@ -59,6 +62,7 @@ class PaperTickTool(BaseTool):
             )
 
         equity = result.get("equity_snapshot") or {}
+        event_triggers = result.get("event_triggers") or []
         summary = {
             "status": "ok",
             "fills": len(result.get("conditional_fills") or []),
@@ -66,6 +70,11 @@ class PaperTickTool(BaseTool):
             "stale_positions": equity.get("stale_positions"),
             "date": equity.get("date"),
             "already_recorded": equity.get("already_recorded"),
+            # Surfaced prominently: each flagged symbol should get an ad-hoc
+            # committee run (see the paper-trading-tick job prompt). Full detail
+            # (reason/metric/value/threshold) is preserved for the agent's report.
+            "event_triggers": event_triggers,
+            "event_trigger_symbols": [t.get("symbol") for t in event_triggers],
             "errors": result.get("errors") or [],
         }
         return json.dumps(summary, ensure_ascii=False, default=str)

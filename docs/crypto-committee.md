@@ -507,6 +507,48 @@ later change to `VIBE_COMMITTEE_SYMBOLS` or `VIBE_COMMITTEE_TIMEFRAME` has
 re-registers it with the new env) or hand-edit its persisted prompt to
 change the symbol universe or horizon.
 
+### Event trigger (ad-hoc committee runs)
+
+Between scheduled committee runs, a deterministic, LLM-free check
+(`agent/src/paper/events.py::check_events`) runs inside **every** paper tick —
+no extra scheduled job. For each watched symbol (open positions ∪
+`VIBE_COMMITTEE_SYMBOLS`) it fetches the live price and funding rate via the
+same snapshot fetchers the committee uses and flags the symbol when either:
+
+- `|price − reference| / |reference| ≥ VIBE_EVENT_PRICE_MOVE_PCT` percent
+  (default `5`; `0` disables). The reference is resolved in order: the last
+  committee decision's execution price for that symbol (its paper ledger
+  fill's `fill_price`, else the journal entry's `ref_price`) → else the
+  previous tick's stored price → else no price trigger this tick (the observed
+  price is stored so the next tick can compare).
+- `|funding rate| ≥ VIBE_EVENT_FUNDING_ABS` (default `0.001` = 0.1%/8h; `0`
+  disables).
+
+A flagged symbol lands in the tick result's `event_triggers`
+(`{symbol, reason, metric, value, threshold}`), which the `paper_tick` tool
+surfaces; the `paper-trading-tick` job prompt then fires one ad-hoc
+`run_swarm(preset_name="crypto_committee", variables={"target": "<SYMBOL>",
+"timeframe": "<VIBE_COMMITTEE_TIMEFRAME>"})` per flagged symbol — the same
+structured, binding `variables` channel as the scheduled committee job. Those
+ad-hoc runs journal and execute through the existing loop unchanged. A
+per-symbol cooldown (`VIBE_EVENT_COOLDOWN_H`, default `12`, persisted in
+`tick_state.json` under `last_event_trigger_ts`) means a **sustained** move
+triggers exactly once — a symbol still inside its cooldown window is not
+re-flagged, regardless of whether the agent acted on the earlier trigger. A
+live price/funding fetch failure for a symbol records an error in the tick
+result and yields no trigger for it (never invent a price).
+
+Because `VIBE_EVENT_PRICE_MOVE_PCT` defaults ON, a plain paper deployment now
+writes `tick_state.json` (event bookkeeping only; the bar watermark stays empty
+in 1D mode) even without intraday mode — set both thresholds to `0` to fully
+disable the event path.
+
+**Honest limit:** the reference is decision-time or last-tick, so a fast spike
+that fully reverses *within* the tick interval is invisible by design (no order
+book, no sub-tick sampling). The cooldown is the *only* rate limiter, so
+worst-case an event fires ~2 extra committee runs per symbol per day at the 12h
+default — ad-hoc runs consume the same LLM quota as scheduled ones.
+
 ## Debate rounds
 
 `agent/src/swarm/presets.py::_expand_debate` unrolls the `debates:` YAML

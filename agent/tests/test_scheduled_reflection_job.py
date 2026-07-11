@@ -116,6 +116,33 @@ def test_ensure_paper_trading_tick_job_registers_with_expected_prompt(store):
     assert "paper_tick" in job.prompt
 
 
+def test_paper_tick_job_prompt_has_event_trigger_run_swarm_followup(monkeypatch, store):
+    """Prompt-contract (Task 3): the tick job prompt references paper_tick AND
+    the event-trigger run_swarm follow-up, using the STRUCTURED variables param
+    (target/timeframe) mirroring the committee-run job — not prompt extraction
+    alone. The timeframe is resolved from VIBE_COMMITTEE_TIMEFRAME at
+    registration."""
+    monkeypatch.setenv("VIBE_COMMITTEE_TIMEFRAME", "24h swing")
+    _ensure_paper_trading_tick_job(store)
+    prompt = store.get(PAPER_TICK_JOB_ID).prompt
+
+    assert "paper_tick" in prompt
+    assert "event_triggers" in prompt
+    assert "run_swarm" in prompt
+    assert "crypto_committee" in prompt
+    # structured variables channel with the resolved timeframe baked in
+    assert '"target"' in prompt and '"timeframe"' in prompt
+    assert "24h swing" in prompt
+    # honest constraint carried through
+    assert "never invent" in prompt.lower() or "never fabricate" in prompt.lower()
+
+
+def test_paper_tick_job_prompt_defaults_timeframe_when_env_unset(monkeypatch, store):
+    monkeypatch.delenv("VIBE_COMMITTEE_TIMEFRAME", raising=False)
+    _ensure_paper_trading_tick_job(store)
+    assert "72h swing" in store.get(PAPER_TICK_JOB_ID).prompt
+
+
 def test_paper_tick_job_honors_schedule_env(monkeypatch, store):
     """VIBE_PAPER_TICK_SCHEDULE overrides the initial registration schedule
     (the recommended 2-hourly deployment sets "30 */2 * * *")."""

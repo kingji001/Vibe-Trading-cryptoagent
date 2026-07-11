@@ -48,6 +48,14 @@ def _set_default_env(monkeypatch, tmp_path, **overrides):
         "VIBE_PAPER_DEFAULT_SIZE_PCT": "10",
         "VIBE_PAPER_DEFAULT_STOP_PCT": "8",
         "VIBE_PAPER_ROOT": str(tmp_path),
+        # Task 3: the event trigger (VIBE_EVENT_PRICE_MOVE_PCT) defaults ON (5),
+        # which would fire live price/funding fetches (socket-disabled -> errors)
+        # for these bar-focused tests. Disable BOTH thresholds by default so the
+        # conditional-order / watermark behavior stays exactly what Task 1 pinned;
+        # the event path has its own coverage in test_paper_events.py and the
+        # 1Dxevents matrix tests below (which enable it explicitly + inject fns).
+        "VIBE_EVENT_PRICE_MOVE_PCT": "0",
+        "VIBE_EVENT_FUNDING_ABS": "0",
     }
     env.update(overrides)
     for key, value in env.items():
@@ -601,14 +609,150 @@ def test_load_tick_state_fills_missing_schema_keys(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------- #
 # Task 1 — 1D mode regression: byte-identical, tick_state.json NEVER created   #
 # --------------------------------------------------------------------------- #
-def test_1d_mode_does_not_create_tick_state_file(broker):
-    """Crown jewel: default (1D) mode is byte-identical to pre-change behavior —
-    no tick_state.json is ever written."""
-    _seed_position(broker.store, stop=95.0, take_profits=[])
+def test_1d_mode_with_events_disabled_does_not_create_tick_state_file(monkeypatch, tmp_path, price_fn):
+    """Crown jewel (updated for Task 3): 1D mode with BOTH event thresholds
+    explicitly disabled is byte-identical to pre-event behavior — no
+    tick_state.json is ever written. (The `broker` fixture disables events via
+    _set_default_env; here we pin the thresholds=0 premise explicitly.)"""
+    _set_default_env(
+        monkeypatch, tmp_path,
+        VIBE_EVENT_PRICE_MOVE_PCT="0", VIBE_EVENT_FUNDING_ABS="0",
+    )
+    store = PaperStore(tmp_path)
+    _seed_position(store, stop=95.0, take_profits=[])
     bar = _bar(open=99.0, high=100.0, low=90.0, close=96.0)
-    result = run_tick(broker.store, bars_fn=lambda s, n: bar, price_fn=broker.price_fn)
+    result = run_tick(store, bars_fn=lambda s, n: bar, price_fn=price_fn)
     assert len(result["conditional_fills"]) == 1
-    assert not (broker.store.root / "tick_state.json").exists()
+    assert not (store.root / "tick_state.json").exists()
+
+
+def test_1d_mode_with_events_default_on_creates_tick_state_but_no_bar_watermark(
+    monkeypatch, tmp_path, price_fn
+):
+    """Task 3: VIBE_EVENT_PRICE_MOVE_PCT defaults ON (5), so a plain 1D
+    deployment NOW creates tick_state.json — carrying only event data
+    (last_price / last_event_trigger_ts). last_bar_ts stays empty because 1D
+    mode never advances a per-symbol bar watermark."""
+    _set_default_env(monkeypatch, tmp_path, VIBE_EVENT_PRICE_MOVE_PCT="5", VIBE_EVENT_FUNDING_ABS="0")
+    monkeypatch.setenv("VIBE_COMMITTEE_SYMBOLS", "BTC-USDT")
+    store = PaperStore(tmp_path)
+    _seed_position(store, stop=None, take_profits=[])
+    bar = _bar(open=100.0, high=105.0, low=98.0, close=103.0)
+    # inject event fetchers so no network; no decision -> reference falls back to
+    # (empty) last_price -> no trigger, but the observed price is stored.
+    result = run_tick(
+        store, bars_fn=lambda s, n: bar, price_fn=price_fn,
+        event_price_fn=lambda sym: 100.0,
+        event_funding_fn=lambda sym: 0.0,
+        journal_ref_fn=lambda sym: None,
+    )
+    assert result["event_triggers"] == []
+    assert (store.root / "tick_state.json").exists()
+    st = store.load_tick_state()
+    assert st["last_bar_ts"] == {}  # 1D never sets a bar watermark
+    assert st["last_price"]["BTC-USDT"] == pytest.approx(100.0)  # observed live price stored
+
+
+# --------------------------------------------------------------------------- #
+# Task 3 — event trigger wired into run_tick                                   #
+# --------------------------------------------------------------------------- #
+def test_run_tick_event_trigger_fires_on_price_move(monkeypatch, tmp_path, price_fn):
+    """A watched symbol whose live price has moved >= threshold from the
+    decision reference is surfaced in result['event_triggers'] and enters
+    cooldown (persisted)."""
+    _set_default_env(monkeypatch, tmp_path, VIBE_EVENT_PRICE_MOVE_PCT="5", VIBE_EVENT_FUNDING_ABS="0")
+    monkeypatch.setenv("VIBE_COMMITTEE_SYMBOLS", "BTC-USDT")
+    store = PaperStore(tmp_path)
+    result = run_tick(
+        store, bars_fn=lambda s, n: _bar(), price_fn=price_fn,
+        event_price_fn=lambda sym: 110.0,       # +10% vs reference 100
+        event_funding_fn=lambda sym: 0.0,
+        journal_ref_fn=lambda sym: 100.0,       # decision reference price
+    )
+    triggers = result["event_triggers"]
+    assert len(triggers) == 1
+    assert triggers[0]["symbol"] == "BTC-USDT"
+    assert triggers[0]["metric"] == "price_move_pct"
+    # cooldown armed and persisted
+    assert store.load_tick_state()["last_event_trigger_ts"]["BTC-USDT"]
+
+
+def test_run_tick_event_fetch_failure_records_error_no_trigger(monkeypatch, tmp_path, price_fn):
+    """A live event-price fetch failure is recorded in the tick errors and
+    yields no trigger (never invent a price)."""
+    _set_default_env(monkeypatch, tmp_path, VIBE_EVENT_PRICE_MOVE_PCT="5", VIBE_EVENT_FUNDING_ABS="0")
+    monkeypatch.setenv("VIBE_COMMITTEE_SYMBOLS", "BTC-USDT")
+    store = PaperStore(tmp_path)
+
+    def boom(sym):
+        raise RuntimeError("okx snapshot down")
+
+    result = run_tick(
+        store, bars_fn=lambda s, n: _bar(), price_fn=price_fn,
+        event_price_fn=boom,
+        event_funding_fn=lambda sym: 0.0,
+        journal_ref_fn=lambda sym: 100.0,
+    )
+    assert result["event_triggers"] == []
+    assert any(
+        e["symbol"] == "BTC-USDT" and "event price fetch failed" in e["error"]
+        for e in result["errors"]
+    )
+
+
+def test_run_tick_event_cooldown_suppresses_second_tick(monkeypatch, tmp_path, price_fn):
+    """Trigger on tick 1; a sustained move on tick 2 (within the cooldown
+    window) is suppressed — the sustained move triggers exactly once."""
+    _set_default_env(monkeypatch, tmp_path, VIBE_EVENT_PRICE_MOVE_PCT="5", VIBE_EVENT_FUNDING_ABS="0")
+    monkeypatch.setenv("VIBE_COMMITTEE_SYMBOLS", "BTC-USDT")
+    monkeypatch.setenv("VIBE_EVENT_COOLDOWN_H", "12")
+    store = PaperStore(tmp_path)
+    kwargs = dict(
+        bars_fn=lambda s, n: _bar(), price_fn=price_fn,
+        event_price_fn=lambda sym: 110.0, event_funding_fn=lambda sym: 0.0,
+        journal_ref_fn=lambda sym: 100.0,
+    )
+    first = run_tick(store, now=datetime(2026, 7, 11, 0, 0, tzinfo=timezone.utc), **kwargs)
+    second = run_tick(store, now=datetime(2026, 7, 11, 2, 0, tzinfo=timezone.utc), **kwargs)
+    assert len(first["event_triggers"]) == 1
+    assert second["event_triggers"] == []  # cooldown
+
+
+def test_run_tick_event_watched_includes_open_positions(monkeypatch, tmp_path, price_fn):
+    """An open-position symbol is watched even when it is not in
+    VIBE_COMMITTEE_SYMBOLS."""
+    _set_default_env(monkeypatch, tmp_path, VIBE_EVENT_PRICE_MOVE_PCT="5", VIBE_EVENT_FUNDING_ABS="0")
+    monkeypatch.setenv("VIBE_COMMITTEE_SYMBOLS", "SOL-USDT")  # not the position symbol
+    store = PaperStore(tmp_path)
+    _seed_position(store, symbol="ETH-USDT", stop=None, take_profits=[])
+
+    seen: list[str] = []
+
+    def price(sym):
+        seen.append(sym)
+        return 110.0
+
+    run_tick(
+        store, bars_fn=lambda s, n: _bar(), price_fn=price_fn,
+        event_price_fn=price, event_funding_fn=lambda sym: 0.0,
+        journal_ref_fn=lambda sym: 100.0,
+    )
+    assert "ETH-USDT" in seen  # open position watched
+    assert "SOL-USDT" in seen  # committee symbol watched
+
+
+def test_run_tick_1d_events_atomic_no_tmp_file_left(monkeypatch, tmp_path, price_fn):
+    """tick_state is written atomically (tmp + os.replace): no .tmp residue."""
+    _set_default_env(monkeypatch, tmp_path, VIBE_EVENT_PRICE_MOVE_PCT="5", VIBE_EVENT_FUNDING_ABS="0")
+    monkeypatch.setenv("VIBE_COMMITTEE_SYMBOLS", "BTC-USDT")
+    store = PaperStore(tmp_path)
+    run_tick(
+        store, bars_fn=lambda s, n: _bar(), price_fn=price_fn,
+        event_price_fn=lambda sym: 100.0, event_funding_fn=lambda sym: 0.0,
+        journal_ref_fn=lambda sym: None,
+    )
+    assert (tmp_path / "tick_state.json").exists()
+    assert not (tmp_path / "tick_state.json.tmp").exists()
 
 
 def test_1d_mode_explicit_interval_matches_default(monkeypatch, tmp_path, price_fn):

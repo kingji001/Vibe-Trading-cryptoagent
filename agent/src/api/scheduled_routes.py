@@ -128,16 +128,43 @@ PAPER_TICK_JOB_ID = "paper-trading-tick"
 # deployment sets "30 */2 * * *" alongside VIBE_PAPER_TICK_INTERVAL=1H.
 PAPER_TICK_JOB_SCHEDULE = "30 0 * * *"
 _PAPER_TICK_SCHEDULE_ENV = "VIBE_PAPER_TICK_SCHEDULE"
-PAPER_TICK_JOB_PROMPT = (
-    "You are running the scheduled daily paper-trading tick. This is a "
-    "mechanical maintenance run, not a trading decision — do not analyze "
-    "the market and do not call any tool other than the one below.\n\n"
-    "1. Call the paper_tick tool exactly once, with no arguments.\n"
-    "2. Reply with a one-line summary of its result: how many conditional "
-    "fills triggered, the current equity, and how many positions were "
-    "marked stale. If the tool reported any errors, include them verbatim.\n"
-    "Never fabricate results — report exactly what the tool returned."
-)
+
+
+def _build_paper_tick_prompt(timeframe: str) -> str:
+    """Build the paper-trading-tick job prompt for a fixed committee timeframe.
+
+    ``timeframe`` (from ``VIBE_COMMITTEE_TIMEFRAME``) is resolved ONCE, at
+    registration, and baked in — same non-clobbering contract as the
+    committee-run job. It is used only in the event-trigger follow-up: when the
+    tick surfaces ``event_triggers``, the agent fires one ad-hoc committee run
+    per flagged symbol, passing the instrument + this horizon through
+    run_swarm's STRUCTURED ``variables`` parameter (the binding channel Task 2
+    added — a missing target now errors; prompt extraction is only a fallback),
+    mirroring the committee-run job's phrasing.
+    """
+    return (
+        "You are running the scheduled paper-trading tick. Steps 1-2 are a "
+        "mechanical maintenance run, not a trading decision.\n\n"
+        "1. Call the paper_tick tool exactly once, with no arguments.\n"
+        "2. Note its result: how many conditional fills triggered, the current "
+        "equity, how many positions were marked stale, and any errors "
+        "(report errors verbatim — never fabricate).\n"
+        "3. Look at the tool's 'event_triggers' list. If it is EMPTY, do "
+        "nothing further. If it is NON-EMPTY, then for EACH flagged trigger "
+        "call run_swarm with preset_name=\"crypto_committee\", "
+        f'variables={{"target": "<SYMBOL>", "timeframe": "{timeframe}"}}, and '
+        'prompt="Run the crypto_committee swarm on <SYMBOL> for a '
+        f'{timeframe} decision." — substituting <SYMBOL> with the trigger\'s '
+        "'symbol'. These are ad-hoc committee runs fired because the market "
+        "moved materially (the trigger carries the reason/metric/value). Run "
+        "them one at a time; if one fails, report the failure verbatim and "
+        "continue with the next flagged symbol.\n"
+        "4. Reply with a one-line tick summary, then — if you started any "
+        "committee runs — one line per flagged symbol: its run id and the "
+        "trigger reason (or the failure). Report exactly what the tools "
+        "returned; never invent a run id, a rating, or a trigger."
+    )
+
 
 _PAPER_ENABLED_ENV = "VIBE_PAPER_ENABLED"
 
@@ -176,10 +203,14 @@ def _ensure_paper_trading_tick_job(store) -> None:
     from src.scheduled_research.models import ScheduledResearchJob
 
     schedule = os.environ.get(_PAPER_TICK_SCHEDULE_ENV, "").strip() or PAPER_TICK_JOB_SCHEDULE
+    # The event-trigger follow-up fires ad-hoc committee runs at the same
+    # horizon the scheduled committee job uses; resolve VIBE_COMMITTEE_TIMEFRAME
+    # once here (non-clobbering — a later env change won't rewrite the prompt).
+    timeframe = os.environ.get(_COMMITTEE_TIMEFRAME_ENV, "").strip() or DEFAULT_COMMITTEE_TIMEFRAME
     store.upsert(
         ScheduledResearchJob(
             id=PAPER_TICK_JOB_ID,
-            prompt=PAPER_TICK_JOB_PROMPT,
+            prompt=_build_paper_tick_prompt(timeframe),
             schedule=schedule,
         )
     )
