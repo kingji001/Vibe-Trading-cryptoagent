@@ -196,6 +196,15 @@ def _ensure_paper_trading_tick_job(store) -> None:
     non-clobbering, changing that env after the job already exists does NOT
     rewrite the persisted schedule — the operator must edit the job (or delete
     it so a restart re-registers it) to change an existing job's cadence.
+
+    UPGRADE NOTE: the same non-clobbering rule means a ``paper-trading-tick``
+    job registered before this module's event-trigger + run_swarm follow-up
+    was added (e.g. one left over from the paper-trading-loop branch) is NOT
+    rewritten by upgrading the code — it keeps its old prompt, which never
+    looks at ``event_triggers``, so events would compute in ``run_tick`` but
+    never be acted on. Operators upgrading from that branch must delete the
+    ``paper-trading-tick`` job once; the next restart re-registers it with the
+    current, event-aware prompt from ``_build_paper_tick_prompt``.
     """
     if store.get(PAPER_TICK_JOB_ID) is not None:
         return
@@ -267,12 +276,21 @@ DEFAULT_COMMITTEE_TIMEFRAME = "72h swing"
 def _parse_committee_symbols() -> list[str]:
     """Parse ``VIBE_COMMITTEE_SYMBOLS`` into an ordered, deduped-by-nothing list.
 
-    Comma-separated; each entry is whitespace-stripped and empties (e.g. a
-    trailing comma or double comma) are dropped. Unset/blank -> the single
-    default ``["BTC-USDT"]``.
+    Comma-separated; each entry is whitespace-stripped, uppercased, and
+    empties (e.g. a trailing comma or double comma) are dropped. Unset/blank
+    -> the single default ``["BTC-USDT"]``.
+
+    Uppercasing matters beyond cosmetics: this symbol list feeds
+    ``_watched_symbols`` (``src/paper/tick.py``), which unions it with open
+    positions' symbols (always stored uppercased, e.g. ``ETH-USDT``) to build
+    the event-trigger watch list. Without normalization here, an operator
+    typo like ``eth-usdt`` would create a second, lowercase identity for the
+    same instrument — a separate cooldown key in ``tick_state.json`` and, in
+    the worst case, duplicate ad-hoc committee runs for what is really one
+    position.
     """
     raw = os.environ.get(_COMMITTEE_SYMBOLS_ENV, "")
-    symbols = [s.strip() for s in raw.split(",")]
+    symbols = [s.strip().upper() for s in raw.split(",")]
     symbols = [s for s in symbols if s]
     return symbols or [DEFAULT_COMMITTEE_SYMBOLS]
 

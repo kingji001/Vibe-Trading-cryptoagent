@@ -309,6 +309,15 @@ def test_parse_committee_symbols_splits_strips_and_drops_empties(monkeypatch):
     assert _parse_committee_symbols() == ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
 
 
+def test_parse_committee_symbols_uppercases_mixed_case_entries(monkeypatch):
+    """A lowercase/mixed-case symbol (e.g. an operator typo like ``eth-usdt``)
+    must normalize to the same identity a position's uppercase symbol uses —
+    otherwise the event trigger's watch-list union creates a parallel
+    lowercase identity with its own cooldown key (final review item 4)."""
+    monkeypatch.setenv("VIBE_COMMITTEE_SYMBOLS", "eth-usdt, Btc-Usdt")
+    assert _parse_committee_symbols() == ["ETH-USDT", "BTC-USDT"]
+
+
 def test_committee_run_job_not_registered_when_schedule_env_unset(monkeypatch, store):
     monkeypatch.delenv("VIBE_COMMITTEE_SCHEDULE", raising=False)
     _ensure_committee_run_job(store)
@@ -341,6 +350,21 @@ def test_committee_run_job_prompt_names_every_symbol_preset_and_timeframe(monkey
     # on the scheduling LLM reproducing the prose template verbatim.
     assert 'variables={"target": "BTC-USDT", "timeframe": "24h swing"}' in job.prompt
     assert 'variables={"target": "ETH-USDT", "timeframe": "24h swing"}' in job.prompt
+
+
+def test_committee_run_job_prompt_uppercases_mixed_case_symbols_env(monkeypatch, store):
+    """A mixed-case VIBE_COMMITTEE_SYMBOLS still lands in the registered job's
+    prompt as uppercase symbols (final review item 4 — normalization happens
+    in _parse_committee_symbols, which this job's registration calls)."""
+    monkeypatch.setenv("VIBE_COMMITTEE_SCHEDULE", "0 8 * * *")
+    monkeypatch.setenv("VIBE_COMMITTEE_SYMBOLS", "eth-usdt, btc-usdt")
+    _ensure_committee_run_job(store)
+    job = store.get(COMMITTEE_RUN_JOB_ID)
+
+    assert "ETH-USDT" in job.prompt
+    assert "BTC-USDT" in job.prompt
+    assert "eth-usdt" not in job.prompt
+    assert 'variables={"target": "ETH-USDT"' in job.prompt
 
 
 def test_committee_run_job_uses_defaults_when_symbols_and_timeframe_unset(monkeypatch, store):

@@ -551,6 +551,13 @@ def run_tick(
     from src.paper.events import EventConfig
 
     event_config = EventConfig.from_env()
+    # A malformed event-tuning env var (e.g. VIBE_EVENT_PRICE_MOVE_PCT=5%)
+    # never raises out of from_env — it falls back to that var's default and
+    # is surfaced here so the typo is visible, WITHOUT aborting the tick
+    # before stop/TP evaluation below (an event-config typo must never freeze
+    # risk management).
+    for warning in event_config.warnings:
+        errors.append({"symbol": None, "error": warning})
     need_state = interval == "1H" or event_config.enabled
     state = store.load_tick_state() if need_state else None
 

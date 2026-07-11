@@ -549,6 +549,35 @@ book, no sub-tick sampling). The cooldown is the *only* rate limiter, so
 worst-case an event fires ~2 extra committee runs per symbol per day at the 12h
 default — ad-hoc runs consume the same LLM quota as scheduled ones.
 
+**Reference-price semantics (read before tuning cooldown/thresholds):**
+
+- A symbol still inside its cooldown window is skipped entirely — no fetch,
+  no trigger, and (by design) no `last_price` refresh. So once the cooldown
+  elapses, the NEXT move is measured from the price at the moment the
+  cooldown-starting trigger fired, not from wherever the price drifted to
+  during the cooldown window. This is intended: it keeps the "sustained move
+  triggers once" guarantee simple (one stored reference per cooldown cycle)
+  rather than silently re-basing the comparison point on every skipped tick.
+- A symbol that temporarily leaves the watched set (open positions ∪
+  `VIBE_COMMITTEE_SYMBOLS`) and later rejoins, with no committee decision
+  journaled for it in the meantime, falls back to whatever `last_price` was
+  last stored for it — which may be stale by however long it was unwatched.
+  The first tick after it rejoins can therefore fire one spurious trigger
+  compared against an old price; the cooldown then bounds it to at most one
+  such false positive per re-entry.
+
+**Upgrade note (existing deployments):** `_ensure_paper_trading_tick_job`
+registration is non-clobbering — like every other `_ensure_*` job in
+`scheduled_routes.py`, a `paper-trading-tick` job that already exists (from a
+server started before this event-trigger + run_swarm follow-up was added, e.g.
+the paper-trading-loop branch) is left untouched by an upgrade. Its OLD prompt
+never looks at `event_triggers`, so after upgrading the code, `run_tick` keeps
+computing triggers but nothing ever acts on them — a silent, easy-to-miss gap.
+Operators upgrading from that branch must **delete the `paper-trading-tick`
+job once** (`DELETE /scheduled-runs/paper-trading-tick`); the next restart
+re-registers it with the current, event-aware prompt (see
+`_build_paper_tick_prompt`).
+
 ## Debate rounds
 
 `agent/src/swarm/presets.py::_expand_debate` unrolls the `debates:` YAML

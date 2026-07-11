@@ -20,6 +20,18 @@ A per-symbol cooldown (``cooldown_h``, persisted in ``tick_state.json`` under
 symbol still inside its cooldown window is not re-flagged, regardless of
 whether the agent later acted on the earlier trigger.
 
+Reference-price semantics worth knowing before tuning cooldown/thresholds:
+  - a symbol in cooldown is skipped entirely, so its ``last_price`` is NOT
+    refreshed during the cooldown window — intended: once the cooldown
+    elapses, the next move is measured from the price at the moment the
+    cooldown-starting trigger fired, not from wherever the price drifted to
+    while skipped;
+  - a symbol that leaves the watched set and later rejoins with no journaled
+    committee decision in the meantime falls back to whatever ``last_price``
+    was last stored for it, which may be stale — the first tick after it
+    rejoins can fire one spurious, cooldown-bounded trigger against that old
+    price.
+
 ``check_events`` is PURE: every market/journal read is an injected callable
 (``price_fn`` / ``funding_fn`` / ``journal_ref_fn``), so the function itself
 performs no I/O and never invents a price. A fetch failure for a symbol raises
@@ -33,7 +45,7 @@ the tick result").
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -57,10 +69,36 @@ def _env_float(name: str, default: str) -> float:
 
     ``"0"`` reads as ``0.0`` (disables the threshold); an unset OR empty value
     falls back to ``default`` — never crashing ``float("")``.
+
+    Kept for any external caller relying on the simple contract; it still
+    raises on a genuinely unparseable value (e.g. ``"5%"``) — ``from_env``
+    below does NOT call this directly for that reason, see
+    ``_env_float_or_warn``.
     """
     raw = os.environ.get(name, default)
     raw = raw.strip() or default
     return float(raw)
+
+
+def _env_float_or_warn(name: str, default: str, warnings: list[str]) -> float:
+    """Parse a float env var, falling back to ``default`` on a bad value.
+
+    An unparseable value (e.g. ``VIBE_EVENT_PRICE_MOVE_PCT=5%``) must NOT
+    raise: that would abort ``EventConfig.from_env`` and, transitively,
+    ``run_tick`` BEFORE stop/TP evaluation — a typo in an event-tuning env var
+    would freeze risk management entirely. Instead the default for that var is
+    used and a human-readable warning is appended to ``warnings`` (surfaced by
+    the caller — ``run_tick`` records it in the tick's ``errors`` list).
+    """
+    raw = os.environ.get(name, default)
+    raw = raw.strip() or default
+    try:
+        return float(raw)
+    except ValueError:
+        warnings.append(
+            f"invalid {name}={raw!r} (not a number) — using default {default}"
+        )
+        return float(default)
 
 
 @dataclass(frozen=True)
@@ -70,11 +108,15 @@ class EventConfig:
     - ``price_move_pct`` (``VIBE_EVENT_PRICE_MOVE_PCT``, default 5; 0 = off)
     - ``funding_abs`` (``VIBE_EVENT_FUNDING_ABS``, default 0.001 = 0.1%/8h; 0 = off)
     - ``cooldown_h`` (``VIBE_EVENT_COOLDOWN_H``, default 12)
+    - ``warnings``: human-readable messages for any env var that failed to
+      parse and fell back to its default (see ``_env_float_or_warn``); empty
+      when every configured value parsed cleanly. ``from_env`` never raises.
     """
 
     price_move_pct: float = 5.0
     funding_abs: float = 0.001
     cooldown_h: float = 12.0
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def enabled(self) -> bool:
@@ -83,10 +125,12 @@ class EventConfig:
 
     @classmethod
     def from_env(cls) -> "EventConfig":
+        warnings: list[str] = []
         return cls(
-            price_move_pct=_env_float("VIBE_EVENT_PRICE_MOVE_PCT", "5"),
-            funding_abs=_env_float("VIBE_EVENT_FUNDING_ABS", "0.001"),
-            cooldown_h=_env_float("VIBE_EVENT_COOLDOWN_H", "12"),
+            price_move_pct=_env_float_or_warn("VIBE_EVENT_PRICE_MOVE_PCT", "5", warnings),
+            funding_abs=_env_float_or_warn("VIBE_EVENT_FUNDING_ABS", "0.001", warnings),
+            cooldown_h=_env_float_or_warn("VIBE_EVENT_COOLDOWN_H", "12", warnings),
+            warnings=warnings,
         )
 
 
@@ -123,11 +167,15 @@ def check_events(
     trigger, no price refresh). A fetch failure is swallowed here (no trigger,
     no invented price) — ``run_tick`` records it in the tick result.
     """
-    new_state = {
-        "last_bar_ts": dict(state.get("last_bar_ts", {})),
-        "last_event_trigger_ts": dict(state.get("last_event_trigger_ts", {})),
-        "last_price": dict(state.get("last_price", {})),
-    }
+    # Copy the WHOLE input dict (not just the three known keys) and overlay
+    # fresh copies of those three, so a foreign top-level key present in
+    # ``state`` (e.g. one added by a future schema version) survives the
+    # round-trip through ``check_events`` -> ``store.save_tick_state`` instead
+    # of being silently dropped on the next save.
+    new_state = dict(state)
+    new_state["last_bar_ts"] = dict(state.get("last_bar_ts", {}))
+    new_state["last_event_trigger_ts"] = dict(state.get("last_event_trigger_ts", {}))
+    new_state["last_price"] = dict(state.get("last_price", {}))
     triggers: list[dict] = []
     if not config.enabled:
         return triggers, new_state

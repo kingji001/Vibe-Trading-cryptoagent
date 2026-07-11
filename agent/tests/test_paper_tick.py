@@ -755,6 +755,34 @@ def test_run_tick_1d_events_atomic_no_tmp_file_left(monkeypatch, tmp_path, price
     assert not (tmp_path / "tick_state.json.tmp").exists()
 
 
+def test_run_tick_malformed_event_env_does_not_freeze_risk_tick(monkeypatch, tmp_path, price_fn):
+    """Final review item 2: a malformed VIBE_EVENT_PRICE_MOVE_PCT (e.g. an
+    operator typo like '5%') must NOT abort run_tick before stop/TP
+    evaluation. EventConfig.from_env falls back to the default threshold and
+    records a warning; run_tick surfaces it in 'errors' but still evaluates
+    conditionals normally (the risk tick is never frozen by an event-tuning
+    typo)."""
+    _set_default_env(monkeypatch, tmp_path, VIBE_EVENT_PRICE_MOVE_PCT="5%", VIBE_EVENT_FUNDING_ABS="0")
+    store = PaperStore(tmp_path)
+    _seed_position(store, stop=95.0, take_profits=[])
+    bar = _bar(open=99.0, high=100.0, low=90.0, close=96.0)
+    result = run_tick(
+        store, bars_fn=lambda s, n: bar, price_fn=price_fn,
+        # Inject benign event fetchers so this test stays socket-free even
+        # though the (malformed-but-defaulted) price_move_pct threshold is
+        # enabled — this test is about the tick not freezing, not about the
+        # event trigger's own behavior (covered in test_paper_events.py).
+        event_price_fn=lambda sym: 100.0,
+        event_funding_fn=lambda sym: 0.0,
+        journal_ref_fn=lambda sym: None,
+    )
+    assert len(result["conditional_fills"]) == 1  # stop still evaluated
+    assert any(
+        "VIBE_EVENT_PRICE_MOVE_PCT" in e["error"] and "5%" in e["error"]
+        for e in result["errors"]
+    )
+
+
 def test_1d_mode_explicit_interval_matches_default(monkeypatch, tmp_path, price_fn):
     """VIBE_PAPER_TICK_INTERVAL=1D is identical to leaving it unset."""
     _set_default_env(monkeypatch, tmp_path, VIBE_PAPER_TICK_INTERVAL="1D")

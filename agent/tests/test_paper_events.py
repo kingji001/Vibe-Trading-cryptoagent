@@ -100,6 +100,40 @@ def test_config_empty_string_falls_back_to_default(monkeypatch):
     assert cfg.price_move_pct == 5.0
 
 
+def test_config_malformed_value_falls_back_to_default_with_warning(monkeypatch):
+    """Final review item 2: an unparseable value (e.g. a stray '%') must NOT
+    raise out of from_env — that would abort run_tick BEFORE stop/TP
+    evaluation, freezing risk management on a tuning typo. It falls back to
+    that var's default and records a warning instead."""
+    monkeypatch.setenv("VIBE_EVENT_PRICE_MOVE_PCT", "5%")
+    cfg = EventConfig.from_env()
+    assert cfg.price_move_pct == 5.0  # default used, not a crash
+    assert cfg.enabled is True
+    assert len(cfg.warnings) == 1
+    assert "VIBE_EVENT_PRICE_MOVE_PCT" in cfg.warnings[0]
+    assert "5%" in cfg.warnings[0]
+
+
+def test_config_malformed_value_only_warns_for_the_bad_var(monkeypatch):
+    """A malformed value on ONE var does not affect the others' parsing or
+    generate a spurious warning for them."""
+    monkeypatch.setenv("VIBE_EVENT_FUNDING_ABS", "abc")
+    monkeypatch.setenv("VIBE_EVENT_COOLDOWN_H", "6")
+    cfg = EventConfig.from_env()
+    assert cfg.funding_abs == 0.001  # default
+    assert cfg.cooldown_h == 6.0  # parsed cleanly
+    assert len(cfg.warnings) == 1
+    assert "VIBE_EVENT_FUNDING_ABS" in cfg.warnings[0]
+
+
+def test_config_all_valid_values_produce_no_warnings(monkeypatch):
+    monkeypatch.setenv("VIBE_EVENT_PRICE_MOVE_PCT", "7")
+    monkeypatch.setenv("VIBE_EVENT_FUNDING_ABS", "0.002")
+    monkeypatch.setenv("VIBE_EVENT_COOLDOWN_H", "24")
+    cfg = EventConfig.from_env()
+    assert cfg.warnings == []
+
+
 # --------------------------------------------------------------------------- #
 # Price-move threshold boundaries                                             #
 # --------------------------------------------------------------------------- #
@@ -381,6 +415,23 @@ def test_input_state_not_mutated():
         now=NOW, config=_cfg(),
     )
     assert state == _empty_state()  # untouched
+
+
+def test_foreign_top_level_key_survives_round_trip():
+    """Final review item 3: check_events must copy the WHOLE input state dict
+    (not just the three known keys) so a foreign top-level key — e.g. one
+    added by a future schema version — is preserved in new_state instead of
+    being silently dropped on the next tick_state.json save."""
+    state = _empty_state()
+    state["some_future_key"] = {"BTC-USDT": "future-data"}
+    _, new_state = check_events(
+        ["BTC-USDT"], state,
+        price_fn=_price_fn({"BTC-USDT": 110.0}),
+        funding_fn=_funding_fn({"BTC-USDT": 0.0}),
+        journal_ref_fn=_ref_fn({"BTC-USDT": 100.0}),
+        now=NOW, config=_cfg(),
+    )
+    assert new_state["some_future_key"] == {"BTC-USDT": "future-data"}
 
 
 def test_empty_symbols_no_triggers():
