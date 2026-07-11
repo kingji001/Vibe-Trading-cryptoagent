@@ -113,6 +113,24 @@ def test_ensure_paper_trading_tick_job_registers_with_expected_prompt(store):
     assert "paper_tick" in job.prompt
 
 
+def test_paper_tick_job_honors_schedule_env(monkeypatch, store):
+    """VIBE_PAPER_TICK_SCHEDULE overrides the initial registration schedule
+    (the recommended 2-hourly deployment sets "30 */2 * * *")."""
+    monkeypatch.setenv("VIBE_PAPER_TICK_SCHEDULE", "30 */2 * * *")
+    _ensure_paper_trading_tick_job(store)
+    assert store.get(PAPER_TICK_JOB_ID).schedule == "30 */2 * * *"
+
+
+def test_paper_tick_job_schedule_env_does_not_clobber_existing(monkeypatch, store):
+    """Non-clobbering: once the job exists, changing the env does NOT rewrite
+    its schedule on a later startup."""
+    _ensure_paper_trading_tick_job(store)  # default "30 0 * * *"
+    assert store.get(PAPER_TICK_JOB_ID).schedule == "30 0 * * *"
+    monkeypatch.setenv("VIBE_PAPER_TICK_SCHEDULE", "30 */2 * * *")
+    _ensure_paper_trading_tick_job(store)  # restart with new env
+    assert store.get(PAPER_TICK_JOB_ID).schedule == "30 0 * * *"  # unchanged
+
+
 def test_ensure_paper_trading_tick_job_is_idempotent(store):
     _ensure_paper_trading_tick_job(store)
     first = store.get(PAPER_TICK_JOB_ID)

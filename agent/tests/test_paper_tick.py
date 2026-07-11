@@ -557,3 +557,261 @@ def test_run_tick_skips_retriable_older_than_7_days(monkeypatch, tmp_path, price
     )
     assert result.get("retried_decisions", []) == []
     assert store.load_positions() == []
+
+
+# --------------------------------------------------------------------------- #
+# Task 1 — PaperStore.load_tick_state / save_tick_state                        #
+# --------------------------------------------------------------------------- #
+def test_load_tick_state_returns_full_schema_when_absent(monkeypatch, tmp_path):
+    _set_default_env(monkeypatch, tmp_path)
+    store = PaperStore(tmp_path)
+    state = store.load_tick_state()
+    assert state == {"last_bar_ts": {}, "last_event_trigger_ts": {}, "last_price": {}}
+    # loading must NOT create the file
+    assert not (tmp_path / "tick_state.json").exists()
+
+
+def test_save_and_load_tick_state_roundtrip(monkeypatch, tmp_path):
+    _set_default_env(monkeypatch, tmp_path)
+    store = PaperStore(tmp_path)
+    state = {
+        "last_bar_ts": {"BTC-USDT": "2026-07-11T05:00:00Z"},
+        "last_event_trigger_ts": {"BTC-USDT": "2026-07-11T00:00:00Z"},
+        "last_price": {"BTC-USDT": 101.5},
+    }
+    store.save_tick_state(state)
+    assert (tmp_path / "tick_state.json").exists()
+    # atomic write leaves no tmp file behind
+    assert not (tmp_path / "tick_state.json.tmp").exists()
+    assert store.load_tick_state() == state
+
+
+def test_load_tick_state_fills_missing_schema_keys(monkeypatch, tmp_path):
+    _set_default_env(monkeypatch, tmp_path)
+    store = PaperStore(tmp_path)
+    (tmp_path / "tick_state.json").write_text(
+        '{"last_bar_ts": {"BTC-USDT": "2026-07-11T05:00:00Z"}}', encoding="utf-8"
+    )
+    state = store.load_tick_state()
+    assert state["last_bar_ts"] == {"BTC-USDT": "2026-07-11T05:00:00Z"}
+    assert state["last_event_trigger_ts"] == {}
+    assert state["last_price"] == {}
+
+
+# --------------------------------------------------------------------------- #
+# Task 1 — 1D mode regression: byte-identical, tick_state.json NEVER created   #
+# --------------------------------------------------------------------------- #
+def test_1d_mode_does_not_create_tick_state_file(broker):
+    """Crown jewel: default (1D) mode is byte-identical to pre-change behavior —
+    no tick_state.json is ever written."""
+    _seed_position(broker.store, stop=95.0, take_profits=[])
+    bar = _bar(open=99.0, high=100.0, low=90.0, close=96.0)
+    result = run_tick(broker.store, bars_fn=lambda s, n: bar, price_fn=broker.price_fn)
+    assert len(result["conditional_fills"]) == 1
+    assert not (broker.store.root / "tick_state.json").exists()
+
+
+def test_1d_mode_explicit_interval_matches_default(monkeypatch, tmp_path, price_fn):
+    """VIBE_PAPER_TICK_INTERVAL=1D is identical to leaving it unset."""
+    _set_default_env(monkeypatch, tmp_path, VIBE_PAPER_TICK_INTERVAL="1D")
+    store = PaperStore(tmp_path)
+    _seed_position(store, stop=95.0, take_profits=[])
+    bar = _bar(open=99.0, high=100.0, low=90.0, close=96.0)
+    result = run_tick(store, bars_fn=lambda s, n: bar, price_fn=price_fn)
+    assert len(result["conditional_fills"]) == 1
+    assert not (store.root / "tick_state.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Task 1 — 1H intraday mode: multi-bar loop + per-symbol watermark             #
+# --------------------------------------------------------------------------- #
+def _hbar(ts: str, **overrides) -> dict:
+    bar = {"open": 100.0, "high": 105.0, "low": 95.0, "close": 102.0, "ts": ts}
+    bar.update(overrides)
+    return bar
+
+
+def _mk_1h_store(monkeypatch, tmp_path, **env):
+    _set_default_env(monkeypatch, tmp_path, VIBE_PAPER_TICK_INTERVAL="1H", **env)
+    return PaperStore(tmp_path)
+
+
+def test_1h_first_tick_evaluates_only_newest_bar_no_backfill(
+    monkeypatch, tmp_path, price_fn
+):
+    """First-ever tick (no watermark): only the NEWEST confirmed bar is
+    evaluated — no deep backfill. An older bar whose low would trip the stop is
+    ignored; the watermark is planted at the newest bar."""
+    store = _mk_1h_store(monkeypatch, tmp_path)
+    _seed_position(store, stop=95.0, take_profits=[], opened_at="2026-07-09T00:00:00Z")
+    bars = [
+        _hbar("2026-07-11T03:00:00Z", open=99.0, high=100.0, low=90.0, close=96.0),  # would trip stop
+        _hbar("2026-07-11T04:00:00Z", open=101.0, high=106.0, low=99.0, close=104.0),  # newest: no trip
+    ]
+    result = run_tick(
+        store, bars_fn=lambda s, n: bars, price_fn=price_fn,
+        now=datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc),
+    )
+    assert result["conditional_fills"] == []  # older bar NOT backfilled
+    assert store.load_positions()[0]["qty"] == pytest.approx(10.0, abs=ABS)
+    st = store.load_tick_state()
+    assert st["last_bar_ts"]["BTC-USDT"] == "2026-07-11T04:00:00Z"
+    assert st["last_price"]["BTC-USDT"] == pytest.approx(104.0, abs=ABS)
+
+
+def test_1h_subsequent_tick_evaluates_all_bars_after_watermark_chronologically(
+    monkeypatch, tmp_path, price_fn
+):
+    """With a watermark set, every confirmed bar strictly after it is evaluated
+    in chronological order; the watermark advances to the last evaluated bar."""
+    store = _mk_1h_store(monkeypatch, tmp_path)
+    _seed_position(store, stop=None,
+                   take_profits=[{"price": 110.0, "fraction": 0.5}],
+                   opened_at="2026-07-09T00:00:00Z")
+    store.save_tick_state(
+        {"last_bar_ts": {"BTC-USDT": "2026-07-11T02:00:00Z"},
+         "last_event_trigger_ts": {}, "last_price": {}}
+    )
+    bars = [
+        _hbar("2026-07-11T02:00:00Z", high=100.0),  # at watermark -> skipped
+        _hbar("2026-07-11T03:00:00Z", open=101.0, high=112.0, low=99.0, close=111.0),  # TP hit
+        _hbar("2026-07-11T04:00:00Z", high=108.0, close=107.0),
+    ]
+    result = run_tick(
+        store, bars_fn=lambda s, n: bars, price_fn=price_fn,
+        now=datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc),
+    )
+    assert len(result["conditional_fills"]) == 1
+    assert result["conditional_fills"][0]["order_type"] == "take_profit"
+    assert store.load_positions()[0]["qty"] == pytest.approx(5.0, abs=ABS)
+    st = store.load_tick_state()
+    assert st["last_bar_ts"]["BTC-USDT"] == "2026-07-11T04:00:00Z"  # advanced past all
+
+
+def test_1h_watermark_persists_even_when_no_conditionals_fire(
+    monkeypatch, tmp_path, price_fn
+):
+    store = _mk_1h_store(monkeypatch, tmp_path)
+    _seed_position(store, stop=80.0, take_profits=[{"price": 200.0, "fraction": 1.0}],
+                   opened_at="2026-07-09T00:00:00Z")
+    store.save_tick_state(
+        {"last_bar_ts": {"BTC-USDT": "2026-07-11T02:00:00Z"},
+         "last_event_trigger_ts": {}, "last_price": {}}
+    )
+    bars = [
+        _hbar("2026-07-11T03:00:00Z"),
+        _hbar("2026-07-11T04:00:00Z", close=101.0),
+    ]
+    result = run_tick(
+        store, bars_fn=lambda s, n: bars, price_fn=price_fn,
+        now=datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc),
+    )
+    assert result["conditional_fills"] == []
+    st = store.load_tick_state()
+    assert st["last_bar_ts"]["BTC-USDT"] == "2026-07-11T04:00:00Z"  # advanced regardless
+    assert st["last_price"]["BTC-USDT"] == pytest.approx(101.0, abs=ABS)
+
+
+def test_1h_stop_in_earlier_bar_closes_position_later_bars_skip_cleanly(
+    monkeypatch, tmp_path, price_fn
+):
+    """A stop in bar N closes the position; bar N+1 (which would have hit a TP)
+    sees no position and is skipped cleanly — stop-beats-TP emerges purely from
+    chronological ordering, not a single-bar special case."""
+    store = _mk_1h_store(monkeypatch, tmp_path)
+    _seed_position(store, stop=95.0,
+                   take_profits=[{"price": 110.0, "fraction": 1.0}],
+                   opened_at="2026-07-09T00:00:00Z")
+    store.save_tick_state(
+        {"last_bar_ts": {"BTC-USDT": "2026-07-11T02:00:00Z"},
+         "last_event_trigger_ts": {}, "last_price": {}}
+    )
+    bars = [
+        _hbar("2026-07-11T03:00:00Z", open=99.0, high=100.0, low=90.0, close=94.0),  # stop
+        _hbar("2026-07-11T04:00:00Z", open=108.0, high=115.0, low=107.0, close=112.0),  # TP would hit
+    ]
+    result = run_tick(
+        store, bars_fn=lambda s, n: bars, price_fn=price_fn,
+        now=datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc),
+    )
+    assert len(result["conditional_fills"]) == 1
+    assert result["conditional_fills"][0]["order_type"] == "stop"
+    assert store.load_positions() == []  # closed by the stop, never refilled by the TP
+
+
+def test_1h_entry_partial_bar_skip_at_1h_granularity(monkeypatch, tmp_path, price_fn):
+    """Entry-bar skip generalizes to 1H: the bar whose hour CONTAINS opened_at
+    is skipped; the next full hour after entry is evaluated (unprotected window
+    is <=1h, not <=1d)."""
+    store = _mk_1h_store(monkeypatch, tmp_path)
+    _seed_position(store, stop=95.0, take_profits=[],
+                   avg_entry=100.05, opened_at="2026-07-11T03:30:00Z")
+    store.save_tick_state(
+        {"last_bar_ts": {"BTC-USDT": "2026-07-11T02:00:00Z"},
+         "last_event_trigger_ts": {}, "last_price": {}}
+    )
+    bars = [
+        _hbar("2026-07-11T03:00:00Z", open=99.0, high=100.0, low=90.0, close=96.0),  # entry hour -> skip
+        _hbar("2026-07-11T04:00:00Z", open=99.0, high=100.0, low=90.0, close=96.0),  # full hour -> stop
+    ]
+    result = run_tick(
+        store, bars_fn=lambda s, n: bars, price_fn=price_fn,
+        now=datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc),
+    )
+    assert len(result["conditional_fills"]) == 1  # only the 04:00 bar fires
+    assert result["conditional_fills"][0]["order_type"] == "stop"
+    assert any("BTC-USDT" in n for n in result.get("notes", []))
+
+
+def test_1h_bars_fn_failure_records_error_and_leaves_watermark_untouched(
+    monkeypatch, tmp_path, price_fn
+):
+    store = _mk_1h_store(monkeypatch, tmp_path)
+    _seed_position(store, stop=95.0, take_profits=[], opened_at="2026-07-09T00:00:00Z")
+    store.save_tick_state(
+        {"last_bar_ts": {"BTC-USDT": "2026-07-11T02:00:00Z"},
+         "last_event_trigger_ts": {}, "last_price": {}}
+    )
+
+    def failing(symbol, now):
+        raise RuntimeError("no 1H bars for BTC-USDT via okx/ccxt")
+
+    result = run_tick(
+        store, bars_fn=failing, price_fn=price_fn,
+        now=datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc),
+    )
+    assert result["conditional_fills"] == []
+    assert len(result["errors"]) == 1 and "no 1H bars" in result["errors"][0]["error"]
+    assert store.load_positions()[0]["qty"] == pytest.approx(10.0, abs=ABS)  # untouched
+    st = store.load_tick_state()
+    assert st["last_bar_ts"]["BTC-USDT"] == "2026-07-11T02:00:00Z"  # NOT advanced
+
+
+def test_1h_empty_bar_list_leaves_watermark_untouched(monkeypatch, tmp_path, price_fn):
+    store = _mk_1h_store(monkeypatch, tmp_path)
+    _seed_position(store, stop=95.0, take_profits=[], opened_at="2026-07-09T00:00:00Z")
+    store.save_tick_state(
+        {"last_bar_ts": {"BTC-USDT": "2026-07-11T02:00:00Z"},
+         "last_event_trigger_ts": {}, "last_price": {}}
+    )
+    result = run_tick(
+        store, bars_fn=lambda s, n: [], price_fn=price_fn,
+        now=datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc),
+    )
+    assert result["conditional_fills"] == []
+    assert result["errors"] == []
+    assert store.load_tick_state()["last_bar_ts"]["BTC-USDT"] == "2026-07-11T02:00:00Z"
+
+
+def test_1h_equity_snapshot_one_per_utc_date(monkeypatch, tmp_path, price_fn):
+    store = _mk_1h_store(monkeypatch, tmp_path)
+    _seed_position(store, stop=None, take_profits=[], opened_at="2026-07-09T00:00:00Z")
+    bars_a = [_hbar("2026-07-11T04:00:00Z", close=103.0)]
+    bars_b = [_hbar("2026-07-11T06:00:00Z", close=104.0)]
+    first = run_tick(store, bars_fn=lambda s, n: bars_a, price_fn=price_fn,
+                     now=datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc))
+    second = run_tick(store, bars_fn=lambda s, n: bars_b, price_fn=price_fn,
+                      now=datetime(2026, 7, 11, 7, 0, tzinfo=timezone.utc))
+    assert first["equity_snapshot"]["already_recorded"] is False
+    assert second["equity_snapshot"]["already_recorded"] is True
+    assert len(list(store.iter_equity())) == 1  # one snapshot for the UTC date

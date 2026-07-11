@@ -53,6 +53,7 @@ class PaperStore:
         self._positions_path = self.root / "positions.json"
         self._ledger_path = self.root / "ledger.jsonl"
         self._equity_path = self.root / "equity.jsonl"
+        self._tick_state_path = self.root / "tick_state.json"
         self._lock = threading.Lock()
 
     # -- atomic primitive --------------------------------------------------- #
@@ -116,6 +117,33 @@ class PaperStore:
     def iter_equity(self) -> Iterator[dict]:
         yield from self._iter_jsonl(self._equity_path)
 
+    # -- tick state (intraday watermark + event bookkeeping) ---------------- #
+    def load_tick_state(self) -> dict:
+        """Return the intraday tick state, always with the full schema.
+
+        Shape (Task 1 creates the whole schema; ``last_event_trigger_ts`` and
+        the event use of ``last_price`` are populated by Task 3)::
+
+            {"last_bar_ts": {symbol: iso}, "last_event_trigger_ts": {symbol: iso},
+             "last_price": {symbol: float}}
+
+        When the file is absent an empty-but-complete schema is returned WITHOUT
+        creating it — 1D mode never touches ``tick_state.json`` (byte-identical
+        to pre-intraday behavior). A partial on-disk file has any missing
+        top-level keys backfilled so callers can index them unconditionally.
+        """
+        empty = {"last_bar_ts": {}, "last_event_trigger_ts": {}, "last_price": {}}
+        if not self._tick_state_path.exists():
+            return empty
+        data = json.loads(self._tick_state_path.read_text(encoding="utf-8"))
+        for key, default in empty.items():
+            data.setdefault(key, default)
+        return data
+
+    def save_tick_state(self, state: dict) -> None:
+        """Persist the intraday tick state atomically (tmp + os.replace)."""
+        self._atomic_write_text(self._tick_state_path, json.dumps(state, indent=2))
+
     # -- jsonl helpers ------------------------------------------------------ #
     def _append_jsonl(self, path: Path, entry: dict) -> None:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -147,6 +175,7 @@ class PaperStore:
                 self._positions_path,
                 self._ledger_path,
                 self._equity_path,
+                self._tick_state_path,
             ):
                 if path.exists():
                     path.replace(archive_dir / path.name)

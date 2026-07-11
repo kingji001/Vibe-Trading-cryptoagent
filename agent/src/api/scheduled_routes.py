@@ -122,8 +122,12 @@ def _ensure_decision_journal_job(store) -> None:
 PAPER_TICK_JOB_ID = "paper-trading-tick"
 # 00:30 UTC — after the 00:00 decision-journal reflection job, so a paper
 # position's mark-to-market/conditional-order tick runs once the day's
-# reflections (if any) have already been written.
+# reflections (if any) have already been written. Overridable at INITIAL
+# registration only via VIBE_PAPER_TICK_SCHEDULE (see
+# _ensure_paper_trading_tick_job); the recommended 2-hourly intraday
+# deployment sets "30 */2 * * *" alongside VIBE_PAPER_TICK_INTERVAL=1H.
 PAPER_TICK_JOB_SCHEDULE = "30 0 * * *"
+_PAPER_TICK_SCHEDULE_ENV = "VIBE_PAPER_TICK_SCHEDULE"
 PAPER_TICK_JOB_PROMPT = (
     "You are running the scheduled daily paper-trading tick. This is a "
     "mechanical maintenance run, not a trading decision — do not analyze "
@@ -153,23 +157,30 @@ def _paper_trading_enabled() -> bool:
 
 
 def _ensure_paper_trading_tick_job(store) -> None:
-    """Register the daily paper_tick job if not already persisted.
+    """Register the paper_tick job if not already persisted.
 
     Idempotent and non-clobbering, identical contract to
     ``_ensure_decision_journal_job``: a job that already exists — whatever
     schedule or prompt it currently has, including a user's own edits — is
     left untouched on every subsequent call (e.g. a server restart).
+
+    ``VIBE_PAPER_TICK_SCHEDULE`` (default ``"30 0 * * *"``) sets the cron
+    schedule for the INITIAL registration only. Because registration is
+    non-clobbering, changing that env after the job already exists does NOT
+    rewrite the persisted schedule — the operator must edit the job (or delete
+    it so a restart re-registers it) to change an existing job's cadence.
     """
     if store.get(PAPER_TICK_JOB_ID) is not None:
         return
 
     from src.scheduled_research.models import ScheduledResearchJob
 
+    schedule = os.environ.get(_PAPER_TICK_SCHEDULE_ENV, "").strip() or PAPER_TICK_JOB_SCHEDULE
     store.upsert(
         ScheduledResearchJob(
             id=PAPER_TICK_JOB_ID,
             prompt=PAPER_TICK_JOB_PROMPT,
-            schedule=PAPER_TICK_JOB_SCHEDULE,
+            schedule=schedule,
         )
     )
 
