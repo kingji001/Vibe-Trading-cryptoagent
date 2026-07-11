@@ -57,3 +57,34 @@ def test_swarm_tool_rejects_ambiguous_continuation_before_starting_run() -> None
 
     assert payload["status"] == "error"
     assert "Ambiguous continuation" in payload["error"]
+
+
+# ---------------------------------------------------------------------------
+# crypto_committee variable extraction (two-tier-cadence Task 2)
+#
+# _build_variables previously hardcoded {"target": "BTC-USDT", "timeframe":
+# "72h swing"} for crypto_committee regardless of prompt content, silently
+# ignoring any other symbol a caller (e.g. the scheduled committee-run job,
+# which iterates VIBE_COMMITTEE_SYMBOLS) asked for. It now extracts the
+# instrument and horizon from the documented "... swarm on <SYMBOL> for a
+# <TIMEFRAME> decision" phrasing (docs/crypto-committee.md), falling back to
+# the historical defaults when a prompt doesn't use that phrasing.
+# ---------------------------------------------------------------------------
+
+
+def test_build_variables_extracts_explicit_symbol_and_timeframe() -> None:
+    prompt = "Run the crypto_committee swarm on ETH-USDT for a 24h swing decision."
+
+    assert swarm_tool._build_variables("crypto_committee", prompt) == {
+        "target": "ETH-USDT",
+        "timeframe": "24h swing",
+    }
+
+
+def test_build_variables_falls_back_to_default_target_and_timeframe() -> None:
+    prompt = "Analyze crypto markets broadly."
+
+    assert swarm_tool._build_variables("crypto_committee", prompt) == {
+        "target": "BTC-USDT",
+        "timeframe": "72h swing",
+    }

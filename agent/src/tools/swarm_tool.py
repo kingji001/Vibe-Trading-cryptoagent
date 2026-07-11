@@ -599,6 +599,43 @@ def _snippet(prompt: str, max_len: int = 240) -> str:
     return s if len(s) <= max_len else s[: max_len - 3] + "..."
 
 
+# crypto_committee target/timeframe extraction (two-tier-cadence Task 2).
+#
+# Matches the documented phrasing (docs/crypto-committee.md "Running the
+# committee"): 'Run the crypto_committee swarm on <SYMBOL> for a <TIMEFRAME>
+# decision.' — the exact sentence the scheduled committee-run job builds per
+# symbol so a single run_swarm(prompt=..., preset_name="crypto_committee")
+# call actually analyzes the requested instrument/horizon instead of the
+# preset's historical hardcoded example pair.
+_CRYPTO_TARGET_PATTERN = re.compile(r"\bon\s+([A-Za-z0-9]{2,10}-[A-Za-z0-9]{2,6})\b", re.IGNORECASE)
+_CRYPTO_TIMEFRAME_PATTERN = re.compile(r"\bfor an?\s+(.+?)\s+decision\b", re.IGNORECASE)
+
+_DEFAULT_CRYPTO_TARGET = "BTC-USDT"
+_DEFAULT_CRYPTO_TIMEFRAME = "72h swing"
+
+
+def _extract_crypto_target(prompt: str) -> str:
+    """Extract the crypto instrument named in an explicit run_swarm prompt.
+
+    Falls back to the historical BTC-USDT default when the prompt doesn't
+    use the documented phrasing (e.g. an ad-hoc natural-language request
+    that only names the preset) — this is exactly today's behavior, just
+    no longer forced for prompts that DO name a different symbol.
+    """
+    match = _CRYPTO_TARGET_PATTERN.search(prompt)
+    return match.group(1).upper() if match else _DEFAULT_CRYPTO_TARGET
+
+
+def _extract_crypto_timeframe(prompt: str) -> str:
+    """Extract the decision horizon named in an explicit run_swarm prompt.
+
+    See :func:`_extract_crypto_target` — same phrasing contract, same
+    default fallback.
+    """
+    match = _CRYPTO_TIMEFRAME_PATTERN.search(prompt)
+    return match.group(1).strip() if match else _DEFAULT_CRYPTO_TIMEFRAME
+
+
 def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
     """Build template variables from prompt for the matched preset.
 
@@ -624,7 +661,10 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         "event_driven_task_force": {"market": market, "event_type": "all types"},
         "etf_allocation_desk": {"risk_profile": _risk_to_etf_profile(risk), "market": market},
         "derivatives_strategy_desk": {"target": g, "view": "neutral"},
-        "crypto_committee": {"target": "BTC-USDT", "timeframe": "72h swing"},
+        "crypto_committee": {
+            "target": _extract_crypto_target(prompt),
+            "timeframe": _extract_crypto_timeframe(prompt),
+        },
         "crypto_research_lab": {"target": "BTC, ETH, SOL", "timeframe": "medium-term 1-3 months"},
         "credit_research_team": {"target": g, "market": "China credit bonds"},
         "convertible_bond_team": {

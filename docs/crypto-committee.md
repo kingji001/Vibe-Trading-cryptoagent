@@ -443,6 +443,47 @@ Read this before treating paper PnL as a strategy backtest:
   resolved decision to the reflection officer's prompt — a modest but
   nonzero token-budget cost.
 
+## Cadence
+
+Two-tier deployment: an intraday `paper-trading-tick` job for cheap,
+mechanical risk management, and a separate, explicitly-scheduled
+`committee-run` job for the expensive full 13-seat analysis. Recommended
+config:
+
+```bash
+# Tick every 2 hours on confirmed 1H bars (stops/take-profits, mark-to-market)
+VIBE_PAPER_TICK_SCHEDULE="30 */2 * * *"
+VIBE_PAPER_TICK_INTERVAL=1H
+# Full committee once or twice a day, per symbol
+VIBE_COMMITTEE_SCHEDULE="0 8 * * *"
+VIBE_COMMITTEE_SYMBOLS=BTC-USDT,ETH-USDT
+VIBE_COMMITTEE_TIMEFRAME="72h swing"
+```
+
+Rationale in one sentence: the tick is deterministic/LLM-free (or a single
+cheap tool call) so it can run every couple of hours to react to intraday
+stops and moves, while the committee spends 13 seats of LLM budget per
+symbol per run, so it stays on a coarser, explicitly opt-in cadence (1-2x/day)
+to keep quota spend proportional to how often the full debate actually needs
+to re-litigate a position.
+
+`committee-run` (`agent/src/api/scheduled_routes.py::_ensure_committee_run_job`)
+is registered ONLY when `VIBE_COMMITTEE_SCHEDULE` is set — unlike the daily
+reflection/paper-tick jobs, there is no built-in default schedule for it,
+since it is the expensive tier. `VIBE_COMMITTEE_SYMBOLS` (comma list, default
+`BTC-USDT`) and `VIBE_COMMITTEE_TIMEFRAME` (default `72h swing`) are read
+**once, at registration time**, and baked verbatim into the job's prompt —
+per symbol, the prompt calls `run_swarm(prompt="Run the crypto_committee
+swarm on <SYMBOL> for a <TIMEFRAME> decision.", preset_name="crypto_committee")`,
+serially, reporting each run's id and the portfolio manager's final rating
+(or the failure, if a run errors — the job continues to the next symbol
+rather than fabricating a result). Because registration is non-clobbering
+(same idempotent contract as every other `_ensure_*` job in that module), a
+later change to `VIBE_COMMITTEE_SYMBOLS` or `VIBE_COMMITTEE_TIMEFRAME` has
+**no effect** on an already-registered job — delete it (so a restart
+re-registers it with the new env) or hand-edit its persisted prompt to
+change the symbol universe or horizon.
+
 ## Debate rounds
 
 `agent/src/swarm/presets.py::_expand_debate` unrolls the `debates:` YAML
