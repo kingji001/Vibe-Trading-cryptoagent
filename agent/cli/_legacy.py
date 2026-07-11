@@ -5050,6 +5050,22 @@ def _resolve_committee_schedule() -> Optional[str]:
     return os.environ.get("VIBE_COMMITTEE_SCHEDULE", "").strip() or None
 
 
+def _parse_env_float(name: str, *, default: float) -> float:
+    """Parse a numeric-seconds env var, raising a CLEAN, user-facing
+    ``ValueError`` (naming both the var and the offending value) instead of
+    letting a raw ``float()`` traceback reach the operator on a malformed
+    override (e.g. a stray non-numeric ``VIBE_OPS_HEARTBEAT_S``)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(
+            f"Invalid {name}={raw!r}: must be a number (seconds)"
+        ) from None
+
+
 def cmd_ops_report(*, window: Optional[str] = None, json_mode: bool = False) -> int:
     """Build the cross-referenced 72h evidence report and print a summary.
 
@@ -5092,8 +5108,12 @@ def cmd_ops_report(*, window: Optional[str] = None, json_mode: bool = False) -> 
     else:
         window_start, window_start_source = default_window_start(ops_root, now)
 
-    heartbeat_interval_s = float(os.environ.get("VIBE_OPS_HEARTBEAT_S", "").strip() or 60)
-    startup_grace_s = float(os.environ.get("VIBE_OPS_STARTUP_GRACE_S", "").strip() or 120)
+    try:
+        heartbeat_interval_s = _parse_env_float("VIBE_OPS_HEARTBEAT_S", default=60.0)
+        startup_grace_s = _parse_env_float("VIBE_OPS_STARTUP_GRACE_S", default=120.0)
+    except ValueError as exc:
+        console.print(f"[red]{rich_escape(str(exc))}[/red]")
+        return EXIT_USAGE_ERROR
     committee_schedule = _resolve_committee_schedule()
 
     report = build_evidence_report(

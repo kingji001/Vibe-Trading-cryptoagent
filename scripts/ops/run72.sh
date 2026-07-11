@@ -43,7 +43,8 @@
 # Artifacts (all written under VIBE_OPS_ROOT):
 #   run72.pid          PID of the running supervisor process.
 #   supervisor.jsonl   {"ts","event":"start|restart|stop","exit_code"?,
-#                       "restart_count"?,"serve_cmd"?,"env_fingerprint"?}
+#                       "restart_count"?,"serve_cmd"?,"serve_cmd_overridden"?,
+#                       "env_fingerprint"?}
 #   heartbeat.jsonl    {"ts","ok":bool,"http":code|null,"latency_ms"}
 #   run72.log          stdout/stderr of the supervised process + warnings
 #                       (e.g. caffeinate unavailable).
@@ -228,6 +229,21 @@ _supervisor_main() {
 
 start() {
   mkdir -p "$OPS_ROOT"
+  if [ -z "${VIBE_OPS_SERVE_CMD:-}" ]; then
+    # Preflight: the default SERVE_CMD's binary must actually resolve on
+    # PATH before we touch the PID file or background anything -- starting
+    # a supervisor around a command that will just fail-and-restart forever
+    # is worse than refusing up front. Skipped entirely when
+    # VIBE_OPS_SERVE_CMD is set: that's a test seam that may point at any
+    # stub, real binary or not.
+    default_bin="${SERVE_CMD%% *}"
+    if ! command -v "$default_bin" >/dev/null 2>&1; then
+      echo "run72: '$default_bin' not found on PATH -- no supervisor started." >&2
+      echo "run72: activate the project venv first (e.g. 'source .venv/bin/activate') or otherwise put '$default_bin' on PATH, then retry '$0 start'." >&2
+      echo "run72: (for tests/stubs only, VIBE_OPS_SERVE_CMD overrides the supervised command entirely -- never set it for a real 72h run)" >&2
+      exit 1
+    fi
+  fi
   if [ -n "${VIBE_OPS_SERVE_CMD:-}" ]; then
     # Loud, twice-recorded, and stamped into the start event
     # (serve_cmd_overridden:true): an evidence run against a stub must be

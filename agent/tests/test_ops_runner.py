@@ -406,6 +406,44 @@ def test_start_replaces_stale_pid_file(tmp_path):
         _stop_runner(ops_root, env)
 
 
+def test_start_preflight_fails_when_default_binary_missing(tmp_path):
+    """Without VIBE_OPS_SERVE_CMD set, `start` must not launch the supervisor
+    if the default served binary ('vibe-trading') isn't on PATH -- fail
+    loudly and instructively (venv/PATH fix named), exit nonzero, and leave
+    no supervisor artifacts behind, rather than starting a doomed loop."""
+    ops_root = tmp_path / "ops"
+    env = _base_env(ops_root)
+    env.pop("VIBE_OPS_SERVE_CMD", None)
+    # A minimal PATH guaranteed not to contain any 'vibe-trading' shim.
+    env["PATH"] = "/usr/bin:/bin"
+    try:
+        result = _run(["start"], env=env)
+        assert result.returncode != 0
+        combined = (result.stdout + result.stderr).lower()
+        assert "vibe-trading" in combined
+        assert "venv" in combined or "path" in combined
+        assert not (ops_root / "run72.pid").exists()
+        assert not (ops_root / "supervisor.jsonl").exists()
+    finally:
+        _stop_runner(ops_root, env)
+
+
+def test_start_preflight_skipped_when_serve_cmd_overridden(tmp_path):
+    """The preflight `command -v` check must be skipped entirely when
+    VIBE_OPS_SERVE_CMD is set -- test seams may point at any stub, real or
+    not on PATH by name, and must not be blocked by this guard."""
+    ops_root = tmp_path / "ops"
+    env = _base_env(ops_root, VIBE_OPS_SERVE_CMD=_sleepy_serve_cmd())
+    env["PATH"] = "/usr/bin:/bin"
+    try:
+        started = _run(["start"], env=env)
+        assert started.returncode == 0, started.stderr
+        pid_file = ops_root / "run72.pid"
+        assert _wait_for(pid_file.exists)
+    finally:
+        _stop_runner(ops_root, env)
+
+
 def test_status_reports_running_and_not_running(tmp_path):
     ops_root = tmp_path / "ops"
     env = _base_env(ops_root, VIBE_OPS_SERVE_CMD=_sleepy_serve_cmd())

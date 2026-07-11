@@ -918,6 +918,36 @@ class TestOpsReportCli:
         rc = cmd_ops_report(window="not-a-window")
         assert rc == EXIT_USAGE_ERROR
 
+    def test_malformed_heartbeat_env_is_a_usage_error(self, monkeypatch, tmp_path, capsys):
+        """VIBE_OPS_HEARTBEAT_S must fail with a clean usage error naming the
+        offending value -- not a raw ValueError traceback -- and must not
+        write a report file."""
+        from cli._legacy import EXIT_USAGE_ERROR, cmd_ops_report
+
+        self._set_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("VIBE_OPS_HEARTBEAT_S", "not-a-number")
+
+        rc = cmd_ops_report(window="4h")
+        out = capsys.readouterr().out
+        assert rc == EXIT_USAGE_ERROR
+        assert "VIBE_OPS_HEARTBEAT_S" in out
+        assert "not-a-number" in out
+        assert not list((tmp_path / "ops").glob("report-*.md"))
+
+    def test_malformed_startup_grace_env_is_a_usage_error(self, monkeypatch, tmp_path, capsys):
+        """Same clean-usage-error contract for VIBE_OPS_STARTUP_GRACE_S."""
+        from cli._legacy import EXIT_USAGE_ERROR, cmd_ops_report
+
+        self._set_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("VIBE_OPS_STARTUP_GRACE_S", "abc123")
+
+        rc = cmd_ops_report(window="4h")
+        out = capsys.readouterr().out
+        assert rc == EXIT_USAGE_ERROR
+        assert "VIBE_OPS_STARTUP_GRACE_S" in out
+        assert "abc123" in out
+        assert not list((tmp_path / "ops").glob("report-*.md"))
+
     def test_persisted_job_schedule_preferred_over_env(self, monkeypatch, tmp_path, capsys):
         # VIBE_COMMITTEE_SCHEDULE only seeds the job at first registration; a
         # hand-edited persisted job is what the executor actually runs, so the
