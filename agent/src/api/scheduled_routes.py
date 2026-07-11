@@ -250,14 +250,17 @@ def _build_committee_run_prompt(symbols: list[str], timeframe: str) -> str:
     """Build the committee-run job prompt for a fixed symbol list/timeframe.
 
     Enumerates every symbol explicitly (not a natural-language "for each")
-    so the instruction is unambiguous, and spells out the exact "... swarm
-    on <SYMBOL> for a <TIMEFRAME> decision" sentence for each call so
-    ``SwarmTool``'s prompt-based variable extraction resolves the intended
-    ``{target}``/``{timeframe}`` instead of the preset's historical
-    BTC-USDT/72h-swing default.
+    so the instruction is unambiguous. Each step passes the instrument and
+    horizon through run_swarm's structured ``variables`` parameter — the
+    binding channel, validated against the preset and taking precedence
+    over prompt extraction — so multi-symbol correctness never depends on
+    the scheduling LLM reproducing the prose template verbatim. The prose
+    "... swarm on <SYMBOL> for a <TIMEFRAME> decision" sentence is kept
+    alongside for human readability (and as a redundant extraction path).
     """
     steps = "\n".join(
-        f'{i}. Call run_swarm with preset_name="crypto_committee" and '
+        f'{i}. Call run_swarm with preset_name="crypto_committee", '
+        f'variables={{"target": "{symbol}", "timeframe": "{timeframe}"}}, and '
         f'prompt="Run the crypto_committee swarm on {symbol} for a '
         f'{timeframe} decision." Wait for it to finish before moving on.'
         for i, symbol in enumerate(symbols, start=1)

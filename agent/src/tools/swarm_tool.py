@@ -599,41 +599,117 @@ def _snippet(prompt: str, max_len: int = 240) -> str:
     return s if len(s) <= max_len else s[: max_len - 3] + "..."
 
 
-# crypto_committee target/timeframe extraction (two-tier-cadence Task 2).
+# crypto_committee target/timeframe extraction (two-tier-cadence Task 2,
+# hardened post-review).
 #
 # Matches the documented phrasing (docs/crypto-committee.md "Running the
 # committee"): 'Run the crypto_committee swarm on <SYMBOL> for a <TIMEFRAME>
 # decision.' — the exact sentence the scheduled committee-run job builds per
-# symbol so a single run_swarm(prompt=..., preset_name="crypto_committee")
-# call actually analyzes the requested instrument/horizon instead of the
-# preset's historical hardcoded example pair.
+# symbol. A prompt that names NO instrument raises CryptoTargetMissingError
+# instead of silently defaulting to BTC-USDT: for this preset {target} is
+# the one asset 13 seats analyze and a PM journals a binding rating for, so
+# a silent default IS the wrong-asset failure mode (the same rationale as
+# grounding.py's IDENTITY_ANCHOR_VARS fail-fast). Callers that can't use
+# the phrasing pass the structured `variables` tool parameter instead
+# (validated in SwarmTool.execute, wins over prompt extraction).
 _CRYPTO_TARGET_PATTERN = re.compile(r"\bon\s+([A-Za-z0-9]{2,10}-[A-Za-z0-9]{2,6})\b", re.IGNORECASE)
 _CRYPTO_TIMEFRAME_PATTERN = re.compile(r"\bfor an?\s+(.+?)\s+decision\b", re.IGNORECASE)
 
-_DEFAULT_CRYPTO_TARGET = "BTC-USDT"
 _DEFAULT_CRYPTO_TIMEFRAME = "72h swing"
 
+_CRYPTO_TARGET_MISSING_MESSAGE = (
+    "crypto_committee requires an explicit target instrument; refusing to "
+    "assume a default asset (a silently-assumed symbol means 13 agents "
+    "debate and journal a binding rating for the wrong asset). Provide the "
+    "instrument either via the structured variables parameter — "
+    "run_swarm(preset_name='crypto_committee', variables={'target': "
+    "'ETH-USDT', 'timeframe': '72h swing'}, prompt=...) — or by phrasing "
+    "the prompt as '... swarm on <SYMBOL> for a <TIMEFRAME> decision.' "
+    "with a loader-format symbol such as ETH-USDT."
+)
 
-def _extract_crypto_target(prompt: str) -> str:
+
+class CryptoTargetMissingError(ValueError):
+    """crypto_committee prompt names no instrument and no override supplied one.
+
+    Carries the variables that WERE resolvable (the timeframe) so
+    ``SwarmTool.execute`` can still honor a structured ``variables``
+    override that supplies the missing target.
+    """
+
+    def __init__(self, message: str, partial_variables: dict[str, str]) -> None:
+        super().__init__(message)
+        self.partial_variables = partial_variables
+
+
+def _extract_crypto_target(prompt: str) -> str | None:
     """Extract the crypto instrument named in an explicit run_swarm prompt.
 
-    Falls back to the historical BTC-USDT default when the prompt doesn't
-    use the documented phrasing (e.g. an ad-hoc natural-language request
-    that only names the preset) — this is exactly today's behavior, just
-    no longer forced for prompts that DO name a different symbol.
+    Returns ``None`` when the prompt does not use the documented
+    'on <SYMBOL>' phrasing — deciding what to do about that (error vs.
+    override) is the caller's job; there is deliberately NO default symbol.
     """
     match = _CRYPTO_TARGET_PATTERN.search(prompt)
-    return match.group(1).upper() if match else _DEFAULT_CRYPTO_TARGET
+    return match.group(1).upper() if match else None
 
 
 def _extract_crypto_timeframe(prompt: str) -> str:
     """Extract the decision horizon named in an explicit run_swarm prompt.
 
-    See :func:`_extract_crypto_target` — same phrasing contract, same
-    default fallback.
+    Unlike the target, an unstated timeframe safely defaults to
+    '72h swing' — a horizon default cannot make the committee analyze the
+    wrong asset.
     """
     match = _CRYPTO_TIMEFRAME_PATTERN.search(prompt)
     return match.group(1).strip() if match else _DEFAULT_CRYPTO_TIMEFRAME
+
+
+def _build_crypto_committee_variables(prompt: str) -> dict[str, str]:
+    """Resolve crypto_committee's {target}/{timeframe} from the prompt.
+
+    Raises:
+        CryptoTargetMissingError: When no instrument is named. The exception
+            carries the resolved timeframe so a ``variables`` override that
+            supplies the target can still proceed.
+    """
+    timeframe = _extract_crypto_timeframe(prompt)
+    target = _extract_crypto_target(prompt)
+    if target is None:
+        raise CryptoTargetMissingError(
+            _CRYPTO_TARGET_MISSING_MESSAGE, {"timeframe": timeframe}
+        )
+    return {"target": target, "timeframe": timeframe}
+
+
+def _validate_variable_overrides(preset_name: str, overrides: Any) -> str | None:
+    """Validate a structured ``variables`` tool argument.
+
+    Returns an error message (for the tool's JSON error response), or
+    ``None`` when the overrides are acceptable. Keys are checked against
+    the preset's declared YAML ``variables:`` section so a typo'd key fails
+    loudly instead of being silently ignored by template rendering.
+    """
+    if not isinstance(overrides, dict):
+        return "variables must be an object mapping preset variable names to string values"
+    non_string = sorted(str(k) for k, v in overrides.items() if not isinstance(v, str))
+    if non_string:
+        return (
+            "variables values must be strings; non-string value(s) for: "
+            + ", ".join(non_string)
+        )
+    try:
+        from src.swarm.presets import _declared_variable_names, load_preset
+
+        declared = _declared_variable_names(load_preset(preset_name).get("variables", []))
+    except FileNotFoundError:
+        return None  # unknown preset surfaces naturally when the run starts
+    unknown = sorted(set(overrides) - declared)
+    if unknown:
+        return (
+            f"unknown variables for preset '{preset_name}': {', '.join(unknown)}. "
+            f"Declared variables: {', '.join(sorted(declared))}"
+        )
+    return None
 
 
 def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
@@ -645,7 +721,16 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
 
     Returns:
         Dict of template variables required by the YAML preset.
+
+    Raises:
+        CryptoTargetMissingError: For ``crypto_committee`` when the prompt
+            names no instrument (see :func:`_build_crypto_committee_variables`).
     """
+    # Handled before the eagerly-evaluated builders dict below: this is the
+    # only preset whose variable resolution can raise.
+    if preset_name == "crypto_committee":
+        return _build_crypto_committee_variables(prompt)
+
     market = _extract_market(prompt)
     risk = _extract_risk_tolerance(prompt)
     goal = prompt.strip()
@@ -661,10 +746,7 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         "event_driven_task_force": {"market": market, "event_type": "all types"},
         "etf_allocation_desk": {"risk_profile": _risk_to_etf_profile(risk), "market": market},
         "derivatives_strategy_desk": {"target": g, "view": "neutral"},
-        "crypto_committee": {
-            "target": _extract_crypto_target(prompt),
-            "timeframe": _extract_crypto_timeframe(prompt),
-        },
+        # crypto_committee is handled above (early return) — it can raise.
         "crypto_research_lab": {"target": "BTC, ETH, SOL", "timeframe": "medium-term 1-3 months"},
         "credit_research_team": {"target": g, "market": "China credit bonds"},
         "convertible_bond_team": {
@@ -705,7 +787,13 @@ class SwarmTool(BaseTool):
         "Provide a natural language prompt and, when known, an explicit preset_name from agent/src/swarm/presets "
         "(e.g. equity_research_team, quant_strategy_desk, global_allocation_committee, risk_committee) "
         "so follow-up/continuation prompts do not lose routing context. "
-        "Example: run_swarm(prompt='Analyze A-share new energy opportunities for Q2 2026', preset_name='equity_research_team')"
+        "Example: run_swarm(prompt='Analyze A-share new energy opportunities for Q2 2026', preset_name='equity_research_team'). "
+        "Pass explicit preset variables via the optional `variables` object when precision matters — "
+        "they are validated against the preset's declared variables and take precedence over values inferred from the prompt. "
+        "NOTE: crypto_committee deliberately refuses to run without an explicit target instrument "
+        "(no silent BTC-USDT default — an assumed symbol would journal a binding rating for the wrong asset): "
+        "supply variables={'target': 'ETH-USDT', 'timeframe': '72h swing'} or phrase the prompt as "
+        "'... swarm on <SYMBOL> for a <TIMEFRAME> decision.'"
     )
     parameters = {
         "type": "object",
@@ -717,6 +805,16 @@ class SwarmTool(BaseTool):
             "preset_name": {
                 "type": "string",
                 "description": "Optional explicit swarm preset name when the user named one or this is a continuation.",
+            },
+            "variables": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": (
+                    "Optional explicit preset variables (string values only), e.g. "
+                    "{'target': 'ETH-USDT', 'timeframe': '72h swing'} for crypto_committee. "
+                    "Validated against the preset's declared variables (unknown keys are rejected) "
+                    "and takes precedence over variables inferred from the prompt text."
+                ),
             },
         },
         "required": ["prompt"],
@@ -773,7 +871,32 @@ class SwarmTool(BaseTool):
                 ensure_ascii=False,
             )
         assert preset is not None
-        variables = _build_variables(preset, prompt)
+
+        # Structured variables channel (post-review): validated against the
+        # preset's declared variables, and wins over prompt extraction.
+        overrides = kwargs.get("variables")
+        if overrides is not None:
+            override_error = _validate_variable_overrides(preset, overrides)
+            if override_error:
+                return json.dumps(
+                    {"status": "error", "error": override_error},
+                    ensure_ascii=False,
+                )
+
+        try:
+            variables = _build_variables(preset, prompt)
+        except CryptoTargetMissingError as exc:
+            if overrides and "target" in overrides:
+                # The structured channel supplied the missing instrument;
+                # keep whatever WAS resolvable from the prompt (timeframe).
+                variables = dict(exc.partial_variables)
+            else:
+                return json.dumps(
+                    {"status": "error", "error": str(exc)},
+                    ensure_ascii=False,
+                )
+        if overrides:
+            variables = {**variables, **overrides}
 
         logger.info(
             "SwarmTool: resolved preset=%s, variables=%s from prompt: %s",

@@ -309,6 +309,11 @@ def test_committee_run_job_prompt_names_every_symbol_preset_and_timeframe(monkey
     assert "crypto_committee" in job.prompt
     assert "run_swarm" in job.prompt
     assert "24h swing" in job.prompt
+    # Structured channel (post-review fix): each step instructs an explicit
+    # variables object per symbol so multi-symbol correctness never depends
+    # on the scheduling LLM reproducing the prose template verbatim.
+    assert 'variables={"target": "BTC-USDT", "timeframe": "24h swing"}' in job.prompt
+    assert 'variables={"target": "ETH-USDT", "timeframe": "24h swing"}' in job.prompt
 
 
 def test_committee_run_job_uses_defaults_when_symbols_and_timeframe_unset(monkeypatch, store):

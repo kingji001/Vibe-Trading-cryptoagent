@@ -64,8 +64,7 @@ unset every seat falls back to the run's global `LANGCHAIN_MODEL_NAME`.
 ## Running the committee
 
 Variables: `target` (loader-format symbol, e.g. `BTC-USDT`) and `timeframe`
-(decision horizon, e.g. `72h swing`). Example (`agent/src/tools/swarm_tool.py`
-ships this exact pair as the preset's example vars):
+(decision horizon, e.g. `72h swing`):
 
 ```bash
 # CLI (interactive)
@@ -74,6 +73,25 @@ ships this exact pair as the preset's example vars):
 # CLI (one-shot prompt through the main agent, which calls run_swarm)
 vibe-trading run -p "Run the crypto_committee swarm on BTC-USDT for a 72h swing decision."
 ```
+
+When calling via the `run_swarm` agent tool, the instrument can be supplied
+two ways (`agent/src/tools/swarm_tool.py`):
+
+- **Structured (binding):** the optional `variables` tool parameter, e.g.
+  `run_swarm(preset_name="crypto_committee", variables={"target":
+  "ETH-USDT", "timeframe": "72h swing"}, prompt=...)`. Keys are validated
+  against the preset's declared variables (a typo'd key errors instead of
+  being silently ignored) and take precedence over prompt extraction.
+- **Prose:** phrasing the prompt as `... swarm on <SYMBOL> for a
+  <TIMEFRAME> decision.` (the exact sentence in the CLI example above).
+
+A run_swarm call that supplies **neither** — no `variables.target` and no
+`on <SYMBOL>` phrasing — errors with an instructive message instead of
+assuming BTC-USDT. This is intentional anti-wrong-asset behavior: a
+silently-defaulted `target` means 13 seats analyze and a PM journals a
+binding rating for an asset nobody asked about, the exact failure mode the
+identity anchor below fails fast on. An unstated `timeframe` still defaults
+to `72h swing` (a horizon default cannot select the wrong asset).
 
 `target` doubles as the preset's **identity anchor** (see below) — it is not
 free-text framing, it is the one instrument all 13 seats analyze and vote on.
@@ -473,11 +491,16 @@ reflection/paper-tick jobs, there is no built-in default schedule for it,
 since it is the expensive tier. `VIBE_COMMITTEE_SYMBOLS` (comma list, default
 `BTC-USDT`) and `VIBE_COMMITTEE_TIMEFRAME` (default `72h swing`) are read
 **once, at registration time**, and baked verbatim into the job's prompt —
-per symbol, the prompt calls `run_swarm(prompt="Run the crypto_committee
-swarm on <SYMBOL> for a <TIMEFRAME> decision.", preset_name="crypto_committee")`,
+per symbol, the prompt calls `run_swarm(preset_name="crypto_committee",
+variables={"target": "<SYMBOL>", "timeframe": "<TIMEFRAME>"}, prompt="Run
+the crypto_committee swarm on <SYMBOL> for a <TIMEFRAME> decision.")`,
 serially, reporting each run's id and the portfolio manager's final rating
 (or the failure, if a run errors — the job continues to the next symbol
-rather than fabricating a result). Because registration is non-clobbering
+rather than fabricating a result). The structured `variables` object is the
+binding channel (validated, wins over prompt extraction — see "Running the
+committee" above), so multi-symbol correctness does not depend on the
+scheduling agent reproducing the prose sentence verbatim; symbols must be
+loader-format hyphenated pairs (`BTC-USDT`, not `BTC` or `BTCUSDT`). Because registration is non-clobbering
 (same idempotent contract as every other `_ensure_*` job in that module), a
 later change to `VIBE_COMMITTEE_SYMBOLS` or `VIBE_COMMITTEE_TIMEFRAME` has
 **no effect** on an already-registered job — delete it (so a restart
