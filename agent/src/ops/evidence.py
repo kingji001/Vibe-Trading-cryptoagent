@@ -164,13 +164,31 @@ def build_heartbeat_section(
 ) -> dict[str, Any]:
     """Uptime %, continuity gaps, and malformed-line count for ``heartbeat.jsonl``.
 
-    Gap rule (spec sec 2.2/4): a gap is a consecutive-row delta STRICTLY
-    greater than 2x the interval (exactly 2x is NOT a gap), OR a contiguous
-    span of ``ok: false`` rows (this catches a service that answers /health
-    on schedule but reports unhealthy -- a case the delta check alone would
-    miss). An ``ok:false`` span's duration is measured from its first to its
-    last row plus one interval, so even a single bad reading contributes
-    roughly one interval of known-bad duration rather than reading as zero.
+    Gap rule (spec sec 2.2/4) -- three distinct kinds, distinguished by the
+    ``reason`` field on each gap entry:
+
+    - DELTA gap ("missing heartbeat"): a consecutive-row delta STRICTLY
+      greater than 2x the interval. Exactly 2x between two healthy beats is
+      NOT a gap (spec boundary rule), so it is never recorded and can never
+      trip the verdict.
+    - WINDOW-EDGE gap ("no heartbeat between window start and first beat" /
+      "... last beat and window end"): the spans ``window_start ->
+      first_beat`` and ``last_beat -> window_end`` are candidate gaps under
+      the same strictly-greater-than-2x rule. Without these, a heartbeat
+      stream that simply STOPS (power loss, machine death -- the supervisor
+      dies too, so no restart event is ever written) would score 100% uptime
+      over whatever short prefix it did record. Coverage is additionally
+      reported as ``coverage_pct`` (observed first..last beat span vs the
+      window span); the verdict degrades when the total uncovered edge time
+      exceeds 2x the interval even if neither single edge does.
+    - UNHEALTHY span ("health check failing (ok:false)"): a contiguous span
+      of ``ok: false`` rows -- a service answering /health on schedule but
+      unhealthy, which the delta check alone would miss. Duration is first
+      to last row plus one interval, so even a single bad reading
+      contributes roughly one interval of known-bad time. ANY unhealthy row
+      degrades the verdict regardless of span length (uptime < 100% is
+      never "uninterrupted"), so short spans whose duration happens to fall
+      at or under 2x the interval still count.
     """
     path = Path(ops_root) / "heartbeat.jsonl"
     if not path.exists():
@@ -189,6 +207,8 @@ def build_heartbeat_section(
             "http_429_count": 0,
             "first_ts": None,
             "last_ts": None,
+            "coverage_pct": None,
+            "uncovered_edge_s": None,
         }
 
     rows, malformed = _read_jsonl(path)
@@ -221,6 +241,40 @@ def build_heartbeat_section(
                 {"start": _iso(ta), "end": _iso(tb), "duration_s": delta, "reason": "missing heartbeat"}
             )
 
+    # Window-edge coverage: a stream that stops (or starts late) leaves NO
+    # consecutive-row delta to flag, so the edges are candidate gaps under
+    # the same strictly-greater-than-2x rule.
+    coverage_pct: float | None = None
+    uncovered_edge_s: float | None = None
+    if in_window:
+        first_beat = _parse_ts(in_window[0]["ts"])
+        last_beat = _parse_ts(in_window[-1]["ts"])
+        lead_s = (first_beat - window_start).total_seconds()
+        trail_s = (window_end - last_beat).total_seconds()
+        uncovered_edge_s = max(0.0, lead_s) + max(0.0, trail_s)
+        window_span_s = (window_end - window_start).total_seconds()
+        if window_span_s > 0:
+            covered = (last_beat - first_beat).total_seconds()
+            coverage_pct = max(0.0, min(100.0, covered / window_span_s * 100.0))
+        if lead_s > threshold:
+            gaps.append(
+                {
+                    "start": _iso(window_start),
+                    "end": _iso(first_beat),
+                    "duration_s": lead_s,
+                    "reason": "no heartbeat between window start and first beat",
+                }
+            )
+        if trail_s > threshold:
+            gaps.append(
+                {
+                    "start": _iso(last_beat),
+                    "end": _iso(window_end),
+                    "duration_s": trail_s,
+                    "reason": "no heartbeat between last beat and window end",
+                }
+            )
+
     idx, n = 0, len(in_window)
     while idx < n:
         if in_window[idx].get("ok") is False:
@@ -243,7 +297,9 @@ def build_heartbeat_section(
             idx += 1
 
     gaps.sort(key=lambda g: g["start"])
-    if total >= 2:
+    # Edge gaps make continuity evaluable from a single row (its distance to
+    # both window edges); only a zero-row window is truly unevaluable.
+    if total >= 1:
         max_gap_s = max((g["duration_s"] for g in gaps), default=0.0)
     else:
         max_gap_s = None
@@ -253,8 +309,6 @@ def build_heartbeat_section(
     reason = None
     if total == 0:
         reason = "no data: no heartbeat rows in window"
-    elif total == 1:
-        reason = "insufficient heartbeat rows in window to evaluate continuity (only 1 row)"
 
     return {
         "available": True,
@@ -271,6 +325,8 @@ def build_heartbeat_section(
         "http_429_count": http_429_count,
         "first_ts": _iso(_parse_ts(in_window[0]["ts"])) if in_window else None,
         "last_ts": _iso(_parse_ts(in_window[-1]["ts"])) if in_window else None,
+        "coverage_pct": coverage_pct if in_window else None,
+        "uncovered_edge_s": uncovered_edge_s if in_window else None,
     }
 
 
@@ -391,6 +447,15 @@ def build_scheduled_firings_section(
     configured -- a valid operator choice, not a missing-evidence gap -- so
     ``configured`` is False and this never contributes to verdict
     degradation (0 expected, 0 missing is vacuously satisfied).
+
+    Schedule-source caveat: ``committee_schedule`` should be the PERSISTED
+    job's schedule (``ScheduledResearchJobStore``, job id ``committee-run``)
+    whenever that store is readable -- the ``VIBE_COMMITTEE_SCHEDULE`` env
+    var only seeds the job at first registration, so a hand-edited persisted
+    job can diverge from the env. The CLI layer (``cmd_ops_report``) resolves
+    persisted-first with env as fallback; callers passing the env value
+    directly should be aware the expected-firing math then reflects the env,
+    not necessarily what the executor actually ran.
     """
     if not committee_schedule:
         return {
@@ -636,11 +701,21 @@ def compute_verdict(
     supervisor: dict[str, Any],
     scheduled_firings: dict[str, Any],
 ) -> dict[str, Any]:
-    """UNINTERRUPTED iff 0 restarts, max gap < 2x interval, every expected
-    committee-run firing accounted for, AND no overridden-serve-cmd start
-    events in-window. Any missing/unparseable source, or any malformed line,
-    also degrades the verdict (never invent continuity that can't be
-    verified) -- each condition below flips the verdict independently.
+    """UNINTERRUPTED iff 0 restarts, max recorded gap < 2x interval, every
+    heartbeat healthy (uptime 100% -- any ok:false span degrades regardless
+    of its length), window-edge coverage complete (total uncovered edge time
+    <= 2x interval), every expected committee-run firing accounted for, AND
+    no overridden-serve-cmd start events in-window. Any missing/unparseable
+    source, or any malformed line, also degrades the verdict (never invent
+    continuity that can't be verified) -- each condition below flips the
+    verdict independently.
+
+    Boundary rule note: the verdict requires ``max_gap_s < 2x interval``
+    (an exactly-2x recorded gap FAILS, per spec sec 2.2), while a DELTA of
+    exactly 2x between two healthy beats is not recorded as a gap in the
+    first place (spec sec 4 boundary rule) and therefore passes. The two
+    rules coexist because only strictly-greater deltas, strictly-greater
+    edge spans, and unhealthy spans (any length) ever enter the gap list.
     """
     reasons: list[str] = []
 
@@ -671,10 +746,34 @@ def compute_verdict(
         max_gap_s = heartbeat.get("max_gap_s")
         interval_s = heartbeat.get("interval_s") or DEFAULT_HEARTBEAT_INTERVAL_S
         if max_gap_s is None:
-            reasons.append("heartbeat continuity could not be evaluated (insufficient in-window rows)")
-        elif max_gap_s > 2 * interval_s:
+            reasons.append("heartbeat continuity could not be evaluated (no in-window rows)")
+        elif max_gap_s >= 2 * interval_s:
+            # Spec: uninterrupted requires max gap strictly LESS than 2x the
+            # interval, so an exactly-2x recorded gap fails. (An exactly-2x
+            # delta between healthy beats is never recorded as a gap, so it
+            # cannot land here.)
+            worst = max(
+                (g for g in heartbeat.get("gaps", []) if g.get("duration_s") == max_gap_s),
+                key=lambda g: g.get("duration_s", 0.0),
+                default=None,
+            )
+            detail = f" ({worst['reason']}: {worst['start']} .. {worst['end']})" if worst else ""
             reasons.append(
-                f"max heartbeat gap {max_gap_s:.0f}s exceeds 2x interval ({2 * interval_s:.0f}s)"
+                f"max heartbeat gap {max_gap_s:.0f}s is not below 2x interval "
+                f"({2 * interval_s:.0f}s){detail}"
+            )
+        total_rows = heartbeat.get("total_rows") or 0
+        ok_rows = heartbeat.get("ok_rows") or 0
+        if total_rows and ok_rows < total_rows:
+            reasons.append(
+                f"{total_rows - ok_rows} unhealthy (ok:false) heartbeat reading(s) in window "
+                "-- uptime below 100% is never uninterrupted"
+            )
+        uncovered_edge_s = heartbeat.get("uncovered_edge_s")
+        if uncovered_edge_s is not None and uncovered_edge_s > 2 * interval_s:
+            reasons.append(
+                f"heartbeat coverage does not span the window: {uncovered_edge_s:.0f}s of "
+                f"window-edge time has no beats (> 2x interval, {2 * interval_s:.0f}s)"
             )
         if heartbeat.get("malformed_lines"):
             reasons.append(
@@ -787,6 +886,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         )
         max_gap = f"{hb['max_gap_s']:.1f}s" if hb["max_gap_s"] is not None else "n/a"
         lines.append(f"- Max gap: {max_gap}")
+        if hb.get("coverage_pct") is not None:
+            lines.append(
+                f"- Window coverage (first..last beat vs window): {hb['coverage_pct']:.2f}% "
+                f"(uncovered edge time: {hb['uncovered_edge_s']:.0f}s)"
+            )
         lines.append(f"- First/last beat: {hb['first_ts']} / {hb['last_ts']}")
         lines.append(f"- Malformed lines: {hb['malformed_lines']}")
         lines.append(f"- HTTP 429 responses: {hb['http_429_count']}")
@@ -840,6 +944,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(f"no data: {sched['reason']}")
     else:
         lines.append(f"- Schedule: `{sched['schedule']}`")
+        lines.append(
+            "- Note: an 'accounted' firing means a committee run was CREATED in the slot -- "
+            "not that it succeeded; per-run status is listed below (failed runs included)."
+        )
         lines.append(f"- Expected firings: {len(sched['expected'])}")
         lines.append(f"- Actual runs in window: {len(sched['actual_runs'])}")
         lines.append(f"- Missing firings: {len(sched['missing'])}")
@@ -866,6 +974,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     paper = report["paper"]
     lines.append("## Paper-trading activity")
+    lines.append("_informational -- not part of the uninterrupted verdict_")
     if not paper["available"]:
         lines.append(f"no data: {paper['reason']}")
     else:
@@ -888,6 +997,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     journal = report["journal"]
     lines.append("## Committee journal activity")
+    lines.append("_informational -- not part of the uninterrupted verdict_")
     if not journal["available"]:
         lines.append(f"no data: {journal['reason']}")
     else:

@@ -5027,6 +5027,29 @@ def cmd_paper_reset(*, confirm: bool = False) -> int:
     return EXIT_SUCCESS
 
 
+def _resolve_committee_schedule() -> Optional[str]:
+    """Resolve the committee-run cron schedule for expected-firing math.
+
+    Prefers the PERSISTED job's schedule (``ScheduledResearchJobStore``, job
+    id ``committee-run``): ``VIBE_COMMITTEE_SCHEDULE`` only seeds the job at
+    first registration and a hand-edited persisted job can diverge from the
+    env, so the persisted value is what the executor actually runs. Falls
+    back to the env var when the store is missing/unreadable or has no
+    committee-run job (e.g. the server never registered one). Read-only and
+    best-effort: any store error just means the env fallback.
+    """
+    try:
+        from src.api.scheduled_routes import COMMITTEE_RUN_JOB_ID
+        from src.scheduled_research.store import ScheduledResearchJobStore
+
+        job = ScheduledResearchJobStore().get(COMMITTEE_RUN_JOB_ID)
+        if job is not None and (job.schedule or "").strip():
+            return job.schedule.strip()
+    except Exception:
+        pass
+    return os.environ.get("VIBE_COMMITTEE_SCHEDULE", "").strip() or None
+
+
 def cmd_ops_report(*, window: Optional[str] = None, json_mode: bool = False) -> int:
     """Build the cross-referenced 72h evidence report and print a summary.
 
@@ -5070,7 +5093,7 @@ def cmd_ops_report(*, window: Optional[str] = None, json_mode: bool = False) -> 
         window_start, window_start_source = default_window_start(ops_root, now)
 
     heartbeat_interval_s = float(os.environ.get("VIBE_OPS_HEARTBEAT_S", "").strip() or 60)
-    committee_schedule = os.environ.get("VIBE_COMMITTEE_SCHEDULE", "").strip() or None
+    committee_schedule = _resolve_committee_schedule()
 
     report = build_evidence_report(
         window_start,

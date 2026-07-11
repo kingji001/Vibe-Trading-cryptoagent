@@ -129,7 +129,10 @@ def test_heartbeat_uptime_pct_exact(fx):
 
 def test_gap_boundary_exactly_two_times_interval_is_not_a_gap(fx):
     # Regular 60s cadence establishes the median interval (60s), then one
-    # delta of EXACTLY 120s (2x) -- must NOT be flagged as a gap.
+    # delta of EXACTLY 120s (2x) between HEALTHY beats -- must NOT be flagged
+    # as a gap (spec sec 4 boundary rule; distinct from an ok:false span or
+    # a recorded edge gap of 2x, which DO fail the verdict).
+    fx.window_end = _dt("2026-07-01T00:04:00")  # tight window: no edge slack
     rows = [
         _hb_row("2026-07-01T00:00:00Z"),
         _hb_row("2026-07-01T00:01:00Z"),
@@ -142,10 +145,15 @@ def test_gap_boundary_exactly_two_times_interval_is_not_a_gap(fx):
     assert hb["interval_s"] == pytest.approx(60.0)
     assert hb["gaps"] == []
     assert hb["max_gap_s"] == pytest.approx(0.0)
-    assert report["verdict"]["status"] != "n/a"  # sanity: verdict computed
+    # No heartbeat-continuity reason may appear: exactly-2x delta passes.
+    # (Match specific phrases, not "gap" -- pytest's tmp dir name contains
+    # this test's own name, which leaks "gap" into path-bearing reasons.)
+    assert not any("heartbeat gap" in r or "coverage" in r or "unhealthy" in r
+                   for r in report["verdict"]["reasons"])
 
 
 def test_gap_strictly_greater_than_two_times_interval_is_flagged(fx):
+    fx.window_end = _dt("2026-07-01T00:04:01")  # tight window: no edge slack
     rows = [
         _hb_row("2026-07-01T00:00:00Z"),
         _hb_row("2026-07-01T00:01:00Z"),
@@ -161,9 +169,12 @@ def test_gap_strictly_greater_than_two_times_interval_is_flagged(fx):
     assert hb["max_gap_s"] == pytest.approx(121.0)
 
 
-def test_ok_false_span_counts_as_a_gap_even_with_regular_cadence(fx):
+def test_ok_false_span_counts_as_a_gap_and_degrades_the_verdict(fx):
     # Cadence stays regular (60s) throughout, so the delta-based check alone
-    # would miss this -- the ok:false span sub-rule must catch it.
+    # would miss this -- the ok:false span sub-rule must catch it AND the
+    # VERDICT must degrade (an unhealthy server is not an uninterrupted run,
+    # whatever the span length).
+    fx.window_end = _dt("2026-07-01T00:03:00")  # tight window: no edge slack
     rows = [
         _hb_row("2026-07-01T00:00:00Z", ok=True),
         _hb_row("2026-07-01T00:01:00Z", ok=False, http=503),
@@ -171,12 +182,99 @@ def test_ok_false_span_counts_as_a_gap_even_with_regular_cadence(fx):
         _hb_row("2026-07-01T00:03:00Z", ok=True),
     ]
     _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    _write_jsonl(fx.ops_root / "supervisor.jsonl", [_sup_start("2026-07-01T00:00:00Z")])
     report = fx.build()
     hb = report["heartbeat"]
     down_gaps = [g for g in hb["gaps"] if "ok:false" in g["reason"]]
     assert len(down_gaps) == 1
     # first false (00:01) to last false (00:02) = 60s, + interval (60s) = 120s
     assert down_gaps[0]["duration_s"] == pytest.approx(120.0)
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+    assert any("ok:false" in r for r in report["verdict"]["reasons"])
+
+
+def test_reviewer_repro_short_ok_false_span_degrades_despite_regular_cadence(fx):
+    # Reviewer's C2 reproduction: two consecutive ok:false readings at a
+    # perfectly regular 60s cadence -> uptime 60%, but pre-fix the verdict
+    # read UNINTERRUPTED with reasons [] because the span duration (120s)
+    # did not exceed 2x interval. Any unhealthy reading must degrade.
+    fx.window_end = _dt("2026-07-01T00:04:00")
+    rows = [
+        _hb_row("2026-07-01T00:00:00Z", ok=True),
+        _hb_row("2026-07-01T00:01:00Z", ok=False, http=503),
+        _hb_row("2026-07-01T00:02:00Z", ok=False, http=503),
+        _hb_row("2026-07-01T00:03:00Z", ok=True),
+        _hb_row("2026-07-01T00:04:00Z", ok=True),
+    ]
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    _write_jsonl(fx.ops_root / "supervisor.jsonl", [_sup_start("2026-07-01T00:00:00Z")])
+    report = fx.build()
+    assert report["heartbeat"]["uptime_pct"] == pytest.approx(60.0)
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+    assert any("unhealthy" in r for r in report["verdict"]["reasons"])
+
+
+def test_reviewer_repro_heartbeat_stream_that_stops_is_not_uninterrupted(fx):
+    # Reviewer's C1 reproduction: a 72h window whose heartbeat stream covers
+    # only the first 10 minutes (power loss / machine death -- the supervisor
+    # dies too, so 1 start and 0 restarts). Pre-fix this scored 100% uptime
+    # and UNINTERRUPTED because gaps were only computed BETWEEN in-window
+    # rows. The trailing window-edge gap must now be recorded and named, and
+    # the verdict must be INTERRUPTED/DEGRADED.
+    rows = [
+        _hb_row(f"2026-07-01T00:{m:02d}:00Z") for m in range(11)  # first 10 minutes only
+    ]
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    _write_jsonl(fx.ops_root / "supervisor.jsonl", [_sup_start("2026-07-01T00:00:00Z")])
+    report = fx.build()  # window: 72h (2026-07-01 .. 2026-07-04)
+    hb = report["heartbeat"]
+    edge_gaps = [g for g in hb["gaps"] if "window end" in g["reason"]]
+    assert len(edge_gaps) == 1
+    assert edge_gaps[0]["start"] == "2026-07-01T00:10:00Z"
+    assert edge_gaps[0]["end"] == "2026-07-04T00:00:00Z"
+    assert hb["coverage_pct"] is not None and hb["coverage_pct"] < 1.0
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+    assert any("window end" in r for r in report["verdict"]["reasons"])
+
+
+def test_late_start_leading_edge_gap_is_flagged(fx):
+    # Symmetric C1 case: first beat long after window start.
+    fx.window_end = _dt("2026-07-01T01:03:00")
+    rows = [
+        _hb_row("2026-07-01T01:00:00Z"),
+        _hb_row("2026-07-01T01:01:00Z"),
+        _hb_row("2026-07-01T01:02:00Z"),
+        _hb_row("2026-07-01T01:03:00Z"),
+    ]
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    report = fx.build()
+    hb = report["heartbeat"]
+    edge_gaps = [g for g in hb["gaps"] if "window start" in g["reason"]]
+    assert len(edge_gaps) == 1
+    assert edge_gaps[0]["duration_s"] == pytest.approx(3600.0)
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+
+
+def test_combined_edge_slack_below_per_edge_threshold_still_degrades_coverage(fx):
+    # Each edge alone is within 2x interval (120s), but together the window
+    # has 190s of uncovered edge time -- the coverage rule must catch what
+    # the per-edge gap rule alone cannot.
+    fx.window_start = _dt("2026-07-01T00:00:00")
+    fx.window_end = _dt("2026-07-01T00:06:10")
+    rows = [
+        _hb_row("2026-07-01T00:01:30Z"),  # lead: 90s (<= 120s threshold)
+        _hb_row("2026-07-01T00:02:30Z"),
+        _hb_row("2026-07-01T00:03:30Z"),
+        _hb_row("2026-07-01T00:04:30Z"),  # trail: 100s (<= 120s threshold)
+    ]
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+    _write_jsonl(fx.ops_root / "supervisor.jsonl", [_sup_start("2026-07-01T00:00:00Z")])
+    report = fx.build()
+    hb = report["heartbeat"]
+    assert not any("window" in g["reason"] for g in hb["gaps"])  # neither edge alone
+    assert hb["uncovered_edge_s"] == pytest.approx(190.0)
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+    assert any("coverage" in r for r in report["verdict"]["reasons"])
 
 
 def test_heartbeat_malformed_lines_counted_not_skipped(fx):
@@ -388,7 +486,9 @@ def test_verdict_flips_on_heartbeat_gap(fx):
     _write_jsonl(fx.ops_root / "heartbeat.jsonl", hb_rows)
     report = fx.build(committee_schedule="0 */2 * * *")
     assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
-    assert any("gap" in r for r in report["verdict"]["reasons"])
+    # "heartbeat gap" specifically -- a bare "gap" would match pytest's own
+    # tmp dir name inside path-bearing reasons.
+    assert any("heartbeat gap" in r for r in report["verdict"]["reasons"])
 
 
 def test_verdict_flips_on_missing_expected_firing(fx):
@@ -476,6 +576,10 @@ def test_render_markdown_includes_all_spec_sections(fx):
         "## Ops health",
     ):
         assert heading in markdown
+    # I1: paper/journal sections must state their informational-only status.
+    assert markdown.count("informational -- not part of the uninterrupted verdict") == 2
+    # Minor (a): firing-accounted != run-succeeded must be stated.
+    assert "not that it succeeded" in markdown
 
 
 # --------------------------------------------------------------------------- #
@@ -532,6 +636,13 @@ class TestOpsReportCli:
         monkeypatch.setenv("VIBE_TRADING_COMMITTEE_JOURNAL", str(tmp_path / "journal.jsonl"))
         monkeypatch.delenv("VIBE_COMMITTEE_SCHEDULE", raising=False)
         monkeypatch.setattr("cli._legacy.SWARM_DIR", tmp_path / "swarm-runs")
+        # Pin the scheduled-research job store (read by the persisted-first
+        # schedule resolution) away from the real ~/.vibe-trading runtime root.
+        import src.scheduled_research.store as sched_store
+
+        monkeypatch.setattr(
+            sched_store, "_default_store_path", lambda: tmp_path / "sched" / "jobs.json"
+        )
 
     def test_smoke_writes_markdown_report_and_returns_success(self, monkeypatch, tmp_path, capsys):
         from cli._legacy import EXIT_SUCCESS, cmd_ops_report
@@ -569,6 +680,39 @@ class TestOpsReportCli:
         self._set_env(monkeypatch, tmp_path)
         rc = cmd_ops_report(window="not-a-window")
         assert rc == EXIT_USAGE_ERROR
+
+    def test_persisted_job_schedule_preferred_over_env(self, monkeypatch, tmp_path, capsys):
+        # VIBE_COMMITTEE_SCHEDULE only seeds the job at first registration; a
+        # hand-edited persisted job is what the executor actually runs, so the
+        # report's expected-firing math must read the persisted schedule first.
+        from cli._legacy import EXIT_SUCCESS, cmd_ops_report
+        from src.scheduled_research.models import ScheduledResearchJob
+        from src.scheduled_research.store import ScheduledResearchJobStore
+
+        self._set_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("VIBE_COMMITTEE_SCHEDULE", "0 */6 * * *")  # stale env value
+        store = ScheduledResearchJobStore()  # resolves to the pinned tmp path
+        store.upsert(
+            ScheduledResearchJob(id="committee-run", prompt="run it", schedule="0 */2 * * *")
+        )
+
+        rc = cmd_ops_report(window="4h", json_mode=True)
+        out = capsys.readouterr().out
+        assert rc == EXIT_SUCCESS
+        payload = json.loads(out)
+        assert payload["scheduled_firings"]["schedule"] == "0 */2 * * *"
+
+    def test_env_schedule_used_when_no_persisted_job(self, monkeypatch, tmp_path, capsys):
+        from cli._legacy import EXIT_SUCCESS, cmd_ops_report
+
+        self._set_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("VIBE_COMMITTEE_SCHEDULE", "0 */6 * * *")
+
+        rc = cmd_ops_report(window="4h", json_mode=True)
+        out = capsys.readouterr().out
+        assert rc == EXIT_SUCCESS
+        payload = json.loads(out)
+        assert payload["scheduled_firings"]["schedule"] == "0 */6 * * *"
 
     def test_default_window_reads_last_supervisor_start_event(self, monkeypatch, tmp_path, capsys):
         from cli._legacy import EXIT_SUCCESS, cmd_ops_report
