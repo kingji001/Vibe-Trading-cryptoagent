@@ -14,6 +14,70 @@ if str(AGENT_DIR) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
+# .env leak hermeticity guard (final whole-branch review finding).
+#
+# ``src.providers.llm._ensure_dotenv()`` searches, in order, ``~/.vibe-
+# trading/.env``, ``agent/.env``, and ``$CWD/.env``, latching a module-level
+# ``_dotenv_loaded`` flag so it only ever runs once per process. Any test
+# that spins up the real FastAPI app (e.g. via ``starlette.testclient
+# .TestClient``, which runs the app's startup lifespan) can be the FIRST
+# thing in a session to call it -- and since pytest is invoked from the repo
+# root, ``$CWD/.env`` resolves to the operator's real, repo-root ``.env``.
+# ``load_dotenv(..., override=False)`` only sets keys not already in
+# ``os.environ``, but for keys that ARE unset it mutates the real process
+# environment directly (not via monkeypatch), so the values leak into every
+# test that runs afterward in the same session and never get cleaned up.
+#
+# With a real ``.env`` that sets VIBE_LLM_MAX_CONCURRENT, VIBE_PAPER_TICK_*,
+# VIBE_COMMITTEE_*, etc. (a normal operator config, not a test fixture) this
+# deterministically broke tests in test_paper_tick.py,
+# test_concurrency_governance.py, and test_scheduled_reflection_job.py that
+# assume those vars are unset unless they set them themselves.
+#
+# Fix: latch the flag to already-loaded (and defensively strip the known
+# leak-prone vars) BEFORE any test gets a chance to trigger the real load.
+# ``cli._legacy`` imports ``_ensure_dotenv`` from this same module and shares
+# the same module-level flag, so there is only one loader to guard -- no
+# sibling flag exists. ``cli.main``'s own ``load_dotenv`` call (onboarding
+# wizard) only fires when NO ``.env`` exists anywhere, which cannot be true
+# once ``.env`` is present, so it needs no guard here.
+#
+# Per-test fixtures still setenv/delenv whatever they need -- this only
+# prevents the ACCIDENTAL, uncontrolled load of the real file.
+# ---------------------------------------------------------------------------
+
+_LEAK_PRONE_ENV_VARS = (
+    "VIBE_PAPER_TICK_INTERVAL",
+    "VIBE_PAPER_TICK_SCHEDULE",
+    "VIBE_LLM_MAX_CONCURRENT",
+    "VIBE_COMMITTEE_SCHEDULE",
+    "VIBE_COMMITTEE_SYMBOLS",
+    "VIBE_COMMITTEE_TIMEFRAME",
+    "VIBE_EVENT_PRICE_MOVE_PCT",
+    "VIBE_EVENT_FUNDING_ABS",
+    "VIBE_EVENT_COOLDOWN_H",
+)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _dotenv_hermeticity_guard(tmp_path_factory):
+    """Latch dotenv loading as already-done before any test can trigger it.
+
+    Must be the first autouse session fixture pytest sets up (hence its
+    placement at the very top of this file, ahead of the paper-executor
+    guard below) so nothing gets a window to load the real repo-root .env.
+    """
+    import src.providers.llm as llm_module
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(llm_module, "_dotenv_loaded", True)
+    for name in _LEAK_PRONE_ENV_VARS:
+        mp.delenv(name, raising=False)
+    yield
+    mp.undo()
+
+
+# ---------------------------------------------------------------------------
 # Paper-executor hermeticity guard (paper-trading loop, Task 5 incident fix).
 #
 # The decision_journal tool's append action fires the paper execution hook
@@ -43,13 +107,21 @@ def _paper_env_session_backstop(tmp_path_factory):
     mp = pytest.MonkeyPatch()
     mp.setenv("VIBE_PAPER_ROOT", str(tmp_path_factory.mktemp("paper-session-backstop")))
     mp.setenv("VIBE_PAPER_ENABLED", "0")
+    mp.setenv("VIBE_OPS_ROOT", str(tmp_path_factory.mktemp("ops-session-backstop")))
     yield
     mp.undo()
 
 
 @pytest.fixture(autouse=True)
 def _paper_env_guard(monkeypatch, tmp_path):
-    """Per-test guard: paper executor disabled, store rooted in this test's tmp."""
+    """Per-test guard: paper executor disabled, store rooted in this test's tmp.
+
+    Also pins VIBE_OPS_ROOT (scripts/ops/run72.sh + `vibe-trading ops report`
+    artifacts root) to this test's tmp — same hermeticity rule as
+    VIBE_PAPER_ROOT above: any new env var with filesystem/network side
+    effects gets a guard entry in the same task that introduces it.
+    """
     monkeypatch.setenv("VIBE_PAPER_ROOT", str(tmp_path / "paper-guard"))
     monkeypatch.setenv("VIBE_PAPER_ENABLED", "0")
+    monkeypatch.setenv("VIBE_OPS_ROOT", str(tmp_path / "ops-guard"))
     yield

@@ -578,6 +578,272 @@ job once** (`DELETE /scheduled-runs/paper-trading-tick`); the next restart
 re-registers it with the current, event-aware prompt (see
 `_build_paper_tick_prompt`).
 
+## Proving a 72-hour run
+
+"The system ran uninterrupted for 72 hours" is a claim that should be
+PROVABLE from artifacts, not asserted from memory. `scripts/ops/run72.sh`
+supervises `vibe-trading serve` and records a redundant evidence trail
+(heartbeat + supervisor events); `vibe-trading ops report` cross-references
+that trail against the swarm run store, the paper store, and the committee
+journal and prints a verdict with reasons. Honesty rule: gaps, restarts, and
+missed firings are **reported, never hidden** — an interrupted run produces a
+report that says exactly where it broke.
+
+### Start / stop / status
+
+```bash
+scripts/ops/run72.sh start    # refuses if a live PID file already exists
+scripts/ops/run72.sh status   # "running (pid N)" or "not running"
+scripts/ops/run72.sh stop     # TERMs the supervised process group + heartbeat loop, waits up to 30s, then KILLs
+```
+
+`start` wraps `vibe-trading serve` under `caffeinate -dims` (prevents idle/
+display/disk sleep on macOS; degrades to a logged warning on other
+platforms), restarts it on crash (5s backoff, `restart_count` incremented
+each time), and runs a background heartbeat loop that `curl`s `GET /health`
+(`agent/src/api/system_routes.py`) every `VIBE_OPS_HEARTBEAT_S` seconds. All
+analysis logic lives in Python (`vibe-trading ops report`); the shell script
+only supervises and appends raw JSONL rows.
+
+### Where artifacts live
+
+Everything is written under `VIBE_OPS_ROOT` (default `~/.vibe-trading/ops`):
+
+| File | Contents |
+|---|---|
+| `run72.pid` | PID of the running supervisor process |
+| `supervisor.jsonl` | `{"ts","event":"start\|restart\|stop","exit_code"?,"restart_count"?,"serve_cmd"?,"serve_cmd_overridden"?,"env_fingerprint"?}` |
+| `heartbeat.jsonl` | `{"ts","ok":bool,"http":code\|null,"latency_ms"}` |
+| `run72.log` | stdout/stderr of the supervised process + warnings (e.g. caffeinate unavailable) |
+| `report-<UTC-ts>.md` | the evidence report, written each time `ops report` runs |
+
+`env_fingerprint` on the `start` event records the **names** of every set
+`VIBE_*`/`SWARM_*`/`LANGCHAIN_*`/`MINIMAX_*` environment variable — never
+values. No key leakage, ever.
+
+### The verdict line
+
+`vibe-trading ops report [--window 72h|48h|...] [--json]` builds the
+cross-referenced report (default window: since the last supervisor `start`
+event) and writes it to `$VIBE_OPS_ROOT/report-<UTC-ts>.md`. The verdict is
+`UNINTERRUPTED` **iff every one of these holds**, and `INTERRUPTED/DEGRADED`
+with the specific broken condition(s) listed otherwise:
+
+- 0 restarts recorded in `supervisor.jsonl`.
+- Max recorded heartbeat gap is **strictly less than** 2× the heartbeat
+  interval (an exactly-2× gap fails; note a plain 2× *delta* between two
+  healthy beats is never recorded as a gap in the first place, so it can't
+  trip this — the two rules coexist deliberately).
+- 100% heartbeat uptime **outside startup grace** — any `ok:false` reading,
+  however brief, degrades the verdict, EXCEPT readings classified as
+  *startup grace*: the heartbeat loop starts before `uvicorn` finishes
+  booting, so the first beat(s) after every supervisor `start`/`restart`
+  event honestly record `ok:false`. An `ok:false` reading is startup grace
+  when it follows a start/restart event, no `ok:true` has been seen since
+  that event, and it lies within `VIBE_OPS_STARTUP_GRACE_S` (default 120
+  seconds, inclusive) of the event. Grace readings are still recorded and
+  rendered (with their own count and label) — they are only excluded from
+  this verdict condition and from unhealthy-span gap math. Bounds: an
+  `ok:false` after the first healthy beat is real unhealthiness even inside
+  the grace horizon; an `ok:false` beyond the horizon with no healthy beat
+  yet means the server never came up — also real; each start/restart opens
+  its own fresh grace window; and grace never touches the edge-coverage
+  condition below, so it cannot hide a stream that went silent.
+- Window-edge coverage is complete: the **sum** of the uncovered time before
+  the first beat and after the last beat is ≤ 2× the interval. (Stricter
+  than a per-edge check — two edge holes that are each under threshold still
+  fail together; a single edge hole above the threshold is additionally
+  recorded as a named gap.)
+- No supervisor `stop` event in-window, and no `start` event **other than
+  the one that opens the window** (for the default window that is the last
+  `start` event itself, which sits exactly at the window start; for an
+  explicit `--window`, any start strictly inside the window counts). A clean
+  stop/start cycle writes no `restart` event, its downtime can slip between
+  heartbeats (the loop is dead, so no beats record the hole), and the second
+  start's cold-boot beats are startup-graced — this condition catches the
+  cycle anyway: the run was not continuous.
+- Every expected `committee-run` firing (per the persisted/`VIBE_COMMITTEE_SCHEDULE`
+  cron, using the same next-due logic as `agent/src/scheduled_research/executor.py`
+  — no parallel cron implementation) is accounted for in the swarm run store.
+- No `supervisor.jsonl` start event carries `serve_cmd_overridden:true` (see
+  the warning below).
+- No missing/unparseable evidence source and no malformed JSONL line —
+  absent or corrupt data always degrades the verdict; it is never treated as
+  a pass.
+
+Each condition flips the verdict independently, and every reason is printed
+so a partial run is diagnosable, not just labeled "failed."
+
+### Machine requirements
+
+- The machine must stay **plugged in**. `caffeinate -dims` prevents idle,
+  display, and disk sleep, so the server keeps answering `/health` while the
+  lid is closed or the screen is off — but it cannot survive **power loss or
+  a forced reboot**. Those show up honestly as heartbeat gaps and/or
+  supervisor restarts, and correctly fail the window; there is no way around
+  this short of a UPS plus the launchd alternative below (which itself only
+  restarts the process — it doesn't preserve the in-window claim of zero
+  interruption, it just resumes service).
+- Network access to the server's own `/health` endpoint (loopback by
+  default) is required for the heartbeat loop; a firewall or VPN change that
+  blocks it mid-run reads as a heartbeat gap, not a crash.
+
+### launchd alternative (sketch, not built)
+
+For a supervisor that survives terminal/session logout (though still not
+power loss), a `launchd` `LaunchAgent` plist is the macOS-native alternative
+to `run72.sh`'s own restart loop. This is documented as a sketch only — it
+is **not** part of this harness and nothing here wires it up automatically:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.vibe-trading.run72</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/path/to/scripts/ops/run72.sh</string>
+    <string>start</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/run72-launchd.log</string>
+  <key>StandardErrorPath</key><string>/tmp/run72-launchd.log</string>
+</dict>
+</plist>
+```
+
+Install with `launchctl load ~/Library/LaunchAgents/com.vibe-trading.run72.plist`.
+Because `run72.sh start` itself refuses to double-start (live PID guard),
+`KeepAlive` re-invoking `start` after a login-session death is safe — it
+either finds no live PID and starts cleanly, or (if the supervisor process
+itself survived) prints the "already running" message and exits non-zero,
+which launchd will retry per its own backoff. Still out of scope: this sketch
+is not tested, not wired into `run72.sh`, and does not change the "power
+loss/reboot honestly fails the window" limit above.
+
+### Getting the report — while the run is still up
+
+```bash
+vibe-trading ops report
+```
+
+Run this **before** `run72.sh stop`, against the still-running supervisor.
+Prefer the plain form above (no `--window`): the default window starts at
+the last supervisor `start` event, so it always covers exactly the run
+currently in progress. Only add an explicit `--window 72h` once the run has
+genuinely been up for **more than 72 hours** — requesting it earlier just
+extends the window past the `start` event for no benefit.
+
+This ordering is not a style preference, it is required: one of the verdict
+conditions above is "no supervisor `stop` event in-window." `run72.sh stop`
+always appends a `stop` event to `supervisor.jsonl`, so **any report
+generated after `stop` has run will see that event and report
+`INTERRUPTED/DEGRADED`** ("supervisor start/stop cycle inside the window --
+the run was not continuous"), regardless of how clean the heartbeat and
+restart history were. This is intentional anti-overstate design, not a
+limitation to work around: `stop` is the harness's own signal that
+supervision has ended, so a report pulled afterward is, correctly, reporting
+on a session that is already over — it must not be able to claim
+"uninterrupted" for a window that includes its own teardown.
+
+If you need a report on a run that has already been stopped (a postmortem,
+say), expect and read the `INTERRUPTED/DEGRADED` stop-cycle reason as
+accurate, not a bug — generate the report before stopping next time if you
+want a shot at `UNINTERRUPTED`.
+
+Prints a one-screen terminal summary (verdict, heartbeat uptime/gap,
+restart count, scheduled-firing counts) and writes the full Markdown report
+to `$VIBE_OPS_ROOT/report-<UTC-ts>.md`. Add `--json` for machine-readable
+output. Sections beyond the verdict-relevant ones (paper-trading activity,
+committee journal activity) are explicitly marked
+`_informational -- not part of the uninterrupted verdict_` and read from the
+real paper store / committee journal / swarm run store regardless of
+`VIBE_OPS_ROOT` — only heartbeat/supervisor/report artifacts are scoped to
+that env var.
+
+### WARNING: `VIBE_OPS_SERVE_CMD` is a test seam
+
+`VIBE_OPS_SERVE_CMD` overrides the command `run72.sh` supervises. It exists
+**only** so tests can substitute a stub/crash binary — production operators
+must never set it. Any run started with it set is self-flagged: the
+`supervisor.jsonl` `start` event carries `"serve_cmd_overridden":true`, and
+`vibe-trading ops report` treats that as an automatic, unconditional verdict
+failure ("a stub-server run cannot count as valid evidence"). If you see
+`serve_cmd_overridden` in a report you meant to be a real 72h claim, the
+run is invalid — start over without the env var set.
+
+### Smoke-verified quickstart (sample output)
+
+The following is a real, short-window run of this exact harness (not a
+72-hour run — a several-heartbeat smoke check that the plumbing works
+end-to-end), captured against a scratch `VIBE_OPS_ROOT` with
+`VIBE_OPS_HEARTBEAT_S=5` (5s beats instead of the 60s default, purely to
+keep the smoke fast) and `VIBE_TRADING_ENABLE_SCHEDULER=0` (the committee
+must not fire during a plumbing check). It ran the real `vibe-trading
+serve` — no `VIBE_OPS_SERVE_CMD` override — for about 30 seconds, through
+`start` → a few heartbeats → `status` → `stop`, then `vibe-trading ops
+report`. **This capture predates the current "report before `stop`"
+guidance above** — it is kept here purely to illustrate the startup-grace
+rule below, not as an ordering to copy; see the corrected verdict note
+right after the sample output for why reporting in this order can no longer
+earn `UNINTERRUPTED`:
+
+```
+## Verdict: INTERRUPTED/DEGRADED
+
+- 1 unhealthy (ok:false) heartbeat reading(s) in window -- uptime below 100% is never uninterrupted
+
+## Heartbeat continuity
+- Uptime: 85.71% (6/7 rows)
+- Interval used for gap math: 5.0s (observed_median)
+- Max gap: 5.0s
+- Window coverage (first..last beat vs window): 76.08% (uncovered edge time: 9s)
+- First/last beat: 2026-07-11T15:44:29Z / 2026-07-11T15:44:59Z
+- Malformed lines: 0
+- HTTP 429 responses: 0
+```
+
+The very first heartbeat fired while `uvicorn` was still starting up
+(before `Application startup complete`), so it recorded `ok:false`.
+`Supervisor: 0 restart(s)`, no `serve_cmd_overridden`, no malformed lines.
+
+**Note — this capture predates the startup-grace rule.** This exact smoke
+exposed the structural flaw in the original verdict condition: because the
+heartbeat loop always fires at least once before the server finishes
+booting, "uptime < 100% ⇒ never UNINTERRUPTED" meant **no genuine run could
+ever earn the verdict**. Under the current rule (see the verdict conditions
+above), that single cold-start `ok:false` — within 120 seconds of the
+`start` event and before the first healthy beat — is classified *startup
+grace*: still recorded and rendered with its own count
+(`N startup-grace reading(s) excluded from verdict per
+VIBE_OPS_STARTUP_GRACE_S=120`), but excluded from the uptime condition.
+Reported **before** `stop` — as the corrected guidance above recommends —
+the same run, with everything else identical (0 restarts, max gap under 2×
+interval, edge coverage within threshold), renders `UNINTERRUPTED` today.
+Reported **after** `stop`, exactly as this capture was, it instead renders
+`INTERRUPTED/DEGRADED` under the separate, independent stop-cycle condition
+("supervisor start/stop cycle inside the window — the run was not
+continuous") — that failure has nothing to do with startup grace and no
+amount of grace tuning changes it. This capture is a startup-grace
+illustration only; reported in the order it actually was, it cannot and
+does not demonstrate an `UNINTERRUPTED` verdict. An `ok:false` appearing
+*after* the first healthy beat, or beyond the grace horizon with the server
+still unhealthy, still degrades exactly as described above.
+
+**Port already in use:** the real server binds `127.0.0.1:8000` by default
+(`vibe-trading serve --host 127.0.0.1 --port 8000`). If something else is
+already listening there, `run72.sh` has no direct host/port passthrough of
+its own — the only lever is `VIBE_OPS_SERVE_CMD='vibe-trading serve --port
+<N>'` together with `VIBE_TRADING_API_URL=http://127.0.0.1:<N>` (so the
+heartbeat loop targets the same port). Using `VIBE_OPS_SERVE_CMD` for this
+is itself the test seam above, so **that run self-flags as invalid** — the
+honest fix for a real 72h claim is to free port 8000 (or edit `run72.sh`'s
+default `SERVE_CMD`), not to route around the seam.
+
 ## Debate rounds
 
 `agent/src/swarm/presets.py::_expand_debate` unrolls the `debates:` YAML
