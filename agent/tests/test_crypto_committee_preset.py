@@ -217,6 +217,20 @@ def test_lessons_to_manager_flag_on_injects_research_manager_input(monkeypatch):
     assert order["task-reflection"] < order["task-research-plan"]
 
 
+def test_pm_append_step_enumerates_execution_and_run_id_fields():
+    """Final review I2/C3: the PM's step-2 decision_journal append enumeration
+    must name the execution fields (stop_loss, take_profit, position_size_pct)
+    and run_id — otherwise the prompt-requested execution data never reaches
+    journal.append_decision / the paper executor."""
+    from src.swarm.presets import PRESETS_DIR
+
+    raw = (PRESETS_DIR / f"{PRESET}.yaml").read_text(encoding="utf-8")
+    idx = raw.index('action "append"')
+    segment = raw[idx : idx + 600]
+    for field in ("stop_loss", "take_profit", "position_size_pct", "run_id"):
+        assert field in segment, f"{field!r} missing from PM append enumeration"
+
+
 def test_snapshot_tool_json_keys_match_prompt_references():
     """Prompt-contract: every top-level field name the snapshot tool's JSON
     envelope actually returns is referenced somewhere in the preset text —

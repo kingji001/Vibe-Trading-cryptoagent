@@ -98,6 +98,83 @@ def _ensure_decision_journal_job(store) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Paper-trading loop, Task 5 — scheduled paper-trading-tick job
+#
+# The paper broker's conditional orders (stops/take-profits) and daily
+# mark-to-market snapshot only advance when something calls
+# ``src.paper.tick.run_tick`` once per UTC day. Rather than invent a new
+# dispatch path, this reuses the exact same scheduled-research store/executor
+# plumbing as the Phase 6 decision-journal job above: a lightweight agent
+# tool (``paper_tick`` — ``src/tools/paper_tick_tool.py``, wraps ``run_tick``,
+# no parameters) is called once by the scheduled agent turn, mirroring how
+# the reflection job calls ``decision_journal``.
+#
+# Double-gated: registered only when the scheduler is enabled AND paper
+# trading itself is enabled (``VIBE_PAPER_ENABLED``, same kill-switch rule as
+# the rest of the paper package — unset means enabled). A user who disables
+# paper trading after the job was already registered keeps the (now inert)
+# job — ``paper_tick`` calls ``run_tick``, which itself honors the kill
+# switch and no-ops fast with a disabled marker. Disabling therefore FREEZES
+# existing positions: no conditional stop/TP evaluation, no mark-to-market
+# snapshot, and no new trades, until the switch is turned back on.
+# ---------------------------------------------------------------------------
+
+PAPER_TICK_JOB_ID = "paper-trading-tick"
+# 00:30 UTC — after the 00:00 decision-journal reflection job, so a paper
+# position's mark-to-market/conditional-order tick runs once the day's
+# reflections (if any) have already been written.
+PAPER_TICK_JOB_SCHEDULE = "30 0 * * *"
+PAPER_TICK_JOB_PROMPT = (
+    "You are running the scheduled daily paper-trading tick. This is a "
+    "mechanical maintenance run, not a trading decision — do not analyze "
+    "the market and do not call any tool other than the one below.\n\n"
+    "1. Call the paper_tick tool exactly once, with no arguments.\n"
+    "2. Reply with a one-line summary of its result: how many conditional "
+    "fills triggered, the current equity, and how many positions were "
+    "marked stale. If the tool reported any errors, include them verbatim.\n"
+    "Never fabricate results — report exactly what the tool returned."
+)
+
+_PAPER_ENABLED_ENV = "VIBE_PAPER_ENABLED"
+
+
+def _paper_trading_enabled() -> bool:
+    """``VIBE_PAPER_ENABLED`` truthiness: unset -> enabled; "0"/"false"/"" -> disabled.
+
+    Same canonical kill-switch rule as ``src.paper.translator._paper_enabled``
+    / ``src.paper.hook._paper_enabled``, duplicated locally (same pattern as
+    this module's own ``_scheduled_research_scheduler_enabled``) so gating
+    job registration never has to import the paper package.
+    """
+    val = os.environ.get(_PAPER_ENABLED_ENV)
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "")
+
+
+def _ensure_paper_trading_tick_job(store) -> None:
+    """Register the daily paper_tick job if not already persisted.
+
+    Idempotent and non-clobbering, identical contract to
+    ``_ensure_decision_journal_job``: a job that already exists — whatever
+    schedule or prompt it currently has, including a user's own edits — is
+    left untouched on every subsequent call (e.g. a server restart).
+    """
+    if store.get(PAPER_TICK_JOB_ID) is not None:
+        return
+
+    from src.scheduled_research.models import ScheduledResearchJob
+
+    store.upsert(
+        ScheduledResearchJob(
+            id=PAPER_TICK_JOB_ID,
+            prompt=PAPER_TICK_JOB_PROMPT,
+            schedule=PAPER_TICK_JOB_SCHEDULE,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
 
@@ -167,11 +244,17 @@ def _start_scheduled_research_executor() -> None:
     """Start scheduled research execution when explicitly enabled.
 
     Also registers the Phase 6 decision-journal reflection job (idempotent)
-    so daily resolve_due + reflect runs regardless of committee activity.
+    so daily resolve_due + reflect runs regardless of committee activity, and
+    — when paper trading is also enabled — the Task 5 paper-trading-tick job
+    (idempotent) so conditional orders and equity mark-to-market advance
+    daily too.
     """
     if not _scheduled_research_scheduler_enabled():
         return
-    _ensure_decision_journal_job(_get_scheduled_research_store())
+    store = _get_scheduled_research_store()
+    _ensure_decision_journal_job(store)
+    if _paper_trading_enabled():
+        _ensure_paper_trading_tick_job(store)
     _get_scheduled_research_executor().start()
 
 

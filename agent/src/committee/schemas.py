@@ -66,7 +66,7 @@ def parse_rating(text: str) -> Rating:
 # in optional numeric fields; coerce to None instead of failing validation.
 # ---------------------------------------------------------------------------
 
-_NULLISH = {"", "n/a", "na", "none", "null", "tbd", "-", "unknown", "nil"}
+_NULLISH = {"", "n/a", "na", "none", "null", "tbd", "-", "unknown", "nil", "<unavailable>"}
 
 
 def _coerce_nullish(value: Any) -> Any:
@@ -143,8 +143,27 @@ class PortfolioDecision(_CommitteeModel):
     time_horizon: str = Field(
         description="Stated horizon, e.g. '72h swing' or '2-4 week position'."
     )
+    stop_loss: float | None = Field(
+        default=None,
+        description="Protective stop in quote currency, grounded in the trader's proposal "
+        "and verified snapshot prices. Omit when not determinable — never invent.",
+    )
+    take_profit: float | None = Field(
+        default=None,
+        description="Target exit in quote currency, grounded in the trader's proposal and "
+        "verified snapshot prices. Omit when not determinable — never invent.",
+    )
+    position_size_pct: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Position size as a percent of equity (0-100). Omit when not "
+        "determinable — never invent.",
+    )
 
-    @field_validator("price_target", mode="before")
+    @field_validator(
+        "price_target", "stop_loss", "take_profit", "position_size_pct", mode="before"
+    )
     @classmethod
     def _nullish(cls, v: Any) -> Any:
         return _coerce_nullish(v)

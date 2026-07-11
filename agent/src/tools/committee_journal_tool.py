@@ -10,6 +10,11 @@ manager) and the main agent can drive the learning loop:
 - lessons      render the prompt-injection block (same-symbol history +
                cross-symbol lessons).
 - list         raw entries for inspection.
+- pnl          decision-level paper-trading PnL (Task 6): was the decision
+               actually executed as a paper trade, and what happened to the
+               money (realized/unrealized PnL, fees, exit_kind). Consumed by
+               the reflection officer to weigh the EXECUTED outcome against
+               the pure directional call.
 
 Learning-loop design adapted from TauricResearch/TradingAgents (Apache-2.0).
 
@@ -25,12 +30,44 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from typing import Any
 
 from src.agent.tools import BaseTool
 
 BENCHMARK_ENV = "VIBE_COMMITTEE_BENCHMARK"
+NOT_EXECUTED_MESSAGE = "not executed — no paper-trading data"
+
+
+def _derive_run_id(run_dir: Any) -> str | None:
+    """Extract the swarm run id from an injected ``run_dir`` path (review C3).
+
+    The swarm worker injects only ``run_dir`` (``.swarm/runs/<run_id>/...``),
+    never ``run_id``. Without a run_id the journal's (run_id, symbol)
+    idempotency can't fire, so a retried PM task re-appends and the paper hook
+    buys again. Anchored to the ``.swarm/runs/`` segment — a checkout path that
+    merely contains ``/runs/`` must not match (it would derive a constant wrong
+    run_id and silently dedupe across runs). None when not derivable.
+    """
+    if not run_dir:
+        return None
+    match = re.search(r"\.swarm[\\/]runs[\\/]([^\\/]+)", str(run_dir))
+    return match.group(1) if match else None
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    """Nullish-tolerant float coercion, same rule as the schema fields.
+
+    Workers sometimes send "n/a" / "<unavailable>" / "$65,000" instead of a
+    bare number; reuse the committee schemas' nullish coercion so those
+    coerce to None / 65000.0 rather than erroring or journaling a string.
+    Raises ValueError/TypeError on genuinely unparseable input.
+    """
+    from src.committee.schemas import _coerce_nullish
+
+    coerced = _coerce_nullish(value)
+    return None if coerced is None else float(coerced)
 
 
 def _loader_fetch_bars(symbol: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
@@ -88,12 +125,15 @@ class DecisionJournalTool(BaseTool):
     description = (
         "The committee decision journal (learning loop). Actions: "
         "'append' a new decision (symbol, rating, time_horizon, price_target?, "
-        "run_id?) — call after a portfolio_decision is accepted; "
+        "stop_loss?, take_profit?, position_size_pct?, run_id?) — call after a "
+        "portfolio_decision is accepted; "
         "'resolve_due' computes realized 24h/72h/7d returns and alpha vs the "
         "BTC benchmark for pending entries and returns entries needing a "
         "reflection; 'reflect' attaches a 2-4 sentence lesson (entry_id, "
         "reflection); 'lessons' renders past-decision context for a symbol; "
-        "'list' returns raw entries."
+        "'list' returns raw entries; 'pnl' (decision_id or symbol) returns the "
+        "decision's paper-trading PnL outcome — 'not executed — no "
+        "paper-trading data' when nothing was actually traded."
     )
     is_readonly = False
     repeatable = True
@@ -102,11 +142,17 @@ class DecisionJournalTool(BaseTool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["append", "resolve_due", "reflect", "lessons", "list"],
+                "enum": ["append", "resolve_due", "reflect", "lessons", "list", "pnl"],
             },
             "symbol": {
                 "type": "string",
-                "description": "Asset in loader format, e.g. BTC-USDT (append/lessons).",
+                "description": "Asset in loader format, e.g. BTC-USDT (append/lessons/pnl — "
+                "pnl resolves the most recent EXECUTED decision for the symbol).",
+            },
+            "decision_id": {
+                "type": "string",
+                "description": "Decision (journal entry) id to compute PnL for (pnl). "
+                "Provide either decision_id or symbol.",
             },
             "rating": {
                 "type": "string",
@@ -118,6 +164,21 @@ class DecisionJournalTool(BaseTool):
                 "description": "Stated horizon, e.g. '72h swing' (append).",
             },
             "price_target": {"type": "number", "description": "Optional (append)."},
+            "stop_loss": {
+                "type": "number",
+                "description": "Optional protective stop in quote currency (append). "
+                "Omit when not determinable.",
+            },
+            "take_profit": {
+                "type": "number",
+                "description": "Optional target exit in quote currency (append). "
+                "Omit when not determinable.",
+            },
+            "position_size_pct": {
+                "type": "number",
+                "description": "Optional position size as percent of equity, 0-100 "
+                "(append). Omit when not determinable.",
+            },
             "run_id": {"type": "string", "description": "Swarm run id (append)."},
             "entry_id": {"type": "string", "description": "Journal entry id (reflect)."},
             "reflection": {
@@ -145,17 +206,56 @@ class DecisionJournalTool(BaseTool):
                 missing = [k for k in ("symbol", "rating", "time_horizon") if not kwargs.get(k)]
                 if missing:
                     return self._err(f"append requires: {', '.join(missing)}")
+                execution: dict[str, float | None] = {}
+                for field in ("stop_loss", "take_profit", "position_size_pct"):
+                    try:
+                        value = _coerce_optional_float(kwargs.get(field))
+                    except (TypeError, ValueError):
+                        return self._err(
+                            f"append: {field} must be a number (or a nullish string "
+                            f"like 'n/a'), got {kwargs.get(field)!r}"
+                        )
+                    # Review C1: an out-of-range position_size_pct must be
+                    # rejected fail-before-write (the schema enforces [0,100] but
+                    # the PM reaches the journal directly through this tool).
+                    if (
+                        field == "position_size_pct"
+                        and value is not None
+                        and not (0.0 <= value <= 100.0)
+                    ):
+                        return self._err(
+                            f"append: position_size_pct must be within [0, 100], "
+                            f"got {value}"
+                        )
+                    execution[field] = value
+                # Review C3: derive run_id from the injected run_dir when the PM
+                # didn't pass one explicitly, so (run_id, symbol) idempotency
+                # protects against retried-task double-execution.
+                run_id = kwargs.get("run_id") or _derive_run_id(kwargs.get("run_dir"))
                 entry = journal.append_decision(
                     symbol=kwargs["symbol"],
                     rating=kwargs["rating"],
                     time_horizon=kwargs["time_horizon"],
                     price_target=kwargs.get("price_target"),
-                    run_id=kwargs.get("run_id"),
+                    run_id=run_id,
+                    **execution,
                 )
-                return json.dumps(
-                    {"status": "ok", "entry_id": entry["id"], "entry": entry},
-                    ensure_ascii=False,
-                )
+                result: dict[str, Any] = {
+                    "status": "ok",
+                    "entry_id": entry["id"],
+                    "entry": entry,
+                }
+                # Paper-trading execution hook (Task 5): translate the
+                # just-journaled decision into a paper order. Never fails the
+                # append — maybe_execute_paper catches everything and returns
+                # None fast when VIBE_PAPER_ENABLED is falsy, in which case
+                # the paper_execution key is omitted entirely (not null).
+                from src.paper.hook import maybe_execute_paper
+
+                paper_execution = maybe_execute_paper(entry)
+                if paper_execution is not None:
+                    result["paper_execution"] = paper_execution
+                return json.dumps(result, ensure_ascii=False, default=str)
 
             if action == "resolve_due":
                 benchmark = os.getenv(BENCHMARK_ENV, journal.DEFAULT_BENCHMARK)
@@ -198,8 +298,12 @@ class DecisionJournalTool(BaseTool):
                     ensure_ascii=False,
                 )
 
+            if action == "pnl":
+                return self._pnl(kwargs, journal)
+
             return self._err(
-                f"Unknown action {action!r}. Valid: append, resolve_due, reflect, lessons, list"
+                "Unknown action {0!r}. Valid: append, resolve_due, reflect, lessons, "
+                "list, pnl".format(action)
             )
         except KeyError as exc:
             return self._err(str(exc))
@@ -207,3 +311,59 @@ class DecisionJournalTool(BaseTool):
     @staticmethod
     def _err(message: str) -> str:
         return json.dumps({"status": "error", "error": message}, ensure_ascii=False)
+
+    def _pnl(self, kwargs: dict[str, Any], journal: Any) -> str:
+        """Handle action='pnl'. Instructive (not an error) when nothing was
+        actually traded: 'not executed — no paper-trading data'."""
+        decision_id = kwargs.get("decision_id")
+        symbol = kwargs.get("symbol")
+        if not decision_id and not symbol:
+            return self._err("pnl requires decision_id or symbol")
+
+        from src.paper.pnl import decision_pnl
+        from src.paper.store import PaperStore, paper_root
+
+        store = PaperStore(paper_root())
+
+        if decision_id:
+            result = decision_pnl(decision_id, store=store)
+            if result.get("executed"):
+                return json.dumps({"status": "ok", **result}, ensure_ascii=False, default=str)
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "decision_id": decision_id,
+                    "executed": False,
+                    # Instructive headline + the function's evidence-bearing
+                    # summary (WHY nothing executed: noop notes such as "sell
+                    # signal with no position", a mandate message, or "price
+                    # unavailable — not executed").
+                    "summary": NOT_EXECUTED_MESSAGE + "\n" + result["summary"],
+                },
+                ensure_ascii=False,
+            )
+
+        # symbol lookup: most recent EXECUTED decision for it, newest first.
+        candidates = [e for e in journal.load_entries() if e.get("symbol") == symbol]
+        candidates.sort(key=lambda e: e.get("decided_at") or "", reverse=True)
+        newest_result: dict | None = None
+        for entry in candidates:
+            result = decision_pnl(entry["id"], store=store)
+            if result.get("executed"):
+                return json.dumps({"status": "ok", **result}, ensure_ascii=False, default=str)
+            if newest_result is None:
+                newest_result = result
+
+        summary = NOT_EXECUTED_MESSAGE
+        if newest_result is not None:
+            # Surface the newest candidate's evidence (noop notes) too.
+            summary += "\n" + newest_result["summary"]
+        return json.dumps(
+            {
+                "status": "ok",
+                "symbol": symbol,
+                "executed": False,
+                "summary": summary,
+            },
+            ensure_ascii=False,
+        )
