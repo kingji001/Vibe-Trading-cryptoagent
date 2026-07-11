@@ -4379,6 +4379,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Required to actually archive + reset (refuses otherwise)",
     )
 
+    ops_parser = subparsers.add_parser("ops", help="72h supervised-run evidence")
+    ops_subparsers = ops_parser.add_subparsers(dest="ops_command")
+
+    ops_report_parser = ops_subparsers.add_parser(
+        "report", help="Generate the cross-referenced 72h evidence report"
+    )
+    ops_report_parser.add_argument(
+        "--window", dest="ops_window", default=None,
+        help="Window duration, e.g. 72h or 3d (default: since the last supervisor start event)",
+    )
+    ops_report_parser.add_argument(
+        "--json", dest="ops_json", action="store_true", help="Print machine-readable JSON"
+    )
+
     connector_parser = subparsers.add_parser("connector", help="Manage trading connector profiles")
     connector_subparsers = connector_parser.add_subparsers(dest="connector_command")
 
@@ -5013,6 +5027,108 @@ def cmd_paper_reset(*, confirm: bool = False) -> int:
     return EXIT_SUCCESS
 
 
+def cmd_ops_report(*, window: Optional[str] = None, json_mode: bool = False) -> int:
+    """Build the cross-referenced 72h evidence report and print a summary.
+
+    Resolves the five injectable sources from the same env vars the rest of
+    the CLI already honors -- ``VIBE_OPS_ROOT`` (default ``~/.vibe-trading/ops``),
+    the swarm run store (``agent/.swarm/runs``, same as ``--swarm-list``),
+    ``VIBE_PAPER_ROOT`` (via ``src.paper.store.paper_root``), and the
+    committee journal (via ``src.committee.journal.journal_path``) -- then
+    calls the pure ``build_evidence_report``. ``VIBE_OPS_HEARTBEAT_S`` and
+    ``VIBE_COMMITTEE_SCHEDULE`` are read once here as fallback/expected-cron
+    inputs; core evidence logic itself never reads the environment.
+
+    Writes the Markdown report to ``$VIBE_OPS_ROOT/report-<UTC-ts>.md`` and
+    prints a one-screen terminal summary (or the full JSON with --json).
+    """
+    from datetime import datetime, timezone
+
+    from src.committee.journal import journal_path as committee_journal_path
+    from src.ops.evidence import (
+        build_evidence_report,
+        default_window_start,
+        parse_window_duration,
+        render_markdown,
+        report_filename,
+    )
+    from src.paper.store import paper_root
+
+    ops_root_env = os.environ.get("VIBE_OPS_ROOT", "").strip()
+    ops_root = Path(ops_root_env).expanduser() if ops_root_env else Path.home() / ".vibe-trading" / "ops"
+    now = datetime.now(timezone.utc)
+
+    if window:
+        try:
+            duration = parse_window_duration(window)
+        except ValueError as exc:
+            console.print(f"[red]{rich_escape(str(exc))}[/red]")
+            return EXIT_USAGE_ERROR
+        window_start = now - duration
+        window_start_source = f"explicit --window {window}"
+    else:
+        window_start, window_start_source = default_window_start(ops_root, now)
+
+    heartbeat_interval_s = float(os.environ.get("VIBE_OPS_HEARTBEAT_S", "").strip() or 60)
+    committee_schedule = os.environ.get("VIBE_COMMITTEE_SCHEDULE", "").strip() or None
+
+    report = build_evidence_report(
+        window_start,
+        now,
+        ops_root=ops_root,
+        swarm_runs_root=SWARM_DIR,
+        paper_root=paper_root(),
+        journal_path=committee_journal_path(),
+        heartbeat_interval_s=heartbeat_interval_s,
+        committee_schedule=committee_schedule,
+        window_start_source=window_start_source,
+        generated_at=now,
+    )
+
+    markdown = render_markdown(report)
+    ops_root.mkdir(parents=True, exist_ok=True)
+    report_path = ops_root / report_filename(now)
+    report_path.write_text(markdown, encoding="utf-8")
+
+    if json_mode:
+        print(json.dumps(report, indent=2))
+        return EXIT_SUCCESS
+
+    verdict = report["verdict"]
+    style = "green" if verdict["status"] == "UNINTERRUPTED" else "red"
+    w = report["window"]
+    console.print(
+        Panel(
+            f"[{style}]{verdict['status']}[/{style}]\n"
+            f"Window: {w['start']} .. {w['end']} ({w['start_source']})",
+            title="72h Evidence Report",
+            border_style=style,
+        )
+    )
+    if verdict["reasons"]:
+        console.print("[bold]Reasons:[/bold]")
+        for reason in verdict["reasons"]:
+            console.print(f"  - {rich_escape(reason)}")
+
+    hb = report["heartbeat"]
+    uptime = f"{hb['uptime_pct']:.2f}%" if hb.get("uptime_pct") is not None else "n/a"
+    max_gap = f"{hb['max_gap_s']:.0f}s" if hb.get("max_gap_s") is not None else "n/a"
+    console.print(
+        f"Heartbeat: {uptime} uptime ({hb.get('total_rows', 0)} rows), max gap {max_gap} "
+        f"(interval {hb.get('interval_s', 0):.0f}s, {hb.get('interval_source', 'n/a')})"
+    )
+    sup = report["supervisor"]
+    console.print(f"Supervisor: {sup.get('restart_count')} restart(s)")
+    sched = report["scheduled_firings"]
+    if sched.get("configured"):
+        console.print(
+            f"Scheduled firings: {len(sched.get('actual_runs', []))} actual / "
+            f"{len(sched.get('expected', []))} expected ({len(sched.get('missing', []))} missing)"
+        )
+    console.print(f"[dim]Full report written to[/dim] {report_path}")
+    return EXIT_SUCCESS
+
+
 def cmd_init() -> int:
     """Interactive setup: create ~/.vibe-trading/.env."""
     console.print(Panel("[bold cyan]Vibe-Trading setup[/bold cyan]\n[dim]Configure the default LLM provider and data tokens.[/dim]", border_style="cyan"))
@@ -5478,6 +5594,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.paper_command == "reset":
             return _coerce_exit_code(cmd_paper_reset(confirm=args.paper_confirm))
         console.print("[red]paper requires a subcommand.[/red] Try: vibe-trading paper status")
+        return EXIT_USAGE_ERROR
+    if args.command == "ops":
+        if args.ops_command == "report":
+            return _coerce_exit_code(cmd_ops_report(window=args.ops_window, json_mode=args.ops_json))
+        console.print("[red]ops requires a subcommand.[/red] Try: vibe-trading ops report")
         return EXIT_USAGE_ERROR
     if args.command == "memory":
         if args.memory_command == "list":
