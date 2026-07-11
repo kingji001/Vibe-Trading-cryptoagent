@@ -64,8 +64,7 @@ unset every seat falls back to the run's global `LANGCHAIN_MODEL_NAME`.
 ## Running the committee
 
 Variables: `target` (loader-format symbol, e.g. `BTC-USDT`) and `timeframe`
-(decision horizon, e.g. `72h swing`). Example (`agent/src/tools/swarm_tool.py`
-ships this exact pair as the preset's example vars):
+(decision horizon, e.g. `72h swing`):
 
 ```bash
 # CLI (interactive)
@@ -74,6 +73,25 @@ ships this exact pair as the preset's example vars):
 # CLI (one-shot prompt through the main agent, which calls run_swarm)
 vibe-trading run -p "Run the crypto_committee swarm on BTC-USDT for a 72h swing decision."
 ```
+
+When calling via the `run_swarm` agent tool, the instrument can be supplied
+two ways (`agent/src/tools/swarm_tool.py`):
+
+- **Structured (binding):** the optional `variables` tool parameter, e.g.
+  `run_swarm(preset_name="crypto_committee", variables={"target":
+  "ETH-USDT", "timeframe": "72h swing"}, prompt=...)`. Keys are validated
+  against the preset's declared variables (a typo'd key errors instead of
+  being silently ignored) and take precedence over prompt extraction.
+- **Prose:** phrasing the prompt as `... swarm on <SYMBOL> for a
+  <TIMEFRAME> decision.` (the exact sentence in the CLI example above).
+
+A run_swarm call that supplies **neither** — no `variables.target` and no
+`on <SYMBOL>` phrasing — errors with an instructive message instead of
+assuming BTC-USDT. This is intentional anti-wrong-asset behavior: a
+silently-defaulted `target` means 13 seats analyze and a PM journals a
+binding rating for an asset nobody asked about, the exact failure mode the
+identity anchor below fails fast on. An unstated `timeframe` still defaults
+to `72h swing` (a horizon default cannot select the wrong asset).
 
 `target` doubles as the preset's **identity anchor** (see below) — it is not
 free-text framing, it is the one instrument all 13 seats analyze and vote on.
@@ -442,6 +460,123 @@ Read this before treating paper PnL as a strategy backtest:
 - **Reflection prompt size.** PnL-aware reflection adds one compact block per
   resolved decision to the reflection officer's prompt — a modest but
   nonzero token-budget cost.
+
+## Cadence
+
+Two-tier deployment: an intraday `paper-trading-tick` job for cheap,
+mechanical risk management, and a separate, explicitly-scheduled
+`committee-run` job for the expensive full 13-seat analysis. Recommended
+config:
+
+```bash
+# Tick every 2 hours on confirmed 1H bars (stops/take-profits, mark-to-market)
+VIBE_PAPER_TICK_SCHEDULE="30 */2 * * *"
+VIBE_PAPER_TICK_INTERVAL=1H
+# Full committee once or twice a day, per symbol
+VIBE_COMMITTEE_SCHEDULE="0 8 * * *"
+VIBE_COMMITTEE_SYMBOLS=BTC-USDT,ETH-USDT
+VIBE_COMMITTEE_TIMEFRAME="72h swing"
+```
+
+Rationale in one sentence: the tick is deterministic/LLM-free (or a single
+cheap tool call) so it can run every couple of hours to react to intraday
+stops and moves, while the committee spends 13 seats of LLM budget per
+symbol per run, so it stays on a coarser, explicitly opt-in cadence (1-2x/day)
+to keep quota spend proportional to how often the full debate actually needs
+to re-litigate a position.
+
+`committee-run` (`agent/src/api/scheduled_routes.py::_ensure_committee_run_job`)
+is registered ONLY when `VIBE_COMMITTEE_SCHEDULE` is set — unlike the daily
+reflection/paper-tick jobs, there is no built-in default schedule for it,
+since it is the expensive tier. `VIBE_COMMITTEE_SYMBOLS` (comma list, default
+`BTC-USDT`) and `VIBE_COMMITTEE_TIMEFRAME` (default `72h swing`) are read
+**once, at registration time**, and baked verbatim into the job's prompt —
+per symbol, the prompt calls `run_swarm(preset_name="crypto_committee",
+variables={"target": "<SYMBOL>", "timeframe": "<TIMEFRAME>"}, prompt="Run
+the crypto_committee swarm on <SYMBOL> for a <TIMEFRAME> decision.")`,
+serially, reporting each run's id and the portfolio manager's final rating
+(or the failure, if a run errors — the job continues to the next symbol
+rather than fabricating a result). The structured `variables` object is the
+binding channel (validated, wins over prompt extraction — see "Running the
+committee" above), so multi-symbol correctness does not depend on the
+scheduling agent reproducing the prose sentence verbatim; symbols must be
+loader-format hyphenated pairs (`BTC-USDT`, not `BTC` or `BTCUSDT`). Because registration is non-clobbering
+(same idempotent contract as every other `_ensure_*` job in that module), a
+later change to `VIBE_COMMITTEE_SYMBOLS` or `VIBE_COMMITTEE_TIMEFRAME` has
+**no effect** on an already-registered job — delete it (so a restart
+re-registers it with the new env) or hand-edit its persisted prompt to
+change the symbol universe or horizon.
+
+### Event trigger (ad-hoc committee runs)
+
+Between scheduled committee runs, a deterministic, LLM-free check
+(`agent/src/paper/events.py::check_events`) runs inside **every** paper tick —
+no extra scheduled job. For each watched symbol (open positions ∪
+`VIBE_COMMITTEE_SYMBOLS`) it fetches the live price and funding rate via the
+same snapshot fetchers the committee uses and flags the symbol when either:
+
+- `|price − reference| / |reference| ≥ VIBE_EVENT_PRICE_MOVE_PCT` percent
+  (default `5`; `0` disables). The reference is resolved in order: the last
+  committee decision's execution price for that symbol (its paper ledger
+  fill's `fill_price`, else the journal entry's `ref_price`) → else the
+  previous tick's stored price → else no price trigger this tick (the observed
+  price is stored so the next tick can compare).
+- `|funding rate| ≥ VIBE_EVENT_FUNDING_ABS` (default `0.001` = 0.1%/8h; `0`
+  disables).
+
+A flagged symbol lands in the tick result's `event_triggers`
+(`{symbol, reason, metric, value, threshold}`), which the `paper_tick` tool
+surfaces; the `paper-trading-tick` job prompt then fires one ad-hoc
+`run_swarm(preset_name="crypto_committee", variables={"target": "<SYMBOL>",
+"timeframe": "<VIBE_COMMITTEE_TIMEFRAME>"})` per flagged symbol — the same
+structured, binding `variables` channel as the scheduled committee job. Those
+ad-hoc runs journal and execute through the existing loop unchanged. A
+per-symbol cooldown (`VIBE_EVENT_COOLDOWN_H`, default `12`, persisted in
+`tick_state.json` under `last_event_trigger_ts`) means a **sustained** move
+triggers exactly once — a symbol still inside its cooldown window is not
+re-flagged, regardless of whether the agent acted on the earlier trigger. A
+live price/funding fetch failure for a symbol records an error in the tick
+result and yields no trigger for it (never invent a price).
+
+Because `VIBE_EVENT_PRICE_MOVE_PCT` defaults ON, a plain paper deployment now
+writes `tick_state.json` (event bookkeeping only; the bar watermark stays empty
+in 1D mode) even without intraday mode — set both thresholds to `0` to fully
+disable the event path.
+
+**Honest limit:** the reference is decision-time or last-tick, so a fast spike
+that fully reverses *within* the tick interval is invisible by design (no order
+book, no sub-tick sampling). The cooldown is the *only* rate limiter, so
+worst-case an event fires ~2 extra committee runs per symbol per day at the 12h
+default — ad-hoc runs consume the same LLM quota as scheduled ones.
+
+**Reference-price semantics (read before tuning cooldown/thresholds):**
+
+- A symbol still inside its cooldown window is skipped entirely — no fetch,
+  no trigger, and (by design) no `last_price` refresh. So once the cooldown
+  elapses, the NEXT move is measured from the price at the moment the
+  cooldown-starting trigger fired, not from wherever the price drifted to
+  during the cooldown window. This is intended: it keeps the "sustained move
+  triggers once" guarantee simple (one stored reference per cooldown cycle)
+  rather than silently re-basing the comparison point on every skipped tick.
+- A symbol that temporarily leaves the watched set (open positions ∪
+  `VIBE_COMMITTEE_SYMBOLS`) and later rejoins, with no committee decision
+  journaled for it in the meantime, falls back to whatever `last_price` was
+  last stored for it — which may be stale by however long it was unwatched.
+  The first tick after it rejoins can therefore fire one spurious trigger
+  compared against an old price; the cooldown then bounds it to at most one
+  such false positive per re-entry.
+
+**Upgrade note (existing deployments):** `_ensure_paper_trading_tick_job`
+registration is non-clobbering — like every other `_ensure_*` job in
+`scheduled_routes.py`, a `paper-trading-tick` job that already exists (from a
+server started before this event-trigger + run_swarm follow-up was added, e.g.
+the paper-trading-loop branch) is left untouched by an upgrade. Its OLD prompt
+never looks at `event_triggers`, so after upgrading the code, `run_tick` keeps
+computing triggers but nothing ever acts on them — a silent, easy-to-miss gap.
+Operators upgrading from that branch must **delete the `paper-trading-tick`
+job once** (`DELETE /scheduled-runs/paper-trading-tick`); the next restart
+re-registers it with the current, event-aware prompt (see
+`_build_paper_tick_prompt`).
 
 ## Debate rounds
 

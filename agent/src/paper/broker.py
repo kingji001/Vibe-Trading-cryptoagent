@@ -134,19 +134,25 @@ def _parse_iso(value: object) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-# Daily conditional bars cover a one-UTC-day period starting at the bar ts.
+# Default conditional-bar period: one UTC day (1D tick). The 1H intraday tick
+# passes ``bar_period=timedelta(hours=1)`` so the entry-partial-bar skip shrinks
+# the unprotected entry window from <=1 day to <=1 hour.
 _BAR_PERIOD = timedelta(days=1)
 
 
-def bar_status_vs_entry(opened_at: object, bar_ts: object) -> str:
-    """Classify a daily bar relative to a position's entry (review C2).
+def bar_status_vs_entry(
+    opened_at: object, bar_ts: object, period: timedelta = _BAR_PERIOD
+) -> str:
+    """Classify a bar relative to a position's entry (review C2).
 
+    ``period`` is the bar's duration (1 day for the 1D tick, 1 hour for the 1H
+    intraday tick) and defaults to one day so existing callers are unchanged.
     Returns one of:
       - ``"evaluate"``  — the bar's whole period is AFTER entry (first full bar
         after the fill); conditional stops/TPs may be evaluated;
       - ``"entry_day"`` — the bar's period CONTAINS ``opened_at`` (the partially
-        overlapping entry-day bar); skipped, conservatively, so pre-entry price
-        action within the entry day cannot fire a fictitious stop/TP;
+        overlapping entry bar); skipped, conservatively, so pre-entry price
+        action within the entry period cannot fire a fictitious stop/TP;
       - ``"pre_entry"`` — the bar's period ended before ``opened_at`` (entirely
         before the fill); skipped.
 
@@ -159,7 +165,7 @@ def bar_status_vs_entry(opened_at: object, bar_ts: object) -> str:
         return "evaluate"
     if start > opened:
         return "evaluate"
-    if start + _BAR_PERIOD <= opened:
+    if start + period <= opened:
         return "pre_entry"
     return "entry_day"
 
@@ -422,9 +428,17 @@ class PaperBroker:
         return entry
 
     # -- conditional orders (stop / take-profit), evaluated on the daily tick #
-    def evaluate_conditionals(self, symbol: str, bar: dict) -> list[dict]:
-        """Evaluate stop/take-profit triggers for ``symbol`` against one daily
+    def evaluate_conditionals(
+        self, symbol: str, bar: dict, *, bar_period: timedelta = _BAR_PERIOD
+    ) -> list[dict]:
+        """Evaluate stop/take-profit triggers for ``symbol`` against one
         ``bar`` (``{"open", "high", "low", "close", "ts"}``) and execute fills.
+
+        ``bar_period`` is the bar's duration for the entry-partial-bar skip
+        (defaults to one day for the 1D tick; the 1H intraday tick passes
+        one hour). Multi-bar 1H evaluation calls this once per bar in
+        chronological order — each call reloads positions, so a stop that
+        closed the position in an earlier bar makes later bars a clean no-op.
 
         Binding fill rules (t3 brief / design spec §3.1):
           - stop triggers when ``bar["low"] <= stop``; fills at ``bar["open"]``
@@ -454,7 +468,9 @@ class PaperBroker:
         # entry. Bars that ended before entry, and the partially-overlapping
         # entry-day bar, are skipped so pre-entry price action within the entry
         # day can never fire a fictitious stop/TP (run_tick surfaces the note).
-        if bar_status_vs_entry(held.get("opened_at"), bar.get("ts")) != "evaluate":
+        if bar_status_vs_entry(
+            held.get("opened_at"), bar.get("ts"), bar_period
+        ) != "evaluate":
             return []
 
         open_ = float(bar["open"])

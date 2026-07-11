@@ -122,18 +122,49 @@ def _ensure_decision_journal_job(store) -> None:
 PAPER_TICK_JOB_ID = "paper-trading-tick"
 # 00:30 UTC — after the 00:00 decision-journal reflection job, so a paper
 # position's mark-to-market/conditional-order tick runs once the day's
-# reflections (if any) have already been written.
+# reflections (if any) have already been written. Overridable at INITIAL
+# registration only via VIBE_PAPER_TICK_SCHEDULE (see
+# _ensure_paper_trading_tick_job); the recommended 2-hourly intraday
+# deployment sets "30 */2 * * *" alongside VIBE_PAPER_TICK_INTERVAL=1H.
 PAPER_TICK_JOB_SCHEDULE = "30 0 * * *"
-PAPER_TICK_JOB_PROMPT = (
-    "You are running the scheduled daily paper-trading tick. This is a "
-    "mechanical maintenance run, not a trading decision — do not analyze "
-    "the market and do not call any tool other than the one below.\n\n"
-    "1. Call the paper_tick tool exactly once, with no arguments.\n"
-    "2. Reply with a one-line summary of its result: how many conditional "
-    "fills triggered, the current equity, and how many positions were "
-    "marked stale. If the tool reported any errors, include them verbatim.\n"
-    "Never fabricate results — report exactly what the tool returned."
-)
+_PAPER_TICK_SCHEDULE_ENV = "VIBE_PAPER_TICK_SCHEDULE"
+
+
+def _build_paper_tick_prompt(timeframe: str) -> str:
+    """Build the paper-trading-tick job prompt for a fixed committee timeframe.
+
+    ``timeframe`` (from ``VIBE_COMMITTEE_TIMEFRAME``) is resolved ONCE, at
+    registration, and baked in — same non-clobbering contract as the
+    committee-run job. It is used only in the event-trigger follow-up: when the
+    tick surfaces ``event_triggers``, the agent fires one ad-hoc committee run
+    per flagged symbol, passing the instrument + this horizon through
+    run_swarm's STRUCTURED ``variables`` parameter (the binding channel Task 2
+    added — a missing target now errors; prompt extraction is only a fallback),
+    mirroring the committee-run job's phrasing.
+    """
+    return (
+        "You are running the scheduled paper-trading tick. Steps 1-2 are a "
+        "mechanical maintenance run, not a trading decision.\n\n"
+        "1. Call the paper_tick tool exactly once, with no arguments.\n"
+        "2. Note its result: how many conditional fills triggered, the current "
+        "equity, how many positions were marked stale, and any errors "
+        "(report errors verbatim — never fabricate).\n"
+        "3. Look at the tool's 'event_triggers' list. If it is EMPTY, do "
+        "nothing further. If it is NON-EMPTY, then for EACH flagged trigger "
+        "call run_swarm with preset_name=\"crypto_committee\", "
+        f'variables={{"target": "<SYMBOL>", "timeframe": "{timeframe}"}}, and '
+        'prompt="Run the crypto_committee swarm on <SYMBOL> for a '
+        f'{timeframe} decision." — substituting <SYMBOL> with the trigger\'s '
+        "'symbol'. These are ad-hoc committee runs fired because the market "
+        "moved materially (the trigger carries the reason/metric/value). Run "
+        "them one at a time; if one fails, report the failure verbatim and "
+        "continue with the next flagged symbol.\n"
+        "4. Reply with a one-line tick summary, then — if you started any "
+        "committee runs — one line per flagged symbol: its run id and the "
+        "trigger reason (or the failure). Report exactly what the tools "
+        "returned; never invent a run id, a rating, or a trigger."
+    )
+
 
 _PAPER_ENABLED_ENV = "VIBE_PAPER_ENABLED"
 
@@ -153,23 +184,182 @@ def _paper_trading_enabled() -> bool:
 
 
 def _ensure_paper_trading_tick_job(store) -> None:
-    """Register the daily paper_tick job if not already persisted.
+    """Register the paper_tick job if not already persisted.
 
     Idempotent and non-clobbering, identical contract to
     ``_ensure_decision_journal_job``: a job that already exists — whatever
     schedule or prompt it currently has, including a user's own edits — is
     left untouched on every subsequent call (e.g. a server restart).
+
+    ``VIBE_PAPER_TICK_SCHEDULE`` (default ``"30 0 * * *"``) sets the cron
+    schedule for the INITIAL registration only. Because registration is
+    non-clobbering, changing that env after the job already exists does NOT
+    rewrite the persisted schedule — the operator must edit the job (or delete
+    it so a restart re-registers it) to change an existing job's cadence.
+
+    UPGRADE NOTE: the same non-clobbering rule means a ``paper-trading-tick``
+    job registered before this module's event-trigger + run_swarm follow-up
+    was added (e.g. one left over from the paper-trading-loop branch) is NOT
+    rewritten by upgrading the code — it keeps its old prompt, which never
+    looks at ``event_triggers``, so events would compute in ``run_tick`` but
+    never be acted on. Operators upgrading from that branch must delete the
+    ``paper-trading-tick`` job once; the next restart re-registers it with the
+    current, event-aware prompt from ``_build_paper_tick_prompt``.
     """
     if store.get(PAPER_TICK_JOB_ID) is not None:
         return
 
     from src.scheduled_research.models import ScheduledResearchJob
 
+    schedule = os.environ.get(_PAPER_TICK_SCHEDULE_ENV, "").strip() or PAPER_TICK_JOB_SCHEDULE
+    # The event-trigger follow-up fires ad-hoc committee runs at the same
+    # horizon the scheduled committee job uses; resolve VIBE_COMMITTEE_TIMEFRAME
+    # once here (non-clobbering — a later env change won't rewrite the prompt).
+    timeframe = os.environ.get(_COMMITTEE_TIMEFRAME_ENV, "").strip() or DEFAULT_COMMITTEE_TIMEFRAME
     store.upsert(
         ScheduledResearchJob(
             id=PAPER_TICK_JOB_ID,
-            prompt=PAPER_TICK_JOB_PROMPT,
-            schedule=PAPER_TICK_JOB_SCHEDULE,
+            prompt=_build_paper_tick_prompt(timeframe),
+            schedule=schedule,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Two-tier-cadence Task 2 — scheduled committee-run job
+#
+# The full 13-seat crypto_committee swarm is expensive (deep-tier LLM calls
+# across 13 seats), so unlike the reflection/paper-tick jobs above it has NO
+# built-in default cadence: it is registered ONLY when the operator opts in
+# by setting VIBE_COMMITTEE_SCHEDULE. Leaving it unset is exactly today's
+# behavior (no committee job at all) — fully additive.
+#
+# VIBE_COMMITTEE_SYMBOLS (comma list, default BTC-USDT) and
+# VIBE_COMMITTEE_TIMEFRAME (default "72h swing") are resolved ONCE, at
+# registration time, into the job's prompt text — see
+# _build_committee_run_prompt. Because registration is non-clobbering (same
+# contract as _ensure_decision_journal_job / _ensure_paper_trading_tick_job),
+# changing either env after the job already exists has NO effect on a
+# subsequent restart; the operator must delete the job (so a restart
+# re-registers it with the new env) or hand-edit its persisted prompt to
+# change the symbol universe or timeframe.
+#
+# The prompt is built as a literal, per-symbol instruction list (not a
+# "for each symbol" natural-language loop) so a scheduled agent turn calls
+# run_swarm(prompt=..., preset_name="crypto_committee") once per symbol with
+# an EXPLICIT "... swarm on <SYMBOL> for a <TIMEFRAME> decision" sentence —
+# this exact phrasing is what src.tools.swarm_tool._build_variables parses
+# to set the crypto_committee preset's {target}/{timeframe} variables (see
+# docs/crypto-committee.md "Running the committee"); it is what the run_swarm
+# agent tool actually understands (it takes only prompt/preset_name, no
+# structured variables argument — verified: SwarmTool.execute always derives
+# variables from prompt text via _build_variables).
+#
+# run_swarm needs no special declaration to reach this job's session: unlike
+# a hypothetical per-session allowlist, src.tools.build_registry registers
+# every BaseTool subclass (including SwarmTool) unconditionally for every
+# session — the same registry the paper-tick job's session already gets
+# (which is how paper_tick reaches it today). Governance (governance_surface
+# = "scheduler") gates *execution*, not registry membership, and defaults to
+# "observe" mode (denies are logged, not blocking) unless the operator has
+# set VIBE_TRADING_GOVERNANCE_MODE=enforce.
+# ---------------------------------------------------------------------------
+
+COMMITTEE_RUN_JOB_ID = "committee-run"
+_COMMITTEE_SCHEDULE_ENV = "VIBE_COMMITTEE_SCHEDULE"
+_COMMITTEE_SYMBOLS_ENV = "VIBE_COMMITTEE_SYMBOLS"
+_COMMITTEE_TIMEFRAME_ENV = "VIBE_COMMITTEE_TIMEFRAME"
+DEFAULT_COMMITTEE_SYMBOLS = "BTC-USDT"
+DEFAULT_COMMITTEE_TIMEFRAME = "72h swing"
+
+
+def _parse_committee_symbols() -> list[str]:
+    """Parse ``VIBE_COMMITTEE_SYMBOLS`` into an ordered, deduped-by-nothing list.
+
+    Comma-separated; each entry is whitespace-stripped, uppercased, and
+    empties (e.g. a trailing comma or double comma) are dropped. Unset/blank
+    -> the single default ``["BTC-USDT"]``.
+
+    Uppercasing matters beyond cosmetics: this symbol list feeds
+    ``_watched_symbols`` (``src/paper/tick.py``), which unions it with open
+    positions' symbols (always stored uppercased, e.g. ``ETH-USDT``) to build
+    the event-trigger watch list. Without normalization here, an operator
+    typo like ``eth-usdt`` would create a second, lowercase identity for the
+    same instrument — a separate cooldown key in ``tick_state.json`` and, in
+    the worst case, duplicate ad-hoc committee runs for what is really one
+    position.
+    """
+    raw = os.environ.get(_COMMITTEE_SYMBOLS_ENV, "")
+    symbols = [s.strip().upper() for s in raw.split(",")]
+    symbols = [s for s in symbols if s]
+    return symbols or [DEFAULT_COMMITTEE_SYMBOLS]
+
+
+def _build_committee_run_prompt(symbols: list[str], timeframe: str) -> str:
+    """Build the committee-run job prompt for a fixed symbol list/timeframe.
+
+    Enumerates every symbol explicitly (not a natural-language "for each")
+    so the instruction is unambiguous. Each step passes the instrument and
+    horizon through run_swarm's structured ``variables`` parameter — the
+    binding channel, validated against the preset and taking precedence
+    over prompt extraction — so multi-symbol correctness never depends on
+    the scheduling LLM reproducing the prose template verbatim. The prose
+    "... swarm on <SYMBOL> for a <TIMEFRAME> decision" sentence is kept
+    alongside for human readability (and as a redundant extraction path).
+    """
+    steps = "\n".join(
+        f'{i}. Call run_swarm with preset_name="crypto_committee", '
+        f'variables={{"target": "{symbol}", "timeframe": "{timeframe}"}}, and '
+        f'prompt="Run the crypto_committee swarm on {symbol} for a '
+        f'{timeframe} decision." Wait for it to finish before moving on.'
+        for i, symbol in enumerate(symbols, start=1)
+    )
+    return (
+        "You are running the scheduled full crypto investment committee "
+        "cycle. This is a real 13-seat analysis + binding decision run for "
+        "EACH symbol below, not a mechanical maintenance task.\n\n"
+        "Do the following steps IN ORDER, one symbol at a time:\n\n"
+        f"{steps}\n\n"
+        "After each run_swarm call completes, note its run id and the "
+        "portfolio manager's final rating (or, if the run failed or timed "
+        "out, the failure reported) before starting the next symbol. If one "
+        "symbol's run fails, report the failure verbatim and continue with "
+        "the NEXT symbol — do not stop the whole job and do not fabricate a "
+        "run id or rating for a run that did not actually complete.\n\n"
+        "When every symbol above is done, reply with one line per symbol: "
+        "the run id and final rating, or the failure reason. Report exactly "
+        "what run_swarm returned — never invent a result."
+    )
+
+
+def _ensure_committee_run_job(store) -> None:
+    """Register the committee-run job if not already persisted.
+
+    Registered ONLY when ``VIBE_COMMITTEE_SCHEDULE`` is set (non-empty after
+    stripping) — unset means no job at all, unlike the reflection/paper-tick
+    jobs which have a built-in default schedule. Idempotent and
+    non-clobbering, identical contract to the other ``_ensure_*`` jobs in
+    this module: a job that already exists (whatever schedule or prompt it
+    currently has, including a user's own edits) is left untouched on every
+    subsequent call. ``VIBE_COMMITTEE_SYMBOLS``/``VIBE_COMMITTEE_TIMEFRAME``
+    are read once, here, at registration time — see the module comment above
+    for why changing them later requires deleting (or hand-editing) the job.
+    """
+    schedule = os.environ.get(_COMMITTEE_SCHEDULE_ENV, "").strip()
+    if not schedule:
+        return
+    if store.get(COMMITTEE_RUN_JOB_ID) is not None:
+        return
+
+    from src.scheduled_research.models import ScheduledResearchJob
+
+    symbols = _parse_committee_symbols()
+    timeframe = os.environ.get(_COMMITTEE_TIMEFRAME_ENV, "").strip() or DEFAULT_COMMITTEE_TIMEFRAME
+    store.upsert(
+        ScheduledResearchJob(
+            id=COMMITTEE_RUN_JOB_ID,
+            prompt=_build_committee_run_prompt(symbols, timeframe),
+            schedule=schedule,
         )
     )
 
@@ -244,10 +434,12 @@ def _start_scheduled_research_executor() -> None:
     """Start scheduled research execution when explicitly enabled.
 
     Also registers the Phase 6 decision-journal reflection job (idempotent)
-    so daily resolve_due + reflect runs regardless of committee activity, and
-    — when paper trading is also enabled — the Task 5 paper-trading-tick job
-    (idempotent) so conditional orders and equity mark-to-market advance
-    daily too.
+    so daily resolve_due + reflect runs regardless of committee activity, the
+    Task 5 paper-trading-tick job (idempotent, when paper trading is also
+    enabled) so conditional orders and equity mark-to-market advance daily
+    too, and — when VIBE_COMMITTEE_SCHEDULE is set — the two-tier-cadence
+    committee-run job (idempotent) so the full committee runs on its own
+    configured cadence independent of committee activity.
     """
     if not _scheduled_research_scheduler_enabled():
         return
@@ -255,6 +447,7 @@ def _start_scheduled_research_executor() -> None:
     _ensure_decision_journal_job(store)
     if _paper_trading_enabled():
         _ensure_paper_trading_tick_job(store)
+    _ensure_committee_run_job(store)
     _get_scheduled_research_executor().start()
 
 
