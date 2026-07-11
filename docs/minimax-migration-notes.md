@@ -446,3 +446,31 @@ written). Treat the journal as what it is: a way to make decision quality
 *observable over time*, not a one-shot verdict after two weeks. If a cutover
 decision is made on this window, keep collecting journal data afterward and
 revisit the comparison once a materially larger sample has accrued.
+
+## Token Plan quota mechanics (researched 2026-07-11)
+
+Decision-relevant findings for choosing committee cadence (sources: platform.minimax.io
+token-plan intro/FAQ/rate-limits/pricing; GitHub MiniMax-M2.7 issue #36; secondary
+launch coverage — per-tier window caps are NOT officially published):
+
+- Quota = one shared usage bar per plan, governed by a 5-hour window + weekly window.
+  Empirically the 5-hour windows appear CLOCK-ALIGNED (~00/05/10/15/20 UTC resets),
+  not smoothly rolling — a window-exhaustion 429 can mean waiting until the next
+  boundary (up to ~5h), unlike burst rate-limit 429s (~1 min reset). Note: our stream
+  backoff caps at 90s, so window exhaustion will exhaust retries and fail the task —
+  by design (task retry/resume applies); do not raise the cap to bridge 5h waits.
+- Window-exhaustion 429s have carried an explicit reset timestamp/countdown in the
+  field (honored by our Retry-After handling when within the 90s cap).
+- Approximate monthly allowances (directional, launch coverage): Plus ≈1.7B,
+  Max ≈4.5–5.1B, Ultra ≈9.8B tokens. At ~650k tokens per committee run, monthly
+  tokens never bind — the 5-hour window is the real gate (cap unpublished).
+- A 2-hourly committee cadence (12 runs/day) places ≤3 runs (~2–2.4M tokens) in any
+  5-hour window — estimated ~20% of even Plus's proportional per-window budget, so
+  all tiers should sustain it; Plus has the thinnest margin and only ~3–4 agent
+  concurrency during the weekday 15:00–17:30 peak window — schedule around that
+  window on Plus. Max is the comfortable tier for 12×/day.
+- Quota drain is effectively price-weighted per model; M3 requests whose context
+  exceeds 512K tokens bill at 2× — keep committee context under that.
+- Unverifiable from public docs: exact per-tier window caps; any surviving
+  request/prompt cap from the legacy Coding Plan. The live console usage bar plus
+  our per-run token telemetry (VIBE_RUN_TOKEN_BUDGET_WARN) reveal both passively.
