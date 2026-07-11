@@ -30,6 +30,15 @@
 #                         substitute a stub server/crash binary. Parsed by
 #                         `bash -c`, so normal shell quoting works, e.g.
 #                         VIBE_OPS_SERVE_CMD='python -c "import sys; sys.exit(7)"'.
+#                         When set, `start` prints a loud TEST SEAM warning
+#                         (stderr + run72.log) and the supervisor start event
+#                         carries "serve_cmd_overridden":true so the evidence
+#                         report can flag stub runs.
+#
+# Process-group kill: the serve child is launched under bash job control
+# (`set -m`) so it owns a fresh process group (macOS has no setsid); stop
+# TERMs the whole group (`kill -- -$pid`), falling back to a single-PID kill,
+# so compound serve commands cannot leave orphaned descendants.
 #
 # Artifacts (all written under VIBE_OPS_ROOT):
 #   run72.pid          PID of the running supervisor process.
@@ -100,6 +109,12 @@ append_supervisor_event() {
   line="{\"ts\":\"$(now_iso)\",\"event\":\"$event\""
   if [ "$event" = "start" ]; then
     line="$line,\"serve_cmd\":\"$(_json_escape "$SERVE_CMD")\""
+    if [ -n "${VIBE_OPS_SERVE_CMD:-}" ]; then
+      # Self-incriminating evidence: a run against a stubbed server must be
+      # flaggable by `vibe-trading ops report`. Key present only when the
+      # test seam is active.
+      line="$line,\"serve_cmd_overridden\":true"
+    fi
     line="$line,\"env_fingerprint\":$(env_fingerprint_json)"
   fi
   if [ -n "$exit_code" ]; then
@@ -149,6 +164,13 @@ supervise_loop() {
     # word-splitting) so operator/test-supplied commands with quoted
     # arguments parse correctly, e.g. VIBE_OPS_SERVE_CMD='python -c "import
     # sys; sys.exit(7)"'.
+    #
+    # `set -m` (bash job control) around the launch puts the serve child in
+    # its OWN process group — macOS ships no setsid — so stop/restart can
+    # TERM the entire descendant tree via `kill -- -$pid` (pgid == child
+    # pid). Without this, a compound serve command would leave orphans: a
+    # single-PID kill only reaches the top wrapper process.
+    set -m
     if command -v caffeinate >/dev/null 2>&1; then
       caffeinate -dims bash -c "$SERVE_CMD" &
     else
@@ -156,6 +178,7 @@ supervise_loop() {
       bash -c "$SERVE_CMD" &
     fi
     CURRENT_SERVE_PID=$!
+    set +m
 
     exit_code=0
     wait "$CURRENT_SERVE_PID" || exit_code=$?
@@ -173,10 +196,19 @@ supervise_loop() {
   append_supervisor_event "stop"
 }
 
+kill_serve_tree() {
+  # Terminate the serve child's entire process group (it got its own pgid
+  # via `set -m` at launch, and descendants inherit it); fall back to the
+  # single-PID kill if the group signal fails for any reason.
+  local pid="$1"
+  [ -n "$pid" ] || return 0
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+}
+
 _on_terminate() {
   touch "$STOP_FLAG"
   if [ -n "$CURRENT_SERVE_PID" ]; then
-    kill "$CURRENT_SERVE_PID" 2>/dev/null || true
+    kill_serve_tree "$CURRENT_SERVE_PID"
   fi
   if [ -n "$HEARTBEAT_PID" ]; then
     kill "$HEARTBEAT_PID" 2>/dev/null || true
@@ -196,6 +228,14 @@ _supervisor_main() {
 
 start() {
   mkdir -p "$OPS_ROOT"
+  if [ -n "${VIBE_OPS_SERVE_CMD:-}" ]; then
+    # Loud, twice-recorded, and stamped into the start event
+    # (serve_cmd_overridden:true): an evidence run against a stub must be
+    # self-incriminating.
+    local seam_warning="[warn] TEST SEAM ACTIVE — not running the real server (VIBE_OPS_SERVE_CMD is set)"
+    echo "$seam_warning" >&2
+    echo "$seam_warning" >> "$RUN_LOG"
+  fi
   if [ -f "$PID_FILE" ]; then
     local existing_pid
     existing_pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
