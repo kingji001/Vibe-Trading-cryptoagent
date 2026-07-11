@@ -653,6 +653,88 @@ def test_startup_grace_horizon_is_configurable(fx):
     assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
 
 
+def _sup_stop(ts: str) -> dict:
+    return {"ts": ts, "event": "stop"}
+
+
+def test_probe_p3_stop_start_cycle_inside_explicit_window_degrades(fx):
+    # Adversarial probe P3: an explicit --window spans a stop + second start.
+    # The downtime slips between heartbeats (delta < 2x interval, the loop is
+    # dead during it so no beats are recorded), the cold-boot ok:false beats
+    # after the second start are startup-graced, and a stop/start cycle
+    # writes NO restart event -- so pre-fix this read UNINTERRUPTED with
+    # empty reasons. Any in-window stop, or any start strictly inside the
+    # window, must degrade: the run was not continuous.
+    fx.window_start = _dt("2026-07-01T00:00:00")
+    fx.window_end = _dt("2026-07-01T04:00:00")
+    _write_jsonl(
+        fx.ops_root / "supervisor.jsonl",
+        [
+            _sup_start("2026-07-01T00:00:00Z"),
+            _sup_stop("2026-07-01T01:59:30Z"),
+            _sup_start("2026-07-01T02:00:00Z"),
+        ],
+    )
+    rows = [_hb_row(f"2026-07-01T00:{m:02d}:00Z") for m in range(60)]  # 00:00..00:59
+    rows += [_hb_row(f"2026-07-01T01:{m:02d}:00Z") for m in range(60)]  # 01:00..01:59
+    # Loop dead during the stop; second start's cold-boot beats, graced:
+    rows += [
+        _hb_row("2026-07-01T02:00:30Z", ok=False, http=None),
+        _hb_row("2026-07-01T02:01:30Z", ok=False, http=None),
+    ]
+    rows += [
+        _hb_row(f"2026-07-01T02:{m:02d}:30Z") for m in range(2, 60)
+    ]  # 02:02:30..02:59:30
+    rows += [_hb_row(f"2026-07-01T03:{m:02d}:30Z") for m in range(60)]  # ..03:59:30
+    _write_jsonl(fx.ops_root / "heartbeat.jsonl", rows)
+
+    report = fx.build()
+    hb = report["heartbeat"]
+    sup = report["supervisor"]
+    # Pre-conditions proving this is exactly the probe's blind spot: the
+    # boot beats were graced, no restart event exists, no delta gap tripped.
+    assert hb["startup_grace_rows"] == 2
+    assert hb["unhealthy_rows"] == 0
+    assert sup["restart_count"] == 0
+    assert not any("heartbeat gap" in r for r in report["verdict"]["reasons"])
+    # ... and the new independent condition catches the cycle anyway:
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+    assert any(
+        "start/stop cycle inside the window" in r and "not continuous" in r
+        for r in report["verdict"]["reasons"]
+    )
+
+
+def test_in_window_stop_event_alone_degrades(fx):
+    # A stop with no second start (operator stopped the run mid-window) is
+    # just as fatal to the continuity claim.
+    _clean_fixture(fx)
+    with (fx.ops_root / "supervisor.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(_sup_stop("2026-07-01T03:00:00Z")) + "\n")
+    report = fx.build(committee_schedule="0 */2 * * *")
+    assert report["verdict"]["status"] == "INTERRUPTED/DEGRADED"
+    assert any("start/stop cycle" in r for r in report["verdict"]["reasons"])
+
+
+def test_window_opening_start_event_does_not_trip_the_cycle_rule(fx):
+    # The DEFAULT window opens AT the last supervisor start event, so a start
+    # exactly at window_start must never count as an interior start -- the
+    # clean-run verdict stays earnable. An earlier start/stop cycle BEFORE
+    # the window is equally irrelevant.
+    _clean_fixture(fx)  # writes the opening start exactly at window_start
+    # Prepend an out-of-window earlier cycle.
+    existing = (fx.ops_root / "supervisor.jsonl").read_text(encoding="utf-8")
+    earlier = (
+        json.dumps(_sup_start("2026-06-30T00:00:00Z"))
+        + "\n"
+        + json.dumps(_sup_stop("2026-06-30T12:00:00Z"))
+        + "\n"
+    )
+    (fx.ops_root / "supervisor.jsonl").write_text(earlier + existing, encoding="utf-8")
+    report = fx.build(committee_schedule="0 */2 * * *")
+    assert report["verdict"] == {"status": "UNINTERRUPTED", "reasons": []}
+
+
 def test_no_supervisor_events_means_no_grace(fx):
     # Without a start/restart anchor there is nothing to grace against: an
     # ok:false first beat stays a real degradation (and the missing

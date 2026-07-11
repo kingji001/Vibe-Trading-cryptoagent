@@ -417,6 +417,15 @@ def build_supervisor_section(
     ``VIBE_OPS_SERVE_CMD`` -- the test seam -- was active). Their presence
     always degrades the verdict: a run against a stub server can never read
     as valid 72h evidence.
+
+    ``stop_events`` and ``interior_start_events`` (starts strictly AFTER
+    ``window_start`` -- the window-opening start, which sits exactly at
+    ``window_start`` for the default window, never counts) exist for the
+    continuity condition in :func:`compute_verdict`: a stop/start cycle
+    inside the window writes no restart event and its downtime can slip
+    between heartbeats while the second start's cold-boot beats are
+    startup-graced -- without this signal, such a cycle would read as
+    uninterrupted (adversarial probe P3).
     """
     path = Path(ops_root) / "supervisor.jsonl"
     if not path.exists():
@@ -428,6 +437,8 @@ def build_supervisor_section(
             "restarts_omitted": 0,
             "start_events": [],
             "overridden_start_events": [],
+            "stop_events": [],
+            "interior_start_events": [],
             "malformed_lines": 0,
         }
 
@@ -437,7 +448,9 @@ def build_supervisor_section(
 
     restarts = [r for r in in_window if r.get("event") == "restart"]
     starts = [r for r in in_window if r.get("event") == "start"]
+    stops = [r for r in in_window if r.get("event") == "stop"]
     overridden_starts = [r for r in starts if r.get("serve_cmd_overridden") is True]
+    interior_starts = [r for r in starts if _parse_ts(r["ts"]) > window_start]
 
     displayed_restarts, restarts_omitted = _cap_events(restarts)
 
@@ -449,6 +462,8 @@ def build_supervisor_section(
         "restarts_omitted": restarts_omitted,
         "start_events": starts,
         "overridden_start_events": overridden_starts,
+        "stop_events": stops,
+        "interior_start_events": interior_starts,
         "malformed_lines": malformed,
     }
 
@@ -779,8 +794,11 @@ def compute_verdict(
     within the grace horizon of a start/restart, before the first healthy
     beat -- are excluded, see ``build_heartbeat_section``), window-edge
     coverage complete (total uncovered edge time <= 2x interval), every
-    expected committee-run firing accounted for, AND no overridden-serve-cmd
-    start events in-window. Any missing/unparseable
+    expected committee-run firing accounted for, no overridden-serve-cmd
+    start events in-window, AND no supervisor stop event or interior start
+    event (a start strictly after ``window_start``) in-window -- a stop/start
+    cycle means the run was not continuous even when its downtime leaves no
+    heartbeat trace and its boot beats are startup-graced. Any missing/unparseable
     source, or any malformed line, also degrades the verdict (never invent
     continuity that can't be verified) -- each condition below flips the
     verdict independently.
@@ -811,6 +829,27 @@ def compute_verdict(
             reasons.append(
                 "supervisor ran with VIBE_OPS_SERVE_CMD override (test seam) at "
                 f"{ts_list} -- a stub-server run cannot count as valid evidence"
+            )
+        # Continuity condition (adversarial probe P3): a clean stop/start
+        # cycle inside the window writes NO restart event, its downtime can
+        # slip between heartbeats (the loop is dead, so no beats record the
+        # hole), and the second start's cold-boot ok:false beats are
+        # startup-graced -- so without this independent check the cycle
+        # reads as uninterrupted. Any in-window stop, or any start OTHER
+        # than the window-opening one (strictly inside the window), fails.
+        stops = supervisor.get("stop_events") or []
+        interior_starts = supervisor.get("interior_start_events") or []
+        if stops or interior_starts:
+            cycle_events = sorted(
+                [("stop", str(e.get("ts", "?"))) for e in stops]
+                + [("start", str(e.get("ts", "?"))) for e in interior_starts],
+                key=lambda pair: pair[1],
+            )
+            shown = ", ".join(f"{kind} at {ts}" for kind, ts in cycle_events[:5])
+            more = f" (+{len(cycle_events) - 5} more)" if len(cycle_events) > 5 else ""
+            reasons.append(
+                "supervisor start/stop cycle inside the window -- the run was "
+                f"not continuous ({shown}{more})"
             )
 
     if not heartbeat.get("available"):
@@ -1022,6 +1061,19 @@ def render_markdown(report: dict[str, Any]) -> str:
     else:
         lines.append(f"- Restart count: {sup['restart_count']}")
         lines.append(f"- Start events: {len(sup['start_events'])}")
+        stops = sup.get("stop_events") or []
+        interior_starts = sup.get("interior_start_events") or []
+        lines.append(f"- Stop events: {len(stops)}")
+        if stops or interior_starts:
+            cycle_bits = sorted(
+                [f"stop at {e.get('ts')}" for e in stops]
+                + [f"start at {e.get('ts')}" for e in interior_starts]
+            )
+            lines.append(
+                "- **Start/stop cycle inside the window** (run not continuous): "
+                + "; ".join(cycle_bits[:10])
+                + (f" (+{len(cycle_bits) - 10} more)" if len(cycle_bits) > 10 else "")
+            )
         lines.append(f"- Malformed lines: {sup['malformed_lines']}")
         if sup["overridden_start_events"]:
             lines.append("")

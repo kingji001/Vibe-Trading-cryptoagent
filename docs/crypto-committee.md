@@ -649,8 +649,19 @@ with the specific broken condition(s) listed otherwise:
   yet means the server never came up — also real; each start/restart opens
   its own fresh grace window; and grace never touches the edge-coverage
   condition below, so it cannot hide a stream that went silent.
-- Window-edge coverage is complete (uncovered time before the first beat or
-  after the last beat is ≤ 2× the interval).
+- Window-edge coverage is complete: the **sum** of the uncovered time before
+  the first beat and after the last beat is ≤ 2× the interval. (Stricter
+  than a per-edge check — two edge holes that are each under threshold still
+  fail together; a single edge hole above the threshold is additionally
+  recorded as a named gap.)
+- No supervisor `stop` event in-window, and no `start` event **other than
+  the one that opens the window** (for the default window that is the last
+  `start` event itself, which sits exactly at the window start; for an
+  explicit `--window`, any start strictly inside the window counts). A clean
+  stop/start cycle writes no `restart` event, its downtime can slip between
+  heartbeats (the loop is dead, so no beats record the hole), and the second
+  start's cold-boot beats are startup-graced — this condition catches the
+  cycle anyway: the run was not continuous.
 - Every expected `committee-run` firing (per the persisted/`VIBE_COMMITTEE_SCHEDULE`
   cron, using the same next-due logic as `agent/src/scheduled_research/executor.py`
   — no parallel cron implementation) is accounted for in the swarm run store.
