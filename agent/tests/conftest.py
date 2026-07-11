@@ -43,13 +43,21 @@ def _paper_env_session_backstop(tmp_path_factory):
     mp = pytest.MonkeyPatch()
     mp.setenv("VIBE_PAPER_ROOT", str(tmp_path_factory.mktemp("paper-session-backstop")))
     mp.setenv("VIBE_PAPER_ENABLED", "0")
+    mp.setenv("VIBE_OPS_ROOT", str(tmp_path_factory.mktemp("ops-session-backstop")))
     yield
     mp.undo()
 
 
 @pytest.fixture(autouse=True)
 def _paper_env_guard(monkeypatch, tmp_path):
-    """Per-test guard: paper executor disabled, store rooted in this test's tmp."""
+    """Per-test guard: paper executor disabled, store rooted in this test's tmp.
+
+    Also pins VIBE_OPS_ROOT (scripts/ops/run72.sh + `vibe-trading ops report`
+    artifacts root) to this test's tmp — same hermeticity rule as
+    VIBE_PAPER_ROOT above: any new env var with filesystem/network side
+    effects gets a guard entry in the same task that introduces it.
+    """
     monkeypatch.setenv("VIBE_PAPER_ROOT", str(tmp_path / "paper-guard"))
     monkeypatch.setenv("VIBE_PAPER_ENABLED", "0")
+    monkeypatch.setenv("VIBE_OPS_ROOT", str(tmp_path / "ops-guard"))
     yield
