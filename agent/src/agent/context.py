@@ -186,7 +186,7 @@ class ContextBuilder:
             )
 
         return _SYSTEM_PROMPT.format(
-            tool_count=len(self.registry._tools),
+            tool_count=len(self.registry.tool_names),
             skill_count=len(self.skills_loader.skills),
             data_source_count=self._count_data_sources(),
             tool_descriptions=self._format_tool_descriptions(),
@@ -250,10 +250,22 @@ class ContextBuilder:
         messages.append({"role": "user", "content": enriched})
         return messages
 
+    def _iter_tools(self):
+        """Yield registered tools via the public registry surface.
+
+        Goes through ``tool_names``/``get`` rather than the raw ToolRegistry's
+        private ``_tools`` dict: SessionService wraps the registry in
+        GovernedToolRegistry, which forwards only the public surface.
+        """
+        for name in self.registry.tool_names:
+            tool = self.registry.get(name)
+            if tool is not None:
+                yield tool
+
     def _format_tool_descriptions(self) -> str:
         """Format tool descriptions."""
         lines = []
-        for tool in self.registry._tools.values():
+        for tool in self._iter_tools():
             params = tool.parameters.get("properties", {})
             required = tool.parameters.get("required", [])
             param_parts = []

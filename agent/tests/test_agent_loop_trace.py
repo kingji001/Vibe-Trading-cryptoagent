@@ -22,9 +22,16 @@ class _Tool:
 
 
 class _SecretRegistry:
-    """Minimal registry returning a JSON result with sensitive fields."""
+    """Minimal registry returning a JSON result with sensitive fields.
 
-    _tools: dict[str, Any] = {}
+    Exposes the registry's public surface (``tool_names``/``get``) rather than
+    a private ``_tools`` dict: ContextBuilder reads tools through that surface
+    so it keeps working when the registry is wrapped in GovernedToolRegistry.
+    """
+
+    @property
+    def tool_names(self) -> list[str]:
+        return []
 
     def get(self, tool_name: str) -> _Tool:
         return _Tool()
