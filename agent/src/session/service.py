@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 # Dedicated thread pool limited to four concurrent agents to avoid exhausting the default executor.
 _AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent")
@@ -190,6 +193,14 @@ class SessionService:
             )
 
         except Exception as exc:
+            # Log, don't just record. The attempt.json + event-bus emit below
+            # reach a UI nobody is watching on an unattended run, so a crashing
+            # agent turn used to leave the server log completely clean -- a
+            # scheduled job would report "completed" (the scheduler only means
+            # "enqueued") while every turn died before its first LLM call.
+            logger.exception(
+                "attempt %s failed for session %s", attempt.attempt_id, session.session_id
+            )
             attempt.mark_failed(error=str(exc))
             self.store.update_attempt(attempt)
             self.event_bus.emit(session.session_id, "attempt.failed", {"attempt_id": attempt.attempt_id, "error": str(exc)})
