@@ -31,6 +31,12 @@ ops = pathlib.Path(os.environ["OPS_ROOT"])
 quiet = os.environ.get("QUIET") == "1"
 alerts, lines = [], []
 
+# In-flight work is not failure. A crypto_committee cycle takes ~25 min (13 seats,
+# 2 concurrent), so a job or swarm younger than this is simply still thinking --
+# alerting on it would fire every cycle and train the reader to ignore the watch.
+# Past the grace it is genuinely stuck and worth waking someone.
+GRACE_MIN = 60
+
 def out(s):
     if not quiet:
         lines.append(s)
@@ -85,16 +91,23 @@ if db.exists():
     c = sqlite3.connect(db)
     cut = ws.timestamp()
     rows = list(c.execute(
-        """SELECT s.title, SUM(CASE WHEN m.role='assistant' THEN 1 ELSE 0 END)
+        """SELECT s.title, s.started_at, SUM(CASE WHEN m.role='assistant' THEN 1 ELSE 0 END)
            FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
            WHERE s.title LIKE 'scheduled-research:%' AND s.started_at >= ?
            GROUP BY s.id""", (cut,)))
-    kinds = Counter(t.split(":", 1)[1] for t, _ in rows)
+    stale_cut = (now - datetime.timedelta(minutes=GRACE_MIN)).timestamp()
+    kinds = Counter(t.split(":", 1)[1] for t, _, _ in rows)
     for kind, n in sorted(kinds.items()):
-        done = sum(r for t, r in rows if t.endswith(kind))
-        out(f"job       : {kind:28} dispatched={n:3} completed={done:3}")
-        if done < n:
-            alerts.append(f"ALERT job: {kind} has {n - done} dispatch(es) with NO agent reply")
+        mine = [(st, r) for t, st, r in rows if t.endswith(kind)]
+        done = sum(r for _, r in mine)
+        inflight = sum(1 for st, r in mine if not r and st >= stale_cut)
+        stuck = sum(1 for st, r in mine if not r and st < stale_cut)
+        suffix = f" in_flight={inflight}" if inflight else ""
+        out(f"job       : {kind:28} dispatched={n:3} completed={done:3}{suffix}")
+        if stuck:
+            alerts.append(
+                f"ALERT job: {kind} has {stuck} dispatch(es) with NO agent reply "
+                f"after {GRACE_MIN}m — the turn died silently")
 
 # --- committee swarms: did the analysis actually finish? ---------------------
 swarms = []
@@ -108,13 +121,19 @@ for d in pathlib.Path("agent/.swarm/runs").glob("swarm-*"):
         continue
     if s.get("preset_name") != "crypto_committee":
         continue
-    if datetime.datetime.fromtimestamp(rj.stat().st_mtime, datetime.timezone.utc) >= ws:
-        swarms.append((d.name, s.get("status")))
-tally = Counter(st for _, st in swarms)
+    mt = datetime.datetime.fromtimestamp(rj.stat().st_mtime, datetime.timezone.utc)
+    if mt >= ws:
+        swarms.append((d.name, s.get("status"), mt))
+tally = Counter(st for _, st, _ in swarms)
 out(f"swarms    : {len(swarms)} committee runs {dict(tally)}")
-for name, st in swarms:
-    if st != "completed":
-        alerts.append(f"ALERT swarm: {name} status={st} — no portfolio decision for that cycle")
+for name, st, mt in swarms:
+    age_min = (now - mt).total_seconds() / 60
+    if st == "completed":
+        continue
+    if st == "running" and age_min < GRACE_MIN:
+        continue  # still deliberating — not a failure
+    reason = "stuck (no progress)" if st == "running" else f"status={st}"
+    alerts.append(f"ALERT swarm: {name} {reason} — no portfolio decision for that cycle")
 
 # --- the regression we fixed: reasoning_content must stay at zero ------------
 hits = 0
