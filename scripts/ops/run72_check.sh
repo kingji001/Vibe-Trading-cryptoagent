@@ -24,7 +24,7 @@ QUIET=0
 cd "$REPO_ROOT" || exit 1
 
 OPS_ROOT="$OPS_ROOT" QUIET="$QUIET" "$PY" - <<'PYEOF'
-import json, os, pathlib, sqlite3, subprocess, sys, datetime
+import json, os, pathlib, re, sqlite3, subprocess, sys, datetime
 from collections import Counter
 
 ops = pathlib.Path(os.environ["OPS_ROOT"])
@@ -174,7 +174,24 @@ try:
     out(f"verdict   : {verdict}")
     if verdict != "UNINTERRUPTED":
         reasons = [l.strip() for l in r.stdout.splitlines() if l.strip().startswith("-")]
-        alerts.append(f"ALERT verdict: {verdict} :: {'; '.join(reasons) or 'see ops report'}")
+
+        # Boundary artifact: for the first ~1-2 min after an even-hour cron
+        # fires, the committee agent has not yet called run_swarm, so ops
+        # report transiently sees the firing as "missing" until the swarm dir
+        # exists. Suppress the page only when EVERY reason is a
+        # missing-firing whose expected time is within the grace window --
+        # a real miss (older, or any non-firing reason) still alerts.
+        def _is_fresh_firing_miss(reason: str) -> bool:
+            m = re.search(r"firing\(s\) missing:\s*([0-9T:\-]+Z)", reason)
+            if not m:
+                return False
+            exp = datetime.datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+            return (now - exp).total_seconds() / 60 < GRACE_MIN
+
+        if reasons and all(_is_fresh_firing_miss(x) for x in reasons):
+            out("          (transient: firing just fired, swarm not yet created — not alerting)")
+        else:
+            alerts.append(f"ALERT verdict: {verdict} :: {'; '.join(reasons) or 'see ops report'}")
 except Exception as exc:
     alerts.append(f"ALERT verdict: ops report failed: {exc}")
 
