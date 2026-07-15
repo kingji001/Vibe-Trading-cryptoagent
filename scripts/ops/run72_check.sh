@@ -37,6 +37,24 @@ alerts, lines = [], []
 # Past the grace it is genuinely stuck and worth waking someone.
 GRACE_MIN = 60
 
+# A failed swarm dir is permanent, but the alert should be edge-triggered: fire
+# once when first seen, not every 5-minute poll for the rest of the run. Persist
+# the set of already-reported failures so a restart of the watch does not replay
+# them. (The verdict/regression checks stay level-triggered on purpose -- those
+# describe the current run state, not a one-time event.)
+SEEN_FILE = ops / ".run72_check_alerted.json"
+try:
+    _seen = set(json.loads(SEEN_FILE.read_text()))
+except Exception:
+    _seen = set()
+_seen_new = set()
+
+def alert_once(key: str, msg: str) -> None:
+    if key in _seen:
+        return
+    _seen_new.add(key)
+    alerts.append(msg)
+
 def out(s):
     if not quiet:
         lines.append(s)
@@ -105,7 +123,8 @@ if db.exists():
         suffix = f" in_flight={inflight}" if inflight else ""
         out(f"job       : {kind:28} dispatched={n:3} completed={done:3}{suffix}")
         if stuck:
-            alerts.append(
+            alert_once(
+                f"job:{kind}:stuck:{stuck}",
                 f"ALERT job: {kind} has {stuck} dispatch(es) with NO agent reply "
                 f"after {GRACE_MIN}m — the turn died silently")
 
@@ -133,7 +152,8 @@ for name, st, mt in swarms:
     if st == "running" and age_min < GRACE_MIN:
         continue  # still deliberating — not a failure
     reason = "stuck (no progress)" if st == "running" else f"status={st}"
-    alerts.append(f"ALERT swarm: {name} {reason} — no portfolio decision for that cycle")
+    alert_once(f"swarm:{name}:{st}",
+               f"ALERT swarm: {name} {reason} — no portfolio decision for that cycle")
 
 # --- the regression we fixed: reasoning_content must stay at zero ------------
 hits = 0
@@ -194,6 +214,12 @@ try:
             alerts.append(f"ALERT verdict: {verdict} :: {'; '.join(reasons) or 'see ops report'}")
 except Exception as exc:
     alerts.append(f"ALERT verdict: ops report failed: {exc}")
+
+if _seen_new:
+    try:
+        SEEN_FILE.write_text(json.dumps(sorted(_seen | _seen_new)))
+    except Exception:
+        pass  # best-effort; a re-alert next poll beats crashing the watch
 
 for l in lines:
     print(l)
