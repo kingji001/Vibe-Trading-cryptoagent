@@ -82,7 +82,7 @@ class _FakeStreamingLLM:
         self._barrier = barrier
         self._hold = hold
 
-    def stream(self, messages: Any, config: Any = None):
+    def stream(self, messages: Any, config: Any = None, **kwargs: Any):
         self._probe.enter()
         try:
             # Sleep while "in flight" so overlapping requests are observable.

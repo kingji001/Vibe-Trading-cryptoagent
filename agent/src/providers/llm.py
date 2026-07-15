@@ -26,6 +26,42 @@ except ImportError:
     ChatOpenAI = None  # type: ignore
 
 
+def _normalize_reasoning(value: Any) -> str:
+    """Collapse any provider reasoning shape to one canonical ``str``.
+
+    An ``additional_kwargs`` value MUST keep a stable type across every chunk of
+    a stream: ``langchain_core.utils._merge.merge_dicts`` raises TypeError when
+    one key arrives as two different types, and it does so inside LangChain's own
+    ``merge_chat_generation_chunks`` -- before any of our code sees the chunks,
+    so it cannot be caught downstream. The only fix is to never emit two types.
+
+    Providers disagree on the shape: Moonshot/DeepSeek send ``reasoning_content``
+    (str), OpenRouter relays ``reasoning`` (str), and MiniMax M3 (reasoning_split)
+    sends ``reasoning_details`` as a typed list of ``{"type": "reasoning.text",
+    "text": ...}``. A single MiniMax stream can carry both shapes, which is what
+    made this intermittent.
+
+    Normalizing to ``str`` matches what every consumer already assumes -- notably
+    ``openai_codex.py`` concatenates this value with ``+``, which a list would
+    break -- and the outbound replay path re-wraps a str into MiniMax's typed
+    list, a form that is live-verified accepted. The permissive final ``str()``
+    is deliberate: an unknown future shape must merge, not crash a 72h run.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "".join(parts)
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("content") or "")
+    return str(value)
+
+
 if ChatOpenAI is not None:
     class ChatOpenAIWithReasoning(ChatOpenAI):  # type: ignore[misc,valid-type]
         """ChatOpenAI that preserves provider reasoning across invoke + stream.
@@ -111,7 +147,8 @@ if ChatOpenAI is not None:
                 if not value and caps.reasoning_split_extra_body:
                     value = src.get("reasoning_details")
                 if value:
-                    msg.additional_kwargs["reasoning_content"] = value
+                    # Single-typed by construction -- see _normalize_reasoning.
+                    msg.additional_kwargs["reasoning_content"] = _normalize_reasoning(value)
             if caps.gemini_thought_signatures and (
                 signatures := self._collect_tool_call_thought_signatures(src.get("tool_calls"))
             ):

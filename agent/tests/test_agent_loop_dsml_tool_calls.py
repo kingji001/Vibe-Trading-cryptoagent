@@ -35,7 +35,7 @@ class _ScriptedStreamingLLM:
     def bind_tools(self, tools: list[dict[str, Any]]) -> "_ScriptedStreamingLLM":
         return self
 
-    def stream(self, messages: list[dict[str, Any]], config: dict[str, Any] | None = None):
+    def stream(self, messages: list[dict[str, Any]], config: dict[str, Any] | None = None, **kwargs: Any):
         yield _Chunk(self._responses.pop(0))
 
 

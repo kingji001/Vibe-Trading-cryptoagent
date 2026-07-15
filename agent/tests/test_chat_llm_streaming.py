@@ -46,7 +46,7 @@ class _FakeStreamingLLM:
     def bind_tools(self, tools: list[dict[str, Any]]) -> "_FakeStreamingLLM":
         return self
 
-    def stream(self, messages: list[dict[str, Any]], config: dict[str, Any] | None = None):
+    def stream(self, messages: list[dict[str, Any]], config: dict[str, Any] | None = None, **kwargs: Any):
         if self.exc is not None:
             raise self.exc
         yield from self.chunks

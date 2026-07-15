@@ -372,7 +372,12 @@ class ChatLLM:
             accumulated = None
             pending_text = ""
             possible_dsml_text = True
-            for chunk in llm.stream(messages, config=config):
+            # stream_usage asks the provider for a usage block on the stream
+            # (OpenAI's stream_options.include_usage). Without it a streamed
+            # turn reports no usage at all, and since AgentLoop only streams,
+            # every run's llm_usage.json read zero tokens while real tokens
+            # burned. Verified honored by MiniMax.
+            for chunk in llm.stream(messages, config=config, stream_usage=True):
                 if should_cancel and should_cancel():
                     break
                 if chunk.content and on_text_chunk:
