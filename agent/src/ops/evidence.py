@@ -543,6 +543,29 @@ def build_scheduled_firings_section(
     persisted-first with env as fallback; callers passing the env value
     directly should be aware the expected-firing math then reflects the env,
     not necessarily what the executor actually ran.
+
+    Token-accounting note (why this table does NOT reconcile with
+    ``agent/runs/*/llm_usage.json``):
+    The per-run ``input_tokens`` / ``output_tokens`` columns come straight from
+    each swarm run's ``SwarmRun.total_input_tokens`` / ``total_output_tokens``
+    (see ``src.swarm.runtime``), which sum the real, provider-reported per-call
+    usage of *every worker* in the committee (research_manager, analysts,
+    trader, ...) across *every* ReAct iteration. Because each iteration re-sends
+    the growing conversation, input tokens accumulate per call -- that is real
+    billing, not double counting (each SwarmRun's totals are per-run, seeded at
+    zero, and each worker result is folded in exactly once, keyed by task id).
+
+    ``agent/runs/*/llm_usage.json`` is a *disjoint* population: it is written
+    only by ``AgentLoop`` (``src.agent.loop``), the single-agent path used by
+    interactive / API single-agent runs. Swarm workers
+    (``src.swarm.worker``) deliberately drive ``ChatLLM`` directly without an
+    ``AgentLoop`` and never emit ``llm_usage.json``. The committee cron fires
+    *swarm* runs, so essentially all committee token burn lands in this table
+    and none of it in ``llm_usage.json``. Summing the two and expecting them to
+    match is apples-to-oranges: one counts multi-worker committee swarms, the
+    other counts single-agent loops. Both use the same accumulation mechanism
+    and neither double counts; the ~5.8M (llm_usage) vs tens-of-millions (this
+    table) gap in the 72h run is scope, not a defect.
     """
     if not committee_schedule:
         return {
