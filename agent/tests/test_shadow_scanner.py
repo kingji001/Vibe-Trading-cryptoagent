@@ -136,7 +136,7 @@ def test_scan_today_signals_matches_rsi_range_condition() -> None:
     """
     profile = _profile({"market": "us", "entry_rsi14": {"min": 50.0, "max": 100.0}})
     closes = _ramp(20, 10.0, 0.2)  # >= 14 bars so RSI is defined
-    target = pd.Timestamp("2026-04-01") + pd.Timedelta(days=len(closes) - 1)
+    target = pd.Timestamp("2026-04-01") + pd.Timedelta(len(closes) - 1, unit="D")
     frames = {"AAPL": _bars(closes)}
 
     matches = scan_today_signals(profile, target_date=target.date(), price_frames=frames)
@@ -149,7 +149,7 @@ def test_scan_today_signals_rejects_out_of_band_rsi() -> None:
     """A steady uptrend (RSI ~100) must fail a low-RSI [0, 30] band."""
     profile = _profile({"market": "us", "entry_rsi14": {"min": 0.0, "max": 30.0}})
     closes = _ramp(20, 10.0, 0.2)
-    target = pd.Timestamp("2026-04-01") + pd.Timedelta(days=len(closes) - 1)
+    target = pd.Timestamp("2026-04-01") + pd.Timedelta(len(closes) - 1, unit="D")
     frames = {"AAPL": _bars(closes)}
 
     assert scan_today_signals(profile, target_date=target.date(), price_frames=frames) == []

@@ -121,7 +121,7 @@ class DataLoader:
 
         timeframe = _INTERVAL_MAP.get(interval, "1d")
         since_ms = int(pd.Timestamp(start_date).timestamp() * 1000)
-        end_ms = int((pd.Timestamp(end_date) + pd.Timedelta(days=1)).timestamp() * 1000)
+        end_ms = int((pd.Timestamp(end_date) + pd.Timedelta(1, unit="D")).timestamp() * 1000)
 
         # Build the exchange lazily so a full cache hit never imports ccxt or
         # opens an exchange object.

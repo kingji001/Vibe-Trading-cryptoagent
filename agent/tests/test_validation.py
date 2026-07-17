@@ -32,8 +32,8 @@ def _make_trades(pnls: list[float], start: str = "2025-01-01") -> list[TradeReco
     trades = []
     base = pd.Timestamp(start)
     for i, pnl in enumerate(pnls):
-        entry = base + pd.Timedelta(days=i * 2)
-        exit_ = entry + pd.Timedelta(days=1)
+        entry = base + pd.Timedelta(i * 2, unit="D")
+        exit_ = entry + pd.Timedelta(1, unit="D")
         trades.append(TradeRecord(
             symbol="TEST",
             direction=1,

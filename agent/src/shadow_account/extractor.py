@@ -285,7 +285,7 @@ def _attach_price_features(
         market = sym_rows[0]["market"]
         buy_dts = [pd.Timestamp(r["buy_dt"]) for r in sym_rows]
         end = max(buy_dts)
-        start = min(buy_dts) - pd.Timedelta(days=_PRICE_LOOKBACK_DAYS)
+        start = min(buy_dts) - pd.Timedelta(_PRICE_LOOKBACK_DAYS, unit="D")
         if end.tzinfo is not None:
             end = end.tz_localize(None)
         if start.tzinfo is not None:

@@ -148,7 +148,7 @@ def _rows_to_frame(
     frame = frame.dropna(subset=["open", "high", "low", "close"])
 
     lower = pd.Timestamp(start_date).normalize()
-    upper = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
+    upper = pd.Timestamp(end_date).normalize() + pd.Timedelta(1, unit="D")
     frame = frame[(frame.index >= lower) & (frame.index < upper)]
     return frame.astype(float).sort_index()
 
