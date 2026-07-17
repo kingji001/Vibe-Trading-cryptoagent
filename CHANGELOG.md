@@ -6,10 +6,59 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **MiniMax M3 migration + provider hardening (#1).** New M3 provider path with
+  a phased probe script and migration notes, `<think>`-tag stripping, and
+  typed `reasoning_details` replay (live 400s on string/empty payloads). Adds
+  quick/deep model **tiering** via env placeholders, multi-round adversarial
+  **debate** through preset expansion, an anti-hallucination **verified
+  snapshot** + sentiment tools + identity anchor, and a scheduled **reflection
+  learning loop** with crypto benchmark routing.
+- **Paper-trading loop (#2).** End-to-end paper executor: a paper store +
+  broker core with mandates and exact fill math, a decision-to-order translator
+  with per-decision idempotency, conditional stop/take-profit evaluation, a
+  daily mark-to-market tick, a post-journal execution hook, decision-level PnL
+  with a PnL-aware reflection prompt, and a `vibe-trading paper` CLI to
+  inspect/manage the account. Kill switch: `VIBE_PAPER_ENABLED` (unset =
+  enabled; `0`/`false`/empty = disabled).
+- **Two-tier committee cadence (#3).** Env-configurable scheduled committee
+  runs (`VIBE_COMMITTEE_SCHEDULE`), an intraday **1H tick** mode with a bar
+  watermark, and a deterministic **event trigger** with cooldown wired to
+  ad-hoc committee runs.
+- **Ops evidence harness (#4).** A supervised 72h runner with heartbeat
+  (`scripts/ops/run72.sh`) and a cross-referenced evidence report via
+  `vibe-trading ops report`, covering continuity, scheduled-firing accounting,
+  committee quality, and token burn.
+- **`run72_check.sh` live health probe (#5).** One-screen, evidence-only health
+  check (`scripts/ops/run72_check.sh`) for a running supervised session: exit 0
+  = healthy, exit 1 = any alert.
 
 ### Changed
+- **Concurrency governance for a hard 3-slot LLM ceiling (#1).** A global LLM
+  gate caps concurrent calls; layer-deadline waves are bounded by the gate cap
+  so committee swarms cannot exceed the ceiling. `MINIMAX_MAX_TOKENS`
+  documented.
+- **`run_swarm` takes a structured `variables` param (#3)** with no silent
+  `BTC-USDT` default.
 
 ### Fixed
+- **`GovernedToolRegistry` context crash (#5).** Agent turns now read tools
+  through the public registry surface instead of a private attribute that the
+  governed wrapper didn't expose.
+- **Streamed-call token accounting (#5).** Streaming LLM calls now request usage
+  metadata, so `llm_usage.json` no longer records `calls: 0` / zero tokens
+  while real tokens burned.
+- **Agent-turn failures are logged, not swallowed (#5)**, surfacing attempt
+  failures that previously disappeared silently.
+- **`reasoning_content` str/list merge (#5).** Captured reasoning is normalized
+  to a single type, fixing the live 400 that recurred in ~48% of committee runs.
+- **Ops-report verdict correctness (#4).** Closed verdict-overstate paths (edge
+  gaps, unhealthy spans), a startup-grace rule so cold-start beats don't forbid
+  UNINTERRUPTED, and in-window stop/start cycles now correctly degrade the
+  verdict; plus serve-cmd preflight, env parsing, and dotenv test hermeticity.
+- **Paper-executor robustness (#2).** Side-dependent conservative write order
+  (sells persist positions first), sizing/cash/entry-day bar guards, an equity
+  staleness flag, run_id derivation + tick-driven retry, and hermetic test
+  isolation preventing real-account leakage.
 
 ## [0.1.9] — 2026-06-01
 
