@@ -85,7 +85,7 @@ def _to_epoch_seconds(date_str: str, *, end_of_day: bool) -> int:
     """
     ts = pd.Timestamp(date_str).normalize()
     if end_of_day:
-        ts = ts + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        ts = ts + pd.Timedelta(1, unit="D") - pd.Timedelta(1, unit="s")
     return int(ts.value // 1_000_000_000)
 
 

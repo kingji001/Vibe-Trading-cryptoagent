@@ -4252,7 +4252,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--max-iter", dest="run_max_iter", type=int, default=50, help="Maximum agent iterations")
 
     serve_parser = subparsers.add_parser("serve", help="Start the API server")
-    serve_parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    serve_parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=8000, help="Listen port")
     serve_parser.add_argument("--dev", action="store_true", help="Start the Vite dev server")
 

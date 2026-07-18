@@ -80,7 +80,7 @@ class DataLoader:
         codes = [c.replace("/", "-").upper() for c in codes]
 
         start_ts = int(pd.Timestamp(start_date).timestamp() * 1000)
-        end_ts = int((pd.Timestamp(end_date) + pd.Timedelta(days=1)).timestamp() * 1000)
+        end_ts = int((pd.Timestamp(end_date) + pd.Timedelta(1, unit="D")).timestamp() * 1000)
 
         max_pages = 200 if interval in ("1m", "5m") else 50 if interval in ("15m", "30m") else 20
 

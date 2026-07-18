@@ -274,7 +274,7 @@ def _knowable_date(published: pd.Timestamp, cutoff_hour: int) -> pd.Timestamp:
     stamp = published.tz_localize(None) if published.tzinfo is not None else published
     base = stamp.normalize()
     if stamp.hour >= cutoff_hour:
-        base = base + pd.Timedelta(days=1)
+        base = base + pd.Timedelta(1, unit="D")
     return base
 
 

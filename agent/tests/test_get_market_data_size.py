@@ -89,7 +89,7 @@ def test_stride_form_last_pinned_increasing_no_gap(monkeypatch):
     dates = [row["trade_date"] for row in data]
     assert dates == sorted(dates) and len(set(dates)) == len(dates)
     # original series ends 2025-01-01 + 999 days; last sampled bar is pinned.
-    last_expected = pd.Timestamp("2025-01-01") + pd.Timedelta(days=999)
+    last_expected = pd.Timestamp("2025-01-01") + pd.Timedelta(999, unit="D")
     assert pd.Timestamp(data[-1]["trade_date"]) == last_expected
 
 

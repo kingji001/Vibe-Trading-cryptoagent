@@ -377,7 +377,7 @@ def _apply_filter(df: pd.DataFrame, expr: str) -> pd.DataFrame:
         try:
             lo_raw, hi_raw = (p.strip() for p in expr.split(" to ", 1))
             lo = pd.to_datetime(lo_raw)
-            hi = pd.to_datetime(hi_raw) + pd.Timedelta(days=1)
+            hi = pd.to_datetime(hi_raw) + pd.Timedelta(1, unit="D")
             return df[(df["datetime"] >= lo) & (df["datetime"] < hi)]
         except Exception as exc:
             logger.warning("filter date parse failed: %s", exc)

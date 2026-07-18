@@ -75,7 +75,7 @@ def _to_yfinance_interval(interval: str) -> str:
 
 def _to_yfinance_exclusive_end(end_date: str) -> str:
     """Convert the project-inclusive end date to yfinance's exclusive end."""
-    return (pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    return (pd.Timestamp(end_date).normalize() + pd.Timedelta(1, unit="D")).strftime("%Y-%m-%d")
 
 
 def _download_history(

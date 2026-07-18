@@ -21,7 +21,7 @@ from backtest.loaders.base import DEFAULT_MAX_RETRIES
 from backtest.loaders.okx import DataLoader
 
 S = int(pd.Timestamp("2026-05-01").timestamp() * 1000)
-E = int((pd.Timestamp("2026-05-05") + pd.Timedelta(days=1)).timestamp() * 1000)
+E = int((pd.Timestamp("2026-05-05") + pd.Timedelta(1, unit="D")).timestamp() * 1000)
 
 
 class _Resp:
