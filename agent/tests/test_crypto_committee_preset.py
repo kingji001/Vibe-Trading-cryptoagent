@@ -26,9 +26,20 @@ DECISION_AGENTS = {
 }
 
 
+# Env vars that reshape the built run (debate depth / risk rotation rounds and
+# the lessons-to-manager experiment knob). The structural assertions below
+# assume the historical single-pass, flag-off graph, so the shared run must be
+# built with these pinned to a known state — otherwise the suite fails in any
+# shell that exports e.g. VIBE_DEBATE_ROUNDS=2.
+_RUN_SHAPING_ENVS = ("VIBE_DEBATE_ROUNDS", "VIBE_RISK_ROUNDS", "VIBE_LESSONS_TO_MANAGER")
+
+
 @pytest.fixture(scope="module")
 def run():
-    return build_run_from_preset(PRESET, USER_VARS)
+    with pytest.MonkeyPatch.context() as mp:
+        for var in _RUN_SHAPING_ENVS:
+            mp.delenv(var, raising=False)
+        return build_run_from_preset(PRESET, USER_VARS)
 
 
 def test_preset_loads_and_lists(run):

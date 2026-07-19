@@ -27,11 +27,33 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
-OPENAI_CHAT_URL = "https://api.minimax.io/v1/chat/completions"
-ANTHROPIC_MESSAGES_URL = "https://api.minimax.io/anthropic/v1/messages"
+# Mainland domain — the default account this repo runs against lives here,
+# not on the global api.minimax.io domain. Keep in sync with the fallback
+# baked into agent/src/providers/llm.py:_minimax_base_url.
+_DEFAULT_MINIMAX_BASE_URL = "https://api.minimaxi.com/v1"
+
+
+def _minimax_root_url() -> str:
+    """Return ``scheme://host`` for the configured MiniMax deployment.
+
+    Reads ``MINIMAX_BASE_URL`` — the same env var the real adapter resolves
+    in ``agent/src/providers/llm.py:_minimax_base_url`` — so this script can
+    never silently probe the wrong host again. Falls back to the mainland
+    domain (not ``api.minimax.io``) when the var is unset, matching what
+    production actually uses.
+    """
+    base = os.environ.get("MINIMAX_BASE_URL", "").strip() or _DEFAULT_MINIMAX_BASE_URL
+    parsed = urlparse(base)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+_MINIMAX_ROOT = _minimax_root_url()
+OPENAI_CHAT_URL = f"{_MINIMAX_ROOT}/v1/chat/completions"
+ANTHROPIC_MESSAGES_URL = f"{_MINIMAX_ROOT}/anthropic/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
 DEFAULT_TIMEOUT = 30.0
