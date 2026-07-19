@@ -212,6 +212,53 @@ def _parse_extra_loopback_hosts(raw: Optional[str]) -> set[str]:
 
 _EXTRA_LOOPBACK_HOSTS = _parse_extra_loopback_hosts(os.getenv("API_ALLOWED_HOSTS"))
 
+_MCP_COMMITTEE_ENV = "VIBE_MCP_COMMITTEE"
+_MCP_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _committee_mcp_enabled() -> bool:
+    """Gate 1 (VIBE_MCP_COMMITTEE): mount the committee MCP app at /mcp."""
+    return os.getenv(_MCP_COMMITTEE_ENV, "").strip().lower() in _MCP_TRUE_VALUES
+
+
+def _maybe_mount_committee_mcp(app: FastAPI) -> bool:
+    """Mount the FastMCP streamable-HTTP app at /mcp when gate 1 is on.
+
+    No-op (returns False) when VIBE_MCP_COMMITTEE is unset/falsy, so the
+    served route set is byte-identical to today. The FastMCP http_app carries
+    its own lifespan (the streamable-HTTP session manager); Starlette does NOT
+    run a mounted sub-app's lifespan automatically, so we enter/exit it from
+    this app's startup/shutdown. Idempotent: a second call is a no-op.
+    """
+    if not _committee_mcp_enabled():
+        return False
+    if any(getattr(route, "path", "") == "/mcp" for route in app.routes):
+        return True
+
+    import mcp_server  # import-time registration keyed on the same env var
+
+    # http_app(path=...) sets the route *inside* the returned sub-app, not an
+    # external prefix -- app.mount("/mcp", ...) already adds that prefix, so
+    # the sub-app's own path must be "/" or the combined route becomes
+    # /mcp/mcp instead of /mcp.
+    mcp_app = mcp_server.mcp.http_app(path="/", transport="streamable-http")
+    app.mount("/mcp", mcp_app)
+
+    @app.on_event("startup")
+    async def _committee_mcp_startup() -> None:
+        cm = mcp_app.router.lifespan_context(mcp_app)
+        app.state._committee_mcp_cm = cm
+        await cm.__aenter__()
+
+    @app.on_event("shutdown")
+    async def _committee_mcp_shutdown() -> None:
+        cm = getattr(app.state, "_committee_mcp_cm", None)
+        if cm is not None:
+            await cm.__aexit__(None, None, None)
+            app.state._committee_mcp_cm = None
+
+    return True
+
 
 def _host_without_port(host: str) -> str:
     """Normalize a Host header to a lowercase hostname without a port."""
@@ -1083,6 +1130,11 @@ def serve_main(argv: list[str] | None = None) -> int:
             f"Remote requests are rejected by the loopback peer-IP check, "
             f"but consider using --host 127.0.0.1 for local-only access."
         )
+
+    # Committee Observatory MCP (spec §3.4): mount /mcp before the SPA
+    # catch-all "/" mount below, and only when VIBE_MCP_COMMITTEE is set.
+    if _maybe_mount_committee_mcp(app):
+        print("[mcp] Committee MCP mounted at /mcp (VIBE_MCP_COMMITTEE=on)")
 
     frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
     frontend_root = Path(__file__).resolve().parent.parent / "frontend"
