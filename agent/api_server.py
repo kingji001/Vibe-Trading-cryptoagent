@@ -242,7 +242,7 @@ def _maybe_mount_committee_mcp(app: FastAPI) -> bool:
     # the sub-app's own path must be "/" or the combined route becomes
     # /mcp/mcp instead of /mcp.
     mcp_app = mcp_server.mcp.http_app(path="/", transport="streamable-http")
-    app.mount("/mcp", mcp_app)
+    app.mount("/mcp", _McpHostAuthMiddleware(mcp_app))
 
     @app.on_event("startup")
     async def _committee_mcp_startup() -> None:
@@ -594,6 +594,39 @@ def _is_local_client(request: Request) -> bool:
     if ip.is_loopback:
         return True
     return _trusted_docker_loopback_ip(ip)
+
+
+class _McpHostAuthMiddleware:
+    """Enforce the same host/API-key auth policy on the /mcp mount as REST routes.
+
+    The mount is a raw ASGI sub-app (FastMCP's streamable-HTTP app), so it does
+    not go through FastAPI's dependency injection and never sees the
+    ``require_auth``/``Security(_security)`` machinery used by every REST
+    route. This middleware wraps the mounted sub-app and calls
+    ``_validate_api_auth`` directly -- the exact same policy function REST
+    routes use -- instead of re-deriving loopback/key logic here. Loopback
+    clients pass through untouched; non-loopback clients must present
+    ``API_AUTH_KEY`` via the same Bearer header REST routes require.
+    """
+
+    def __init__(self, asgi_app) -> None:
+        self._asgi_app = asgi_app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self._asgi_app(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
+        try:
+            cred = await _security(request)
+            _validate_api_auth(request=request, cred=cred)
+        except HTTPException as exc:
+            response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+            await response(scope, receive, send)
+            return
+
+        await self._asgi_app(scope, receive, send)
 
 
 def _env_flag_enabled(name: str) -> bool:

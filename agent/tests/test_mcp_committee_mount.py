@@ -42,19 +42,63 @@ def test_mcp_mounted_when_gate_on(monkeypatch):
     assert sum(1 for r in app.routes if getattr(r, "path", "") == "/mcp") == 1
 
 
+def _mcp_initialize_payload():
+    return {
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                   "clientInfo": {"name": "mount-test", "version": "1"}},
+    }
+
+
+_MCP_HEADERS = {"Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json"}
+
+
 def test_mcp_initialize_handshake_over_http(monkeypatch):
     mod = _reload_api_server(monkeypatch, "1")
     app = FastAPI()
     assert mod._maybe_mount_committee_mcp(app) is True
 
     with TestClient(app) as client:  # enters the wired MCP lifespan
-        resp = client.post(
-            "/mcp/",
-            headers={"Accept": "application/json, text/event-stream",
-                     "Content-Type": "application/json"},
-            json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                  "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                             "clientInfo": {"name": "mount-test", "version": "1"}}},
-        )
+        resp = client.post("/mcp/", headers=_MCP_HEADERS, json=_mcp_initialize_payload())
         assert resp.status_code == 200, resp.text
         assert "protocolVersion" in resp.text  # SSE or JSON body carries the result
+
+
+def test_mcp_rejects_non_loopback_client_without_key(monkeypatch):
+    """/mcp must enforce the same non-loopback API-key policy as REST routes."""
+    monkeypatch.setenv("API_AUTH_KEY", "s3cr3t")
+    mod = _reload_api_server(monkeypatch, "1")
+    app = FastAPI()
+    assert mod._maybe_mount_committee_mcp(app) is True
+
+    with TestClient(app, client=("10.7.7.7", 40000)) as client:
+        resp = client.post("/mcp/", headers=_MCP_HEADERS, json=_mcp_initialize_payload())
+        assert resp.status_code in (401, 403), resp.text
+
+
+def test_mcp_allows_non_loopback_client_with_key(monkeypatch):
+    monkeypatch.setenv("API_AUTH_KEY", "s3cr3t")
+    mod = _reload_api_server(monkeypatch, "1")
+    app = FastAPI()
+    assert mod._maybe_mount_committee_mcp(app) is True
+
+    headers = dict(_MCP_HEADERS, Authorization="Bearer s3cr3t")
+    with TestClient(app, client=("10.7.7.7", 40000)) as client:
+        resp = client.post("/mcp/", headers=headers, json=_mcp_initialize_payload())
+        assert resp.status_code == 200, resp.text
+        assert "protocolVersion" in resp.text
+
+
+def test_mcp_loopback_client_bypasses_key_requirement(monkeypatch):
+    """Loopback clients stay trusted even when API_AUTH_KEY is configured,
+    matching require_auth's dev-mode escape hatch for the REST routes."""
+    monkeypatch.setenv("API_AUTH_KEY", "s3cr3t")
+    mod = _reload_api_server(monkeypatch, "1")
+    app = FastAPI()
+    assert mod._maybe_mount_committee_mcp(app) is True
+
+    with TestClient(app) as client:
+        resp = client.post("/mcp/", headers=_MCP_HEADERS, json=_mcp_initialize_payload())
+        assert resp.status_code == 200, resp.text
+        assert "protocolVersion" in resp.text
