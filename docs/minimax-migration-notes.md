@@ -12,6 +12,21 @@ This environment has no `MINIMAX_API_KEY`, so the live probes in section
 "How to run the probes" below have **not** been executed here. Section
 "Findings" is a template to fill in once someone runs them with a real key.
 
+**Update 2026-07-19 — probe script host bug fixed, probe 0.2 run live.**
+`scripts/minimax_probe.py` originally hardcoded `OPENAI_CHAT_URL` /
+`ANTHROPIC_MESSAGES_URL` against the global `api.minimax.io` domain, but this
+account's Subscription Key lives on the mainland domain
+(`api.minimaxi.com`, per `MINIMAX_BASE_URL` in `.env`) — every probe run
+before this fix would have silently hit the wrong host. The script now
+derives its request host from `MINIMAX_BASE_URL` (same env var
+`agent/src/providers/llm.py:_minimax_base_url` resolves), falling back to
+the mainland domain — never `api.minimax.io` — when unset. See
+`scripts/minimax_probe.py:20-45` (`_minimax_root_url`,
+`_DEFAULT_MINIMAX_BASE_URL`, `OPENAI_CHAT_URL`, `ANTHROPIC_MESSAGES_URL`).
+Probe 0.2 (model coverage) was then run for real against the corrected host
+— see the Findings table below. Probes 0.1, 0.3, 0.4 are still unrun as of
+this update.
+
 ## What's already known (from platform docs, before probing)
 
 - **Subscription Key ≠ pay-as-you-go API key.** The MiniMax Token Plan issues
@@ -169,8 +184,8 @@ python scripts/minimax_probe.py all 2>&1 | tee /tmp/minimax-probe-output.txt
 
 | # | Task | Exit criterion | Result | Notes |
 |---|---|---|---|---|
-| 0.1 | Subscription Key vs `/v1/chat/completions` | Documented yes/no (+ error shape). **Decides Path A vs B** | _not yet run — no MINIMAX_API_KEY in this environment_ | |
-| 0.2 | Model coverage of the Token Plan | List of usable models → fixes the tier table | _not yet run_ | |
+| 0.1 | Subscription Key vs `/v1/chat/completions` | Documented yes/no (+ error shape). **Decides Path A vs B** | _not yet run this session — a real `MINIMAX_API_KEY` is now available in `.env`, but this task's scope was limited to fixing the probe host and running 0.2 only. Probe 0.2's 200s above are indirect confirmation that Path A auth works, but 0.1 itself (including the Path B auth check) should still be run explicitly._ | |
+| 0.2 | Model coverage of the Token Plan | List of usable models → fixes the tier table | **Ran 2026-07-19** against the corrected mainland host (`https://api.minimaxi.com/v1`, OpenAI-compatible surface, Subscription Key from `.env`). All three probed models returned 200 on a trivial completion: `MiniMax-M3` (200), `MiniMax-M2.7-highspeed` (200), `MiniMax-M2.5-highspeed` (200). | Same-provider constraint for Direction D is satisfied: this key serves `MiniMax-M2.7-highspeed` on `/v1`. Plain (non-highspeed) `M2.7`/`M2.5` were not probed — `MODELS_TO_PROBE` only lists the two `-highspeed` variants plus `M3`, per the roadmap plan's scope. |
 | 0.3 | Reasoning round-trip shapes | Notes on exact field names for Phase 1 | _not yet run_ | |
 | 0.4 | Concurrency probe | Backoff parameters for Phase 2 grounded in reality | _not yet run_ | |
 
@@ -178,6 +193,18 @@ Fill in the "Result" column with a one-line verdict (e.g. "Path A: OK
 (200)" / "Path A: FAIL (401, error.type=invalid_api_key)") and "Notes" with
 anything a later phase needs (exact field names, model availability caveats,
 observed `Retry-After` values, recovery latency).
+
+### Direction D tiering-readiness note
+
+**Direction D's precondition is cleared: yes.** Probe 0.2 confirms the
+Token Plan Subscription Key authorizes `MiniMax-M2.7-highspeed` (200) on the
+OpenAI-compatible `/v1` surface under `LANGCHAIN_PROVIDER=minimax`, alongside
+`MiniMax-M3` (200) and `MiniMax-M2.5-highspeed` (200). Direction D's
+same-provider constraint (migration notes Phase 3) is satisfied for all
+three models this key was checked against. This was a model-coverage check
+only (trivial completion, no tool calls, no reasoning replay) — it does not
+by itself validate tool-calling or reasoning behavior per model; that's
+probe 0.3's job and remains unrun.
 
 ## Probe 0.5 — baseline committee run
 
