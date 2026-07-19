@@ -33,7 +33,8 @@ def _tmp_swarm_and_journal(tmp_path, monkeypatch):
 
 
 def _seed_run(runs_root: Path, run_id: str, *, target="BTC-USDT",
-              status=RunStatus.completed, with_reports=True, corrupt_decision=False):
+              status=RunStatus.completed, with_reports=True, corrupt_decision=False,
+              created_at="2026-07-18T20:00:58+00:00"):
     rd = runs_root / run_id
     (rd / "artifacts" / "portfolio_manager").mkdir(parents=True)
     tasks = [
@@ -51,7 +52,7 @@ def _seed_run(runs_root: Path, run_id: str, *, target="BTC-USDT",
     run = SwarmRun(
         id=run_id, preset_name="crypto_committee", status=status,
         user_vars={"target": target, "timeframe": "72h swing"}, tasks=tasks,
-        created_at="2026-07-18T20:00:58+00:00",
+        created_at=created_at,
         completed_at="2026-07-18T20:18:29+00:00",
         total_input_tokens=704573, total_output_tokens=104805,
     )
@@ -82,7 +83,12 @@ def _seed_journal(run_id: str, symbol="BTC-USDT"):
 
 
 def test_runs_list_newest_first_with_shape(_tmp_swarm_and_journal):
-    _seed_run(_tmp_swarm_and_journal, "swarm-20260718-200058-aaa")
+    # Distinct created_at values: list_runs sorts by created_at desc, and a
+    # tie leaves the order filesystem-dependent (flaked on CI's ext4 while
+    # passing on local APFS). "aaa" is deliberately older; "bbb" keeps the
+    # default so rows[0]'s wall_clock_s assertion below stays valid.
+    _seed_run(_tmp_swarm_and_journal, "swarm-20260718-200058-aaa",
+              created_at="2026-07-18T18:00:58+00:00")
     _seed_run(_tmp_swarm_and_journal, "swarm-20260719-100000-bbb")
     rows = _client().get("/committee/runs").json()
     assert [r["run_id"] for r in rows] == [
