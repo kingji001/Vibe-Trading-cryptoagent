@@ -223,6 +223,31 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ broker }),
     }),
+
+  // Committee observatory API (read-only, spec §3.1)
+  getCommitteeRuns: (params: CommitteeRunsParams = {}) => {
+    const q = new URLSearchParams();
+    if (params.limit !== undefined) q.set("limit", String(params.limit));
+    if (params.status) q.set("status", params.status);
+    if (params.symbol) q.set("symbol", params.symbol);
+    const qs = q.toString();
+    return request<CommitteeRunItem[]>(`/committee/runs${qs ? `?${qs}` : ""}`);
+  },
+  getCommitteeRun: (runId: string) =>
+    request<CommitteeRunDetail>(`/committee/runs/${encodeURIComponent(runId)}`),
+  getPaperStatus: () => request<PaperStatus>("/paper/status"),
+  getPaperEquity: () => request<PaperEquityRow[]>("/paper/equity"),
+  getPaperPnl: (decisionId: string) =>
+    request<DecisionPnl>(`/paper/pnl/${encodeURIComponent(decisionId)}`),
+  getJournalDecisions: (params: JournalDecisionsParams = {}) => {
+    const q = new URLSearchParams();
+    if (params.limit !== undefined) q.set("limit", String(params.limit));
+    if (params.symbol) q.set("symbol", params.symbol);
+    const qs = q.toString();
+    return request<JournalDecision[]>(`/journal/decisions${qs ? `?${qs}` : ""}`);
+  },
+  getSchedulerHealth: () => request<SchedulerHealth>("/scheduler/health"),
+  getMcpStatus: () => request<McpStatus>("/mcp/status"),
 };
 
 // --- Swarm types ---
@@ -1019,4 +1044,185 @@ export interface MessageItem {
   created_at: string;
   linked_attempt_id?: string;
   metadata?: Record<string, unknown>;
+}
+
+// --- Committee observatory types (spec §3.1) ---
+
+export interface CommitteePnlSummary {
+  realized_pnl?: number | null;
+  unrealized_pnl?: number | null;
+  executed?: boolean;
+  [key: string]: unknown;
+}
+
+export interface CommitteeRunItem {
+  run_id: string;
+  created_at: string;
+  status: string;
+  target: string;
+  wall_clock_s?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  decision_id?: string | null;
+  rating?: string | null;
+  journal_status?: string | null;
+  pnl_summary?: CommitteePnlSummary | null;
+}
+
+export interface CommitteeSeat {
+  agent_id: string;
+  phase: string;
+  round?: number | null;
+  status: string;
+  /** null + missing:true when artifacts/<agent>/report.md is absent — never fabricated. */
+  report_md: string | null;
+  decision_json?: Record<string, unknown> | null;
+  missing?: boolean;
+  error?: string;
+}
+
+export interface CommitteeDebate {
+  rounds: number;
+  order: string[];
+}
+
+/** decision.portfolio_decision.json projection; keys optional per §3 A-guide journal shape. */
+export interface CommitteeDecision {
+  rating?: string | null;
+  price_target?: number | null;
+  stop_loss?: number | null;
+  take_profit?: number | null;
+  position_size_pct?: number | null;
+  time_horizon?: string | null;
+  primary_horizon?: string | null;
+  [key: string]: unknown;
+}
+
+export interface JournalHorizon {
+  raw_return?: number | null;
+  benchmark_return?: number | null;
+  alpha?: number | null;
+  mark_price?: number | null;
+  direction_correct?: boolean | null;
+  resolved_at?: string | null;
+}
+
+export interface CommitteeJournal {
+  horizons: Record<string, JournalHorizon>;
+  reflection?: string | null;
+  reflected_at?: string | null;
+}
+
+/** src.paper.pnl.decision_pnl output (A-guide Task 1). */
+export interface DecisionPnl {
+  decision_id: string;
+  executed: boolean;
+  realized_pnl: number | null;
+  fees_paid?: number | null;
+  unrealized_pnl?: number | null;
+  position_open?: boolean;
+  exit_kind?: string | null;
+  max_drawdown_pct?: number | null;
+  summary?: string | null;
+}
+
+export interface CommitteeRunDetail {
+  run: Record<string, unknown>;
+  seats: CommitteeSeat[];
+  debate: CommitteeDebate;
+  decision: CommitteeDecision | null;
+  journal: CommitteeJournal | null;
+  pnl: DecisionPnl | null;
+}
+
+export interface PaperPositionRow {
+  symbol: string;
+  qty: number;
+  avg_entry: number;
+  mark: number;
+  value: number;
+  unrealized: number;
+  stale?: boolean;
+}
+
+export interface PaperStatus {
+  ts?: string | number;
+  cash: number;
+  positions_value: number;
+  equity: number;
+  positions: PaperPositionRow[];
+  /** Count in broker equity; some snapshots may carry a list — accept both. */
+  stale_positions?: number | string[];
+}
+
+/**
+ * One persisted equity snapshot from GET /paper/equity. `tick.py` persists
+ * `broker.equity()` verbatim (plus `ts`), so this is the same shape as
+ * `PaperStatus` — including the full `positions` array — with no drawdown
+ * field (F2 derives drawdown from the series).
+ */
+export interface PaperEquityRow {
+  ts: string | number;
+  cash?: number;
+  positions_value?: number;
+  equity: number;
+  positions?: PaperPositionRow[];
+  /** Count in broker equity; some snapshots may carry a list — accept both. */
+  stale_positions?: number | string[];
+}
+
+export interface JournalDecision {
+  id: string;
+  decided_at: string;
+  symbol: string;
+  rating?: string | null;
+  status?: string | null;
+  primary_horizon?: string | null;
+  horizons?: Record<string, JournalHorizon>;
+  reflected_at?: string | null;
+  run_id?: string | null;
+}
+
+export interface SchedulerJob {
+  id: string;
+  schedule?: string | null;
+  next_run_at?: string | null;
+  status?: string | null;
+  [key: string]: unknown;
+}
+
+/**
+ * Best-effort run72 supervisor heartbeat (`_supervisor_liveness` in
+ * committee_routes.py): the raw heartbeat file mtime plus its last JSON row,
+ * or `null` when no heartbeat file exists. There is no `alive`/`last_tick`
+ * field on the wire — the UI derives liveness from `heartbeat_mtime`.
+ */
+export interface SchedulerSupervisor {
+  heartbeat_mtime?: number | null;
+  last_row?: Record<string, unknown> | null;
+}
+
+export interface SchedulerHealth {
+  jobs: SchedulerJob[];
+  supervisor: SchedulerSupervisor | null;
+}
+
+export interface McpStatus {
+  committee_tools_enabled: boolean;
+  trigger_enabled: boolean;
+  trigger_budget: number;
+  triggers_used_today: number;
+  http_mount: string | null;
+  stdio_command: string;
+}
+
+export interface CommitteeRunsParams {
+  limit?: number;
+  status?: string;
+  symbol?: string;
+}
+
+export interface JournalDecisionsParams {
+  limit?: number;
+  symbol?: string;
 }
