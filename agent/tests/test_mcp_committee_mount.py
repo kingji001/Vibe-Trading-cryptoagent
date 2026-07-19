@@ -8,10 +8,35 @@ Gate on  -> /mcp mounted and an MCP 'initialize' handshake succeeds under
 from __future__ import annotations
 
 import importlib
+import os
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture(autouse=True)
+def _restore_api_server_module():
+    """Undo the `importlib.reload(api_server)` pollution this file causes.
+
+    `api_server.py` reads `API_AUTH_KEY` into a module-level `_API_KEY`
+    global at import time (its `_configured_api_key()` fallback). Reloading
+    `api_server` while a test has `monkeypatch.setenv("API_AUTH_KEY", ...)`
+    active re-executes that line and bakes the key into the reloaded
+    module's globals. `monkeypatch.undo()` only reverts `os.environ`, not
+    that already-executed module attribute, so the key leaked into every
+    later test importing `api_server` in the same process (breaking
+    unrelated tests in test_settings_api.py). Reload once more here with a
+    guaranteed-clean environment so the shared module is left as found.
+    """
+    yield
+    os.environ.pop("API_AUTH_KEY", None)
+    os.environ.pop("VIBE_MCP_COMMITTEE", None)
+    import api_server
+    import mcp_server
+
+    importlib.reload(mcp_server)
+    importlib.reload(api_server)
 
 
 def _reload_api_server(monkeypatch, gate):
