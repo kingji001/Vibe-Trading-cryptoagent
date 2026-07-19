@@ -1012,6 +1012,17 @@ from src.api.scheduled_routes import register_scheduled_routes  # noqa: E402
 
 register_scheduled_routes(app)
 
+# ============================================================================
+# Paper read-only routes - defined in src/api/paper_routes.py
+# ============================================================================
+#
+# GET-only surface over the paper-trading store (status/ledger/equity/pnl);
+# `paper reset` and other mutations stay CLI-only. Task R3 finalizes the
+# combined registration block alongside the committee routes.
+
+from src.api.paper_routes import register_paper_routes  # noqa: E402
+register_paper_routes(app)
+
 # Re-exported for backward-compatibility / external consumers
 from src.api.scheduled_routes import (  # noqa: E402, F401
     CreateScheduledRunRequest,
