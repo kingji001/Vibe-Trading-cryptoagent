@@ -196,15 +196,24 @@ observed `Retry-After` values, recovery latency).
 
 ### Direction D tiering-readiness note
 
-**Direction D's precondition is cleared: yes.** Probe 0.2 confirms the
-Token Plan Subscription Key authorizes `MiniMax-M2.7-highspeed` (200) on the
-OpenAI-compatible `/v1` surface under `LANGCHAIN_PROVIDER=minimax`, alongside
-`MiniMax-M3` (200) and `MiniMax-M2.5-highspeed` (200). Direction D's
-same-provider constraint (migration notes Phase 3) is satisfied for all
-three models this key was checked against. This was a model-coverage check
-only (trivial completion, no tool calls, no reasoning replay) — it does not
-by itself validate tool-calling or reasoning behavior per model; that's
-probe 0.3's job and remains unrun.
+**Direction D: DEFERRED by operator decision (2026-07-19) — do not activate.**
+Probe 0.2's HTTP 200s (below) measure endpoint availability, NOT plan
+entitlement. The operator confirms this Token Plan covers only `MiniMax-M3`
+and `MiniMax-M2.7` — `MiniMax-M2.7-highspeed` is not included, so a 200 on a
+trivial completion must not be read as "the gate is cleared." Treat plan
+coverage as operator-confirmed knowledge, not something a probe can prove.
+
+Beyond entitlement, the operator's standing decision: no tier split for now.
+`MiniMax-M3` is the stronger model and the 72h + 24h evidence windows showed
+no operational issues running it on all 13 seats, so there is no current
+reason to trade quality for speed on the 11 quick seats. Revisit only if
+quota pressure or latency becomes a real constraint.
+
+Historical probe result (availability only): probe 0.2 on the `/v1` surface
+returned 200 for `MiniMax-M3`, `MiniMax-M2.7-highspeed`, and
+`MiniMax-M2.5-highspeed` on a trivial completion (no tool calls, no
+reasoning replay). Plain `M2.7`/`M2.5` were not probed. Probe 0.3 remains
+unrun and is not needed while tiering is deferred.
 
 ## Probe 0.5 — baseline committee run
 
