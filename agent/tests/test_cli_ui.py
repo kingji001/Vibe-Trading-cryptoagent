@@ -41,13 +41,16 @@ class TestNoDist:
                 (frontend_dir / "dist" / "index.html").write_text("<html></html>")
             return MagicMock(returncode=0, stdout="", stderr="")
 
+        # _probe_health must be faked server-down: a live serve on :8000 would
+        # flip cmd_ui into the attach branch and Popen would never be called.
         with patch.object(cli._legacy, "_resolve_node_and_npm", return_value=("/usr/bin/node", "/usr/bin/npm")):
             with patch.object(cli._legacy, "_is_windows", return_value=False):
                 with patch("cli._legacy.subprocess.run", side_effect=_fake_run) as mock_run:
-                    with patch.object(cli._legacy, "_wait_for_health", return_value=True):
-                        with patch("cli._legacy.subprocess.Popen") as mock_popen:
-                            with patch.object(cli._legacy.webbrowser, "open") as mock_open:
-                                rc = cli._legacy.cmd_ui(frontend_dir=frontend_dir)
+                    with patch.object(cli._legacy, "_probe_health", return_value=False):
+                        with patch.object(cli._legacy, "_wait_for_health", return_value=True):
+                            with patch("cli._legacy.subprocess.Popen") as mock_popen:
+                                with patch.object(cli._legacy.webbrowser, "open") as mock_open:
+                                    rc = cli._legacy.cmd_ui(frontend_dir=frontend_dir)
 
         assert rc == cli._legacy.EXIT_SUCCESS
         assert mock_run.call_count == 2  # npm install + npm run build
@@ -69,10 +72,11 @@ class TestNoDist:
         with patch.object(cli._legacy, "_resolve_node_and_npm", return_value=(r"C:\node.exe", npm_path)):
             with patch.object(cli._legacy, "_is_windows", return_value=True):
                 with patch("cli._legacy.subprocess.run", side_effect=_fake_run) as mock_run:
-                    with patch.object(cli._legacy, "_wait_for_health", return_value=True):
-                        with patch("cli._legacy.subprocess.Popen"):
-                            with patch.object(cli._legacy.webbrowser, "open"):
-                                rc = cli._legacy.cmd_ui(frontend_dir=frontend_dir)
+                    with patch.object(cli._legacy, "_probe_health", return_value=False):
+                        with patch.object(cli._legacy, "_wait_for_health", return_value=True):
+                            with patch("cli._legacy.subprocess.Popen"):
+                                with patch.object(cli._legacy.webbrowser, "open"):
+                                    rc = cli._legacy.cmd_ui(frontend_dir=frontend_dir)
 
         assert rc == cli._legacy.EXIT_SUCCESS
         invoked = [call.args[0][0] for call in mock_run.call_args_list]
