@@ -22,6 +22,17 @@ AuthDep = Callable[..., Awaitable[Any] | Any]
 
 _COMMITTEE_PRESET = "crypto_committee"
 
+# Safety ceiling on how many total swarm runs (all presets) /committee/runs
+# scans looking for crypto_committee rows. SwarmStore.list_runs already reads
+# every run.json under the runs root before sorting/truncating, so raising
+# this ceiling costs nothing extra beyond that existing full scan — it only
+# bounds how far back we're willing to look for committee rows among heavy
+# non-committee swarm usage. A low, hardcoded cap here previously dropped
+# committee runs older than the newest N runs overall even when the caller's
+# `limit` was far from satisfied. Sized generously (thousands) so it only
+# bites in extreme run-volume scenarios.
+_RUN_SCAN_CEILING = 5000
+
 # agent_id -> pipeline phase (analysts -> debate -> research_manager -> trader
 # -> risk -> portfolio_manager -> reflection). Unknown seats fall back to "other".
 _PHASE_BY_AGENT = {
@@ -170,7 +181,7 @@ def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None)
         never fails because one run is unreadable).
         """
         journal_map = _journal_by_run_id()
-        runs = _swarm_store().list_runs(limit=200)
+        runs = _swarm_store().list_runs(limit=_RUN_SCAN_CEILING)
         sym = symbol.upper() if symbol else None
         items: list[dict[str, Any]] = []
         for run in runs:
@@ -196,6 +207,7 @@ def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None)
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
         run_dir = _swarm_runs_root() / run_id
+        decision = _read_decision(run_dir)
         seats: list[dict[str, Any]] = []
         debate_order: list[str] = []
         debate_rounds = 1
@@ -210,7 +222,7 @@ def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None)
             }
             seat.update(_read_report(run_dir, task.agent_id))
             if task.agent_id == "portfolio_manager":
-                seat["decision_json"] = _read_decision(run_dir)
+                seat["decision_json"] = decision
             seats.append(seat)
             if phase == "debate":
                 debate_order.append(task.id)
@@ -248,7 +260,7 @@ def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None)
             },
             "seats": seats,
             "debate": {"rounds": debate_rounds, "order": debate_order},
-            "decision": _read_decision(run_dir),
+            "decision": decision,
             "journal": journal_block,
             "pnl": pnl_block,
         }

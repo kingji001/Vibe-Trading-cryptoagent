@@ -8,6 +8,7 @@ TestClient bypasses dev-mode auth (see tests/test_alpha_compare_api.py).
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -122,6 +123,32 @@ def test_runs_list_ignores_non_committee_presets(_tmp_swarm_and_journal):
                    status=RunStatus.completed, created_at="2026-07-18T20:00:00+00:00")
     (rd / "run.json").write_text(run.model_dump_json(), encoding="utf-8")
     assert _client().get("/committee/runs").json() == []
+
+
+def test_runs_list_scans_past_hardcoded_cap_of_noncommittee_runs(_tmp_swarm_and_journal):
+    """A committee run older than 200 non-committee runs must still surface.
+
+    Regression for the /committee/runs endpoint scanning only the newest N
+    total runs (across all presets) before filtering to crypto_committee: a
+    committee run that isn't in the newest N overall was silently dropped
+    even though the caller's limit was far from satisfied.
+    """
+    runs_root = _tmp_swarm_and_journal
+    _seed_run(runs_root, "committee-old", target="BTC-USDT")
+
+    base = datetime(2026, 7, 19, 0, 0, 0, tzinfo=timezone.utc)
+    for i in range(250):
+        rd = runs_root / f"other-{i:04d}"
+        rd.mkdir()
+        run = SwarmRun(
+            id=f"other-{i:04d}", preset_name="research_team",
+            status=RunStatus.completed,
+            created_at=(base + timedelta(seconds=i)).isoformat(),
+        )
+        (rd / "run.json").write_text(run.model_dump_json(), encoding="utf-8")
+
+    rows = _client().get("/committee/runs").json()
+    assert [r["run_id"] for r in rows] == ["committee-old"]
 
 
 def test_run_detail_shape(_tmp_swarm_and_journal):
