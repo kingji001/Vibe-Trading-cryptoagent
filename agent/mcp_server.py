@@ -45,8 +45,14 @@ import json
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback; no new dependency added
+    fcntl = None
 
 # Ensure agent/ is on sys.path
 AGENT_DIR = Path(__file__).resolve().parent
@@ -477,6 +483,29 @@ def _append_trigger_audit(row: dict) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+@contextmanager
+def _trigger_audit_lock():
+    """Exclusive advisory lock guarding the budget-read -> decision ->
+    audit-append critical section in run_committee, so concurrent MCP calls
+    can never both observe spare budget and both dispatch (TOCTOU). Locks a
+    sidecar "<audit path>.lock" file rather than the audit file itself, so
+    readers (REST /mcp/status) are never blocked. macOS/Linux only (fcntl);
+    falls back to no locking (single-process semantics) where fcntl is
+    unavailable rather than adding a dependency."""
+    if fcntl is None:  # pragma: no cover - not exercised on darwin/linux CI
+        yield
+        return
+    audit_path = _mcp_triggers_path()
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(str(audit_path) + ".lock")
+    with lock_path.open("a", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def _triggers_used_today(rows: list[dict], *, now=None) -> int:
@@ -2400,59 +2429,78 @@ def _register_committee_read_tools(mcp: "FastMCP") -> None:
         """
         from datetime import datetime, timezone
 
-        def _audit(accepted: bool, *, reason=None, run_id=None):
-            _append_trigger_audit({
+        def _audit(accepted: bool, *, symbol_value: str, reason=None, run_id=None):
+            row = {
                 "ts": datetime.now(timezone.utc).isoformat(),
-                "symbol": symbol, "note": note, "accepted": accepted,
-                **({"reason": reason} if reason else {}),
-                **({"run_id": run_id} if run_id else {}),
-            })
+                "symbol": symbol_value, "note": note, "accepted": accepted,
+            }
+            # Audit the canonicalized symbol once resolution has happened
+            # (dispatch itself always uses `resolved`); keep the raw input
+            # alongside it so the row is never ambiguous about what was typed.
+            if symbol_value != symbol:
+                row["raw_symbol"] = symbol
+            if reason:
+                row["reason"] = reason
+            if run_id:
+                row["run_id"] = run_id
+            _append_trigger_audit(row)
 
-        # 1. Symbol shape resolution (cheap, deterministic).
+        # 1. Symbol shape resolution (cheap, deterministic). No audit fidelity
+        # concern here: pre-resolution there is nothing to canonicalize yet,
+        # so the row keeps the raw string (it's all that exists).
         resolved = _grounding_resolve(symbol)
         if resolved is None:
-            _audit(False, reason="could not resolve a tradable symbol from input")
+            _audit(False, symbol_value=symbol,
+                   reason="could not resolve a tradable symbol from input")
             return _json_error(
                 f"could not resolve a tradable instrument from {symbol!r}",
                 error_type="validation")
 
-        # 2. Budget (file-backed; counts accepted rows in the current UTC day).
-        # Checked before the network grounding fetch below so an
-        # over-budget call never wastes a fetch, and a validation refusal
-        # (accepted=false) never consumes budget since only accepted=true
-        # rows are counted by _triggers_used_today.
-        now = datetime.now(timezone.utc)
-        used = _triggers_used_today(_load_trigger_audit(), now=now)
-        budget = _trigger_budget()
-        if used >= budget:
-            _audit(False, reason="budget_exhausted")
-            return json.dumps({
-                "status": "error", "error_type": "budget_exhausted",
-                "error": f"daily committee-trigger budget ({budget}) exhausted",
-                "resets_at": _utc_day_reset(now),
-            }, ensure_ascii=False, indent=2)
+        # 2-4. Budget check -> grounding validation -> dispatch, all under one
+        # exclusive lock. Holding it across the whole span (not just the
+        # budget read) is what prevents two concurrent calls from both
+        # observing spare budget and both dispatching (TOCTOU); it also means
+        # every audit append below (refusal or acceptance) happens while
+        # still holding the lock, so the next reader always sees a
+        # consistent used-count.
+        with _trigger_audit_lock():
+            # 2. Budget (file-backed; counts accepted rows in the current UTC
+            # day). Checked before the network grounding fetch below so an
+            # over-budget call never wastes a fetch, and a validation refusal
+            # (accepted=false) never consumes budget since only accepted=true
+            # rows are counted by _triggers_used_today.
+            now = datetime.now(timezone.utc)
+            used = _triggers_used_today(_load_trigger_audit(), now=now)
+            budget = _trigger_budget()
+            if used >= budget:
+                _audit(False, symbol_value=resolved, reason="budget_exhausted")
+                return json.dumps({
+                    "status": "error", "error_type": "budget_exhausted",
+                    "error": f"daily committee-trigger budget ({budget}) exhausted",
+                    "resets_at": _utc_day_reset(now),
+                }, ensure_ascii=False, indent=2)
 
-        # 3. Deep grounding validation (real market data must exist).
-        try:
-            data = _grounding_fetch(resolved)
-        except Exception as exc:
-            _audit(False, reason=f"grounding fetch failed: {exc}")
-            return _json_error(f"grounding fetch failed for {resolved}: {exc}",
-                               error_type="validation")
-        if resolved not in data or not data.get(resolved):
-            _audit(False, reason="no market data for symbol (ungrounded)")
-            return _json_error(
-                f"no market data resolved for {resolved}; refusing ungrounded run",
-                error_type="validation")
+            # 3. Deep grounding validation (real market data must exist).
+            try:
+                data = _grounding_fetch(resolved)
+            except Exception as exc:
+                _audit(False, symbol_value=resolved, reason=f"grounding fetch failed: {exc}")
+                return _json_error(f"grounding fetch failed for {resolved}: {exc}",
+                                   error_type="validation")
+            if resolved not in data or not data.get(resolved):
+                _audit(False, symbol_value=resolved, reason="no market data for symbol (ungrounded)")
+                return _json_error(
+                    f"no market data resolved for {resolved}; refusing ungrounded run",
+                    error_type="validation")
 
-        # 4. Dispatch + record the accepted run.
-        try:
-            run_id = _dispatch_committee_run(resolved, _committee_timeframe())
-        except Exception as exc:
-            _audit(False, reason=f"dispatch failed: {exc}")
-            return _json_error(f"committee dispatch failed: {exc}")
-        _audit(True, run_id=run_id)
-        return _json_ok(run_id=run_id, symbol=resolved, note=note)
+            # 4. Dispatch + record the accepted run.
+            try:
+                run_id = _dispatch_committee_run(resolved, _committee_timeframe())
+            except Exception as exc:
+                _audit(False, symbol_value=resolved, reason=f"dispatch failed: {exc}")
+                return _json_error(f"committee dispatch failed: {exc}")
+            _audit(True, symbol_value=resolved, run_id=run_id)
+            return _json_ok(run_id=run_id, symbol=resolved, note=note)
 
 
 if _mcp_committee_enabled():
