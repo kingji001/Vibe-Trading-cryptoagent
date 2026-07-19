@@ -31,6 +31,12 @@ _INTERNAL_TEMPLATE_VARS = {"upstream_context", "round"}
 # preset-build time so a misconfigured debate fails before spending tokens.
 _DEBATE_ROUNDS_CAP = 4
 
+# TradingAgents-style named depth presets (Phase 4). Case-insensitive aliases
+# accepted anywhere an integer round count is — as a literal YAML value, as a
+# resolved env value (VIBE_DEBATE_ROUNDS=deep), or in a placeholder default
+# (${VIBE_DEBATE_ROUNDS:-medium}).
+_DEBATE_ROUNDS_ALIASES = {"shallow": 1, "medium": 2, "deep": 3}
+
 # Phase 6 — optional experiment knob. TradingAgents deliberately restricts
 # reflection/memory context to the Portfolio Manager; the learning-loop
 # preset wiring (crypto_committee.yaml) follows that on purpose — only
@@ -140,11 +146,13 @@ def _resolve_model_name(value: str | None) -> str | None:
 def _resolve_debate_rounds(raw, debate_id: str) -> int:
     """Resolve and validate a debate's ``rounds`` field at build time.
 
-    ``raw`` may be a literal int (``rounds: 2``) or an env placeholder string
-    (``rounds: ${VIBE_DEBATE_ROUNDS:-1}``). Missing / unresolved -> 1 (today's
-    single-pass behavior). Non-integer, ``< 1``, or ``> _DEBATE_ROUNDS_CAP``
-    raise ``ValueError`` — the guardrail that fails a misconfigured debate
-    before any tokens are spent.
+    ``raw`` may be a literal int (``rounds: 2``), a named depth alias
+    (``shallow``/``medium``/``deep`` = 1/2/3, case-insensitive), or an env
+    placeholder string (``rounds: ${VIBE_DEBATE_ROUNDS:-1}``) whose resolved
+    value / default is itself an integer or an alias. Missing / unresolved -> 1
+    (today's single-pass behavior). Any other value, ``< 1``, or ``>
+    _DEBATE_ROUNDS_CAP`` raise ``ValueError`` — the guardrail that fails a
+    misconfigured debate before any tokens are spent.
     """
     if raw is None:
         return 1
@@ -156,11 +164,16 @@ def _resolve_debate_rounds(raw, debate_id: str) -> int:
         text = _resolve_env_placeholder(str(raw))
         if text is None or str(text).strip() == "":
             return 1
+        text = str(text).strip()
+        alias = _DEBATE_ROUNDS_ALIASES.get(text.lower())
+        if alias is not None:
+            return alias
         try:
-            resolved = int(str(text).strip())
+            resolved = int(text)
         except ValueError as exc:
             raise ValueError(
-                f"debate '{debate_id}' rounds must be an integer, got {text!r}"
+                f"debate '{debate_id}' rounds must be an integer or one of "
+                f"{sorted(_DEBATE_ROUNDS_ALIASES)}, got {text!r}"
             ) from exc
     if resolved < 1:
         raise ValueError(

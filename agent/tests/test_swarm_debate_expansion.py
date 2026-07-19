@@ -293,6 +293,71 @@ def test_rounds_non_integer_rejected(monkeypatch):
         build_run_from_preset(PRESET, USER_VARS)
 
 
+# ----------------------------------------------------- named depth aliases
+
+# TradingAgents-style depth presets: shallow/medium/deep = 1/2/3 rounds. The
+# resolver accepts these named aliases (case-insensitively) anywhere an integer
+# is accepted — as an env value (VIBE_DEBATE_ROUNDS=deep) and in the default
+# position of a placeholder (${VIBE_DEBATE_ROUNDS:-medium}).
+
+ALIAS_ROUNDS = {"shallow": 1, "medium": 2, "deep": 3}
+
+
+@pytest.mark.parametrize("alias,expected", list(ALIAS_ROUNDS.items()))
+def test_debate_round_alias_resolves(monkeypatch, alias, expected):
+    monkeypatch.setenv("VIBE_DEBATE_ROUNDS", alias)
+    run = build_run_from_preset(PRESET, USER_VARS)
+    tasks = _task_map(run)
+    for r in range(2, expected + 1):
+        assert f"task-bull-r{r}" in tasks, (alias, r)
+    assert f"task-bull-r{expected + 1}" not in tasks
+
+
+@pytest.mark.parametrize("alias,expected", list(ALIAS_ROUNDS.items()))
+def test_risk_round_alias_resolves(monkeypatch, alias, expected):
+    monkeypatch.setenv("VIBE_RISK_ROUNDS", alias)
+    run = build_run_from_preset(PRESET, USER_VARS)
+    tasks = _task_map(run)
+    for r in range(2, expected + 1):
+        assert f"task-risk-aggressive-r{r}" in tasks, (alias, r)
+    assert f"task-risk-aggressive-r{expected + 1}" not in tasks
+
+
+@pytest.mark.parametrize("alias", ["DEEP", "Deep", "dEeP", " Medium ", "SHALLOW"])
+def test_debate_round_alias_case_insensitive(monkeypatch, alias):
+    monkeypatch.setenv("VIBE_DEBATE_ROUNDS", alias)
+    expected = ALIAS_ROUNDS[alias.strip().lower()]
+    run = build_run_from_preset(PRESET, USER_VARS)
+    tasks = _task_map(run)
+    assert (f"task-bull-r{expected}" in tasks) == (expected >= 2)
+    assert f"task-bull-r{expected + 1}" not in tasks
+
+
+@pytest.mark.parametrize("bad", ["deepish", "shallowest", "med", "verydeep"])
+def test_invalid_alias_rejected(monkeypatch, bad):
+    monkeypatch.setenv("VIBE_DEBATE_ROUNDS", bad)
+    with pytest.raises(ValueError, match="rounds"):
+        build_run_from_preset(PRESET, USER_VARS)
+
+
+@pytest.mark.parametrize("alias,expected", list(ALIAS_ROUNDS.items()))
+def test_alias_in_default_position(alias, expected):
+    """An alias in the ${VAR:-default} default position resolves too, so a
+    preset can ship rounds: ${VIBE_DEBATE_ROUNDS:-medium}."""
+    assert (
+        presets._resolve_debate_rounds(
+            "${VIBE_DEBATE_ROUNDS:-" + alias + "}", "test-debate"
+        )
+        == expected
+    )
+
+
+def test_alias_literal_yaml_value():
+    """A bare alias (a literal YAML string, not a placeholder) resolves."""
+    assert presets._resolve_debate_rounds("deep", "test-debate") == 3
+    assert presets._resolve_debate_rounds("MEDIUM", "test-debate") == 2
+
+
 # -------------------------------------------------------------------- inspect
 
 
