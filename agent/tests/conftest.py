@@ -132,7 +132,16 @@ def _paper_env_guard(monkeypatch, tmp_path):
         "VIBE_MCP_COMMITTEE",
         "VIBE_MCP_ALLOW_TRIGGER",
         "VIBE_MCP_TRIGGER_BUDGET",
-        "VIBE_MCP_TRIGGER_AUDIT",
     ):
         monkeypatch.delenv(_mcp_var, raising=False)
+    # VIBE_MCP_TRIGGER_AUDIT is a file PATH (committee_routes._mcp_triggers_path /
+    # mcp_server._mcp_triggers_path both fall back to the real
+    # ~/.vibe-trading/committee/mcp_triggers.jsonl when unset) -- delenv alone
+    # leaves every test reading/appending to that real, live operational
+    # audit log. Point it at this test's own tmp dir instead so no test ever
+    # touches the real file. Tests that want a specific seeded audit log
+    # still override with their own monkeypatch.setenv/setattr.
+    monkeypatch.setenv(
+        "VIBE_MCP_TRIGGER_AUDIT", str(tmp_path / "mcp-audit-guard" / "mcp_triggers.jsonl")
+    )
     yield
