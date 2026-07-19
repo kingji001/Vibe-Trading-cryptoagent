@@ -154,6 +154,82 @@ def _read_decision(run_dir: Path) -> dict[str, Any]:
         return {"error": str(exc)}
 
 
+_MCP_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _truthy(env_name: str) -> bool:
+    import os
+
+    return os.environ.get(env_name, "").strip().lower() in _MCP_TRUE_VALUES
+
+
+def _ops_root() -> Path:
+    import os
+
+    override = os.environ.get("VIBE_OPS_ROOT")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".vibe-trading" / "ops"
+
+
+def _mcp_triggers_path() -> Path:
+    """Same file M3's run_committee writes. Honors the VIBE_MCP_TRIGGER_AUDIT
+    override (hermetic tests / ops) exactly like mcp_server._mcp_triggers_path
+    so REST and MCP always read/write one audit log."""
+    import os
+
+    env = os.environ.get("VIBE_MCP_TRIGGER_AUDIT", "").strip()
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".vibe-trading" / "committee" / "mcp_triggers.jsonl"
+
+
+def _supervisor_liveness() -> dict[str, Any] | None:
+    """Best-effort run72 heartbeat: file mtime + last row. None when absent."""
+    p = _ops_root() / "heartbeat.jsonl"
+    if not p.exists():
+        return None
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    last_row = None
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line:
+            try:
+                last_row = json.loads(line)
+            except json.JSONDecodeError:
+                last_row = None
+            break
+    return {"heartbeat_mtime": p.stat().st_mtime, "last_row": last_row}
+
+
+def _triggers_used_today() -> int:
+    """Count today's (UTC) ACCEPTED rows in the MCP trigger audit log; 0 if
+    absent. accepted=false rows (refusals) never consume budget — identical
+    semantics to mcp_server._triggers_used_today (M3), which owns writing."""
+    p = _mcp_triggers_path()
+    if not p.exists():
+        return 0
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    count = 0
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("accepted") and str(row.get("ts", ""))[:10] == today:
+                count += 1
+    except OSError:
+        return 0
+    return count
+
+
 def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None) -> None:
     """Mount the committee observatory routes onto ``app``."""
     host = _sys.modules.get("api_server") or _sys.modules.get("agent.api_server")
@@ -263,4 +339,69 @@ def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None)
             "decision": decision,
             "journal": journal_block,
             "pnl": pnl_block,
+        }
+
+    @app.get("/journal/decisions", dependencies=[Depends(require_auth)])
+    async def journal_decisions(
+        limit: int = Query(50, ge=1, le=500),
+        symbol: Optional[str] = Query(None),
+    ):
+        """Newest-first journal projection (load_entries is oldest-first)."""
+        from src.committee.journal import load_entries
+
+        entries = list(reversed(load_entries()))
+        if symbol:
+            sym = symbol.upper()
+            entries = [e for e in entries if (e.get("symbol") or "").upper() == sym]
+        entries = entries[:limit]
+        return [
+            {
+                "id": e["id"],
+                "decided_at": e.get("decided_at"),
+                "symbol": e.get("symbol"),
+                "rating": e.get("rating"),
+                "status": e.get("status"),
+                "primary_horizon": e.get("primary_horizon"),
+                "horizons": e.get("horizons"),
+                "reflected_at": e.get("reflected_at"),
+                "run_id": e.get("run_id"),
+            }
+            for e in entries
+        ]
+
+    @app.get("/scheduler/health", dependencies=[Depends(require_auth)])
+    async def scheduler_health():
+        """Registered scheduled jobs + best-effort run72 supervisor liveness."""
+        h = _sys.modules.get("api_server") or _sys.modules.get("agent.api_server")
+        jobs = h._get_scheduled_research_store().list_jobs(limit=200)
+        return {
+            "jobs": [
+                {
+                    "id": j.id,
+                    "schedule": j.schedule,
+                    "status": j.status.value,
+                    "next_run_at": j.next_run_at,
+                }
+                for j in jobs
+            ],
+            "supervisor": _supervisor_liveness(),
+        }
+
+    @app.get("/mcp/status", dependencies=[Depends(require_auth)])
+    async def mcp_status():
+        """MCP interface gate state (read-only reflection of env toggles)."""
+        import os
+
+        committee_on = _truthy("VIBE_MCP_COMMITTEE")
+        try:
+            budget = int(os.environ.get("VIBE_MCP_TRIGGER_BUDGET", "4"))
+        except ValueError:
+            budget = 4
+        return {
+            "committee_tools_enabled": committee_on,
+            "trigger_enabled": committee_on and _truthy("VIBE_MCP_ALLOW_TRIGGER"),
+            "trigger_budget": budget,
+            "triggers_used_today": _triggers_used_today(),
+            "http_mount": "/mcp" if committee_on else None,
+            "stdio_command": "vibe-trading-mcp",
         }

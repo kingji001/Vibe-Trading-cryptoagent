@@ -187,3 +187,91 @@ def test_run_detail_unknown_run_id_404(_tmp_swarm_and_journal):
 
 def test_run_detail_rejects_path_traversal(_tmp_swarm_and_journal):
     assert _client().get("/committee/runs/..%2f..").status_code in (400, 404)
+
+
+# --- Task R3: journal / scheduler / mcp-status ------------------------------
+
+
+def test_journal_decisions_newest_first_projection(_tmp_swarm_and_journal):
+    from src.committee import journal
+    journal.append_decision(symbol="BTC-USDT", rating="Buy", time_horizon="72h swing",
+                            run_id="r1", decided_at="2026-07-18T00:00:00+00:00")
+    journal.append_decision(symbol="ETH-USDT", rating="Hold", time_horizon="24h",
+                            run_id="r2", decided_at="2026-07-19T00:00:00+00:00")
+    rows = _client().get("/journal/decisions").json()
+    assert [r["symbol"] for r in rows] == ["ETH-USDT", "BTC-USDT"]  # newest first
+    r = rows[0]
+    assert set(r) >= {"id", "decided_at", "symbol", "rating", "status",
+                      "primary_horizon", "horizons", "reflected_at", "run_id"}
+
+
+def test_journal_decisions_symbol_filter_and_limit(_tmp_swarm_and_journal):
+    from src.committee import journal
+    journal.append_decision(symbol="BTC-USDT", rating="Buy", time_horizon="72h swing",
+                            run_id="r1", decided_at="2026-07-18T00:00:00+00:00")
+    journal.append_decision(symbol="ETH-USDT", rating="Hold", time_horizon="24h",
+                            run_id="r2", decided_at="2026-07-19T00:00:00+00:00")
+    rows = _client().get("/journal/decisions",
+                         params={"symbol": "ETH-USDT", "limit": 5}).json()
+    assert [r["symbol"] for r in rows] == ["ETH-USDT"]
+
+
+def test_journal_decisions_empty_when_no_file(_tmp_swarm_and_journal):
+    assert _client().get("/journal/decisions").json() == []
+
+
+def test_scheduler_health_lists_jobs(_tmp_swarm_and_journal, monkeypatch):
+    monkeypatch.setenv("VIBE_TRADING_ENABLE_SCHEDULER", "0")
+    store = api_server._get_scheduled_research_store()
+    from src.scheduled_research.models import ScheduledResearchJob
+    store.upsert(ScheduledResearchJob(id="committee-run", prompt="p", schedule="0 0 * * *"))
+    body = _client().get("/scheduler/health").json()
+    ids = {j["id"] for j in body["jobs"]}
+    assert "committee-run" in ids
+    job = next(j for j in body["jobs"] if j["id"] == "committee-run")
+    assert set(job) >= {"id", "schedule", "status", "next_run_at"}
+    assert body["supervisor"] is None  # no heartbeat file seeded
+
+
+def test_scheduler_health_supervisor_from_heartbeat(_tmp_swarm_and_journal, tmp_path, monkeypatch):
+    ops = tmp_path / "ops"
+    ops.mkdir()
+    (ops / "heartbeat.jsonl").write_text(
+        '{"ts":"2026-07-19T00:00:00Z","ok":true,"http":200,"latency_ms":12}\n',
+        encoding="utf-8")
+    monkeypatch.setenv("VIBE_OPS_ROOT", str(ops))
+    body = _client().get("/scheduler/health").json()
+    assert body["supervisor"] is not None
+    assert body["supervisor"]["last_row"]["ok"] is True
+
+
+def test_mcp_status_defaults_off(_tmp_swarm_and_journal, monkeypatch):
+    for var in ("VIBE_MCP_COMMITTEE", "VIBE_MCP_ALLOW_TRIGGER", "VIBE_MCP_TRIGGER_BUDGET"):
+        monkeypatch.delenv(var, raising=False)
+    body = _client().get("/mcp/status").json()
+    assert body == {
+        "committee_tools_enabled": False, "trigger_enabled": False,
+        "trigger_budget": 4, "triggers_used_today": 0,
+        "http_mount": None, "stdio_command": "vibe-trading-mcp",
+    }
+
+
+def test_mcp_status_gated_on_counts_today_triggers(_tmp_swarm_and_journal, tmp_path, monkeypatch):
+    monkeypatch.setenv("VIBE_MCP_COMMITTEE", "1")
+    monkeypatch.setenv("VIBE_MCP_ALLOW_TRIGGER", "yes")
+    monkeypatch.setenv("VIBE_MCP_TRIGGER_BUDGET", "6")
+    trig = tmp_path / "committee"
+    trig.mkdir()
+    monkeypatch.setattr(committee_routes, "_mcp_triggers_path", lambda: trig / "mcp_triggers.jsonl")
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (trig / "mcp_triggers.jsonl").write_text(
+        f'{{"ts":"{today}","symbol":"BTC-USDT","accepted":true}}\n'
+        '{"ts":"2020-01-01T00:00:00Z","symbol":"BTC-USDT","accepted":true}\n',
+        encoding="utf-8")
+    body = _client().get("/mcp/status").json()
+    assert body["committee_tools_enabled"] is True
+    assert body["trigger_enabled"] is True
+    assert body["trigger_budget"] == 6
+    assert body["triggers_used_today"] == 1  # only today's row
+    assert body["http_mount"] == "/mcp"
