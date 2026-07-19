@@ -1023,6 +1023,17 @@ register_scheduled_routes(app)
 from src.api.paper_routes import register_paper_routes  # noqa: E402
 register_paper_routes(app)
 
+# ============================================================================
+# Committee observatory routes - defined in src/api/committee_routes.py
+# ============================================================================
+#
+# GET-only surface over crypto_committee swarm runs (list/detail); joined with
+# the decision journal and paper PnL. Task R3 appends journal/scheduler/mcp
+# endpoints to this same registration.
+
+from src.api.committee_routes import register_committee_routes  # noqa: E402
+register_committee_routes(app)
+
 # Re-exported for backward-compatibility / external consumers
 from src.api.scheduled_routes import (  # noqa: E402, F401
     CreateScheduledRunRequest,
