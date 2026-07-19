@@ -59,6 +59,24 @@ def _heartbeat_interval_s() -> float:
 _HEARTBEAT_INTERVAL_S = _heartbeat_interval_s()
 _MAX_TOKEN_ESTIMATE = 60_000
 
+# Opt-in transcript persistence on NORMAL completion. Failure paths
+# (iteration limit / timeout) already persist unconditionally via
+# _persist_messages; this flag extends that to successful runs so an auditor
+# can prove the identity anchor / grounding block sat inside a live prompt.
+# Default OFF — 12 committee runs/day x 13 workers of full transcripts is real
+# disk; the flag exists for evidence-gathering windows. Truthy-set idiom
+# mirrors src.swarm.presets._LESSONS_TO_MANAGER_TRUE_VALUES.
+_PERSIST_TRANSCRIPTS_ENV = "VIBE_SWARM_PERSIST_TRANSCRIPTS"
+_PERSIST_TRANSCRIPTS_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _persist_transcripts_enabled() -> bool:
+    """``VIBE_SWARM_PERSIST_TRANSCRIPTS`` opt-in: unset/falsy -> OFF."""
+    return (
+        os.getenv(_PERSIST_TRANSCRIPTS_ENV, "").strip().lower()
+        in _PERSIST_TRANSCRIPTS_TRUE_VALUES
+    )
+
 
 def _emit(
     callback: Callable[[SwarmEvent], None] | None,
@@ -625,6 +643,7 @@ def run_worker(
             summary = response.content or last_assistant_content or "(no summary)"
             summary = _resolve_summary(artifact_dir, summary)
             _write_summary(artifact_dir, summary)
+            _maybe_persist_transcript(artifact_dir, messages, response.content)
             reason = _classify_deliverable(
                 summary,
                 is_data_agent=_is_data_agent(agent_spec),
@@ -944,6 +963,26 @@ def _persist_messages(artifact_dir: Path, messages: list[dict]) -> None:
         )
     except Exception:
         logger.warning("Failed to persist messages to %s", artifact_dir, exc_info=True)
+
+
+def _maybe_persist_transcript(
+    artifact_dir: Path, messages: list[dict], final_content: str | None = None
+) -> None:
+    """Persist the full transcript on normal completion when opted in.
+
+    Gated by ``VIBE_SWARM_PERSIST_TRANSCRIPTS`` (default OFF). Reuses the
+    failure-path format/location (``messages.json`` via ``_persist_messages``)
+    so auditors grep one filename regardless of how a run ended. The final
+    assistant response is appended when present, since ``messages`` only
+    accumulates assistant messages that carried tool calls — without this the
+    successful run's closing analysis would be missing from the transcript.
+    """
+    if not _persist_transcripts_enabled():
+        return
+    transcript = messages
+    if final_content:
+        transcript = [*messages, {"role": "assistant", "content": final_content}]
+    _persist_messages(artifact_dir, transcript)
 
 
 def _write_summary(artifact_dir: Path, summary: str) -> None:
