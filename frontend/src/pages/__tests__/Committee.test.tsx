@@ -44,6 +44,22 @@ describe("Committee dashboard", () => {
     expect(await screen.findByText("No committee runs in the current window")).toBeInTheDocument();
   });
 
+  it("clears the dashboard poll interval on unmount", async () => {
+    apiMock.getCommitteeRuns.mockResolvedValue([]);
+    const setSpy = vi.spyOn(window, "setInterval");
+    const clearSpy = vi.spyOn(window, "clearInterval");
+    const { unmount } = render(<MemoryRouter><Committee /></MemoryRouter>);
+    await screen.findByText("No committee runs in the current window");
+
+    expect(setSpy).toHaveBeenCalled();
+    const created = setSpy.mock.results.map((r) => r.value);
+    unmount();
+    // The effect cleanup must clear every interval it created — a leaked
+    // poll keeps hitting the API after navigation.
+    const cleared = clearSpy.mock.calls.map((c) => c[0]);
+    for (const id of created) expect(cleared).toContain(id);
+  });
+
   it("shows stopped when the heartbeat is stale even if the last row was ok", async () => {
     apiMock.getCommitteeRuns.mockResolvedValue([]);
     apiMock.getSchedulerHealth.mockResolvedValue({
