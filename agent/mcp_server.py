@@ -135,6 +135,300 @@ def _json_error(error: str, *, error_type: str = "error") -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Committee Observatory MCP — double-gated, both default OFF (spec §3.4)
+# ---------------------------------------------------------------------------
+_MCP_TRUE_VALUES = {"1", "true", "yes", "on"}  # mirrors _persist_transcripts_enabled
+_MCP_COMMITTEE_ENV = "VIBE_MCP_COMMITTEE"
+_MCP_ALLOW_TRIGGER_ENV = "VIBE_MCP_ALLOW_TRIGGER"
+COMMITTEE_PRESET = "crypto_committee"
+
+ALPHA_CAVEAT = (
+    "Alpha is measured against BTC-USDT. For a single-symbol universe (or the "
+    "benchmark asset itself) alpha vs a same-symbol benchmark is definitionally "
+    "~0, so directional correctness is judged on raw return, not alpha."
+)
+
+# Coarse pipeline phase per crypto_committee seat (unknown seats -> 'other').
+_SEAT_PHASE = {
+    "reflection_officer": "reflection",
+    "market_analyst": "analysis", "onchain_analyst": "analysis",
+    "news_analyst": "analysis", "sentiment_analyst": "analysis",
+    "bull_researcher": "debate", "bear_researcher": "debate",
+    "research_manager": "research_management",
+    "trader": "trading",
+    "risky_analyst": "risk", "safe_analyst": "risk", "neutral_analyst": "risk",
+    "portfolio_manager": "decision",
+}
+
+
+def _mcp_committee_enabled() -> bool:
+    """Gate 1: registers the committee READ tool group (default OFF)."""
+    return os.getenv(_MCP_COMMITTEE_ENV, "").strip().lower() in _MCP_TRUE_VALUES
+
+
+def _mcp_trigger_enabled() -> bool:
+    """Gate 2: only meaningful when gate 1 is on (default OFF)."""
+    return os.getenv(_MCP_ALLOW_TRIGGER_ENV, "").strip().lower() in _MCP_TRUE_VALUES
+
+
+def _parse_iso_utc(value: str | None):
+    from datetime import datetime, timezone
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _wall_clock_s(created_at: str | None, completed_at: str | None) -> float | None:
+    start, end = _parse_iso_utc(created_at), _parse_iso_utc(completed_at)
+    if start is None or end is None:
+        return None
+    return round((end - start).total_seconds(), 1)
+
+
+def _round_from_task_id(task_id: str) -> int | None:
+    """Debate round from the '-r{n}' suffix convention (_expand_debate)."""
+    import re
+    m = re.search(r"-r(\d+)$", task_id or "")
+    return int(m.group(1)) if m else None
+
+
+def _decision_projection(entry: dict, *, full: bool) -> dict:
+    """Journal entry -> public projection. full=True keeps horizons+reflection."""
+    proj = {
+        "id": entry.get("id"),
+        "decided_at": entry.get("decided_at"),
+        "symbol": entry.get("symbol"),
+        "rating": entry.get("rating"),
+        "status": entry.get("status"),
+        "primary_horizon": entry.get("primary_horizon"),
+        "reflected_at": entry.get("reflected_at"),
+        "run_id": entry.get("run_id"),
+    }
+    if full:
+        proj["horizons"] = entry.get("horizons") or {}
+        proj["reflection"] = entry.get("reflection")
+        proj["price_target"] = entry.get("price_target")
+        proj["time_horizon"] = entry.get("time_horizon")
+    return proj
+
+
+def _committee_run_row(run, entry: dict | None) -> dict:
+    row = {
+        "run_id": run.id,
+        "created_at": run.created_at,
+        "status": run.status.value,
+        "target": (run.user_vars or {}).get("target"),
+        "wall_clock_s": _wall_clock_s(run.created_at, run.completed_at),
+        "input_tokens": run.total_input_tokens,
+        "output_tokens": run.total_output_tokens,
+        "decision_id": None,
+        "rating": None,
+        "journal_status": None,
+    }
+    if entry:
+        row["decision_id"] = entry.get("id")
+        row["rating"] = entry.get("rating")
+        row["journal_status"] = entry.get("status")
+    return row
+
+
+def _committee_runs_joined(store, *, limit: int, status: str | None):
+    """crypto_committee runs (newest-first) joined to journal entries by run_id."""
+    from src.committee.journal import load_entries
+    entries_by_run = {e.get("run_id"): e for e in load_entries() if e.get("run_id")}
+    rows: list[dict] = []
+    for run in store.list_runs(limit=200):
+        if run.preset_name != COMMITTEE_PRESET:
+            continue
+        recon = store.reconcile_run(run, write=False)
+        if status and recon.status.value != status:
+            continue
+        rows.append(_committee_run_row(recon, entries_by_run.get(recon.id)))
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _read_seat_report(run_dir, agent_id: str) -> dict:
+    """Read artifacts/<agent>/report.md; never fabricate a missing file."""
+    report_path = run_dir / "artifacts" / agent_id / "report.md"
+    if not report_path.exists():
+        return {"report_md": None, "missing": True}
+    try:
+        return {"report_md": report_path.read_text(encoding="utf-8")}
+    except OSError as exc:
+        return {"report_md": None, "error": str(exc)}
+
+
+def _read_pm_decision(run_dir) -> dict | None:
+    path = run_dir / "artifacts" / "portfolio_manager" / "decision.portfolio_decision.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _run_transcript(store, run_id: str, seat: str | None):
+    """Return the transcript dict or None when the run is unknown."""
+    try:
+        run = store.load_run(run_id)
+    except ValueError:
+        return None
+    if run is None:
+        return None
+    recon = store.reconcile_run(run, write=False)
+    run_dir = store.run_dir(run_id)
+
+    seats: list[dict] = []
+    rounds = 0
+    order: list[str] = []
+    for task in recon.tasks:
+        order.append(task.id)
+        rnd = _round_from_task_id(task.id)
+        if rnd:
+            rounds = max(rounds, rnd)
+        if seat is not None and task.agent_id != seat:
+            continue
+        entry = {
+            "agent_id": task.agent_id,
+            "task_id": task.id,
+            "phase": _SEAT_PHASE.get(task.agent_id, "other"),
+            "round": rnd or 1,
+            "status": task.status.value if hasattr(task.status, "value") else str(task.status),
+        }
+        entry.update(_read_seat_report(run_dir, task.agent_id))
+        seats.append(entry)
+
+    return {
+        # Nested under "run" (matches the REST layer's committee_run_detail
+        # shape) so this dict can be splatted into _json_ok(**transcript)
+        # without its own "status" clobbering the envelope's "status": "ok".
+        "run": {
+            "run_id": recon.id,
+            "status": recon.status.value,
+            "target": (recon.user_vars or {}).get("target"),
+        },
+        "seats": seats,
+        "debate": {"rounds": rounds, "order": order},
+        "decision": _read_pm_decision(run_dir),
+    }
+
+
+def _aggregate_performance(window_hours: int | None, symbol: str | None) -> dict:
+    """Aggregate resolved journal horizons + paper PnL + run cost. Store-only."""
+    from statistics import mean, median
+    from datetime import datetime, timedelta, timezone
+    from src.committee.journal import load_entries, HORIZONS
+
+    entries = load_entries()
+    if symbol:
+        entries = [e for e in entries if e.get("symbol") == symbol]
+    if window_hours is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+        entries = [e for e in entries if (_parse_iso_utc(e.get("decided_at")) or datetime.min.replace(tzinfo=timezone.utc)) >= cutoff]
+
+    horizons_out: dict[str, dict] = {}
+    for key in HORIZONS:
+        rows = [e["horizons"][key] for e in entries
+                if isinstance(e.get("horizons"), dict) and key in e["horizons"]]
+        if not rows:
+            horizons_out[key] = {"count": 0}
+            continue
+        dc = [r["direction_correct"] for r in rows if r.get("direction_correct") is not None]
+        nonhold = [
+            e["horizons"][key]["direction_correct"]
+            for e in entries
+            if key in (e.get("horizons") or {}) and e.get("rating") != "Hold"
+            and e["horizons"][key].get("direction_correct") is not None
+        ]
+        alphas = [r["alpha"] for r in rows if r.get("alpha") is not None]
+        raws = [r["raw_return"] for r in rows if r.get("raw_return") is not None]
+        horizons_out[key] = {
+            "count": len(rows),
+            "direction_correct_rate": round(sum(dc) / len(dc), 4) if dc else None,
+            "direction_correct_rate_non_hold": round(sum(nonhold) / len(nonhold), 4) if nonhold else None,
+            "mean_alpha": round(mean(alphas), 6) if alphas else None,
+            "median_alpha": round(median(alphas), 6) if alphas else None,
+            "mean_raw_return": round(mean(raws), 6) if raws else None,
+            "median_raw_return": round(median(raws), 6) if raws else None,
+        }
+
+    paper = _paper_pnl_summary(symbol)
+    runs = _committee_run_cost_summary(window_hours, symbol)
+
+    distinct = {e.get("symbol") for e in entries}
+    out = {
+        "window_hours": window_hours,
+        "symbol": symbol,
+        "decisions_considered": len(entries),
+        "horizons": horizons_out,
+        "paper": paper,
+        "runs": runs,
+    }
+    if len(distinct) <= 1:
+        out["alpha_caveat"] = ALPHA_CAVEAT
+    return out
+
+
+def _paper_pnl_summary(symbol: str | None) -> dict:
+    """Realized PnL/fees from the ledger + unrealized from the last equity snap.
+
+    Store-only: no live price fetch (mirrors the read-only invariant)."""
+    from src.paper.store import PaperStore, paper_root
+    store = PaperStore(paper_root())
+    realized, fees = 0.0, 0.0
+    for row in store.iter_ledger():
+        if symbol and row.get("symbol") != symbol:
+            continue
+        if row.get("realized_pnl") is not None:
+            realized += float(row["realized_pnl"])
+        fees += float(row.get("fee_paid") or 0.0)
+    snaps = list(store.iter_equity())
+    unrealized, equity = None, None
+    if snaps:
+        last = snaps[-1]
+        equity = last.get("equity")
+        rows = last.get("positions") or []
+        if symbol:
+            rows = [p for p in rows if p.get("symbol") == symbol]
+        unrealized = sum(float(p.get("unrealized") or 0.0) for p in rows) if rows else 0.0
+    return {"realized_pnl": round(realized, 6), "fees_paid": round(fees, 6),
+            "unrealized_pnl": unrealized, "equity": equity}
+
+
+def _committee_run_cost_summary(window_hours: int | None, symbol: str | None) -> dict:
+    from datetime import datetime, timedelta, timezone
+    store = _get_swarm_store()
+    cutoff = None
+    if window_hours is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    ins, outs, walls, n = [], [], [], 0
+    for run in store.list_runs(limit=500):
+        if run.preset_name != COMMITTEE_PRESET:
+            continue
+        if symbol and (run.user_vars or {}).get("target") != symbol:
+            continue
+        created = _parse_iso_utc(run.created_at)
+        if cutoff is not None and (created is None or created < cutoff):
+            continue
+        n += 1
+        ins.append(run.total_input_tokens)
+        outs.append(run.total_output_tokens)
+        w = _wall_clock_s(run.created_at, run.completed_at)
+        if w is not None:
+            walls.append(w)
+    avg = lambda xs: round(sum(xs) / len(xs), 1) if xs else None
+    return {"count": n, "avg_input_tokens": avg(ins), "avg_output_tokens": avg(outs),
+            "avg_wall_clock_s": avg(walls)}
+
+
 def _default_goal_criteria() -> list[str]:
     """Return the MVP finance protocol checklist."""
     from src.goal.context import default_goal_criteria
@@ -1890,6 +2184,103 @@ def scan_shadow_signals(
     if date:
         params["date"] = date
     return registry.execute("scan_shadow_signals", params)
+
+
+# ---------------------------------------------------------------------------
+# Committee Observatory READ tools (gate 1) — registered only when enabled so
+# that with VIBE_MCP_COMMITTEE unset the tool catalogue is byte-identical to
+# today. Module-level if-guard around the decorated defs (the run_committee
+# trigger, gate 2, is registered by Task M3's addition inside this registrar).
+# ---------------------------------------------------------------------------
+def _register_committee_read_tools(mcp: "FastMCP") -> None:
+    @mcp.tool
+    def committee_performance(window_hours: int | None = None, symbol: str | None = None) -> str:
+        """Aggregate committee performance over resolved journal horizons.
+
+        Reports per-horizon (24h/72h/7d) resolved counts, direction-correct
+        rate (overall and excluding Hold), mean/median alpha and raw return,
+        paper realized/unrealized PnL, and average token/wall-clock cost per
+        run. Includes the standing alpha caveat for single-symbol universes.
+
+        Args:
+            window_hours: Only decisions decided within this trailing window.
+            symbol: Restrict to one instrument (e.g. "BTC-USDT").
+        """
+        try:
+            return _json_ok(**_aggregate_performance(window_hours, symbol))
+        except Exception as exc:  # store read failure -> clean envelope
+            return _json_error(f"performance aggregation failed: {exc}")
+
+    @mcp.tool
+    def list_decisions(limit: int = 20, symbol: str | None = None) -> str:
+        """List journaled committee decisions, newest first.
+
+        Args:
+            limit: Maximum decisions to return.
+            symbol: Optional instrument filter.
+        """
+        from src.committee.journal import load_entries
+        entries = load_entries()
+        if symbol:
+            entries = [e for e in entries if e.get("symbol") == symbol]
+        entries = list(reversed(entries))[:max(0, limit)]
+        return _json_ok(decisions=[_decision_projection(e, full=False) for e in entries])
+
+    @mcp.tool
+    def get_decision(decision_id: str) -> str:
+        """Return one journaled decision incl. full horizons + reflection.
+
+        Args:
+            decision_id: Journal id, e.g. "dec_ab12cd34ef56".
+        """
+        from src.committee.journal import load_entries
+        for e in load_entries():
+            if e.get("id") == decision_id:
+                return _json_ok(decision=_decision_projection(e, full=True))
+        return _json_error(f"decision {decision_id} not found", error_type="not_found")
+
+    @mcp.tool
+    def list_committee_runs(limit: int = 20, status: str | None = None) -> str:
+        """List crypto_committee runs joined to their journal entries.
+
+        Args:
+            limit: Maximum runs to return (newest first).
+            status: Optional run-status filter (running/completed/failed/cancelled).
+        """
+        store = _get_swarm_store()
+        return _json_ok(runs=_committee_runs_joined(store, limit=max(0, limit), status=status))
+
+    @mcp.tool
+    def get_run_transcript(run_id: str, seat: str | None = None) -> str:
+        """Return a committee run's per-seat reports, debate structure, decision.
+
+        Args:
+            run_id: Swarm run id (from list_committee_runs).
+            seat: Optional agent_id filter (e.g. "portfolio_manager").
+        """
+        store = _get_swarm_store()
+        transcript = _run_transcript(store, run_id, seat)
+        if transcript is None:
+            return _json_error(f"run {run_id} not found", error_type="not_found")
+        return _json_ok(**transcript)
+
+    @mcp.tool
+    def paper_account() -> str:
+        """Return the paper broker's marked equity plus a recent ledger tail.
+
+        Store-only: the equity snapshot comes from the last persisted
+        mark-to-market row, not a live price fetch.
+        """
+        from src.paper.store import PaperStore, paper_root
+        store = PaperStore(paper_root())
+        snaps = list(store.iter_equity())
+        equity = snaps[-1] if snaps else {"cash": (store.load_account() or {}).get("cash")}
+        ledger_tail = list(store.iter_ledger())[-20:]
+        return _json_ok(equity=equity, ledger_tail=ledger_tail)
+
+
+if _mcp_committee_enabled():
+    _register_committee_read_tools(mcp)
 
 
 # ---------------------------------------------------------------------------
