@@ -267,11 +267,14 @@ def test_mcp_status_gated_on_counts_today_triggers(_tmp_swarm_and_journal, tmp_p
     today = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     (trig / "mcp_triggers.jsonl").write_text(
         f'{{"ts":"{today}","symbol":"BTC-USDT","accepted":true}}\n'
-        '{"ts":"2020-01-01T00:00:00Z","symbol":"BTC-USDT","accepted":true}\n',
+        '{"ts":"2020-01-01T00:00:00Z","symbol":"BTC-USDT","accepted":true}\n'
+        f'{{"ts":"{today}","symbol":"BTC-USDT","accepted":false,"reason":"budget_exhausted"}}\n',
         encoding="utf-8")
     body = _client().get("/mcp/status").json()
     assert body["committee_tools_enabled"] is True
     assert body["trigger_enabled"] is True
     assert body["trigger_budget"] == 6
-    assert body["triggers_used_today"] == 1  # only today's row
+    # only today's ACCEPTED row counts: the stale-year row and today's
+    # accepted=false refusal are both excluded.
+    assert body["triggers_used_today"] == 1
     assert body["http_mount"] == "/mcp"

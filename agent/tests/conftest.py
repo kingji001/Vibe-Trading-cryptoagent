@@ -57,6 +57,9 @@ _LEAK_PRONE_ENV_VARS = (
     "VIBE_EVENT_FUNDING_ABS",
     "VIBE_EVENT_COOLDOWN_H",
     "VIBE_MCP_COMMITTEE",
+    "VIBE_MCP_ALLOW_TRIGGER",
+    "VIBE_MCP_TRIGGER_BUDGET",
+    "VIBE_MCP_TRIGGER_AUDIT",
 )
 
 
@@ -125,6 +128,11 @@ def _paper_env_guard(monkeypatch, tmp_path):
     monkeypatch.setenv("VIBE_PAPER_ROOT", str(tmp_path / "paper-guard"))
     monkeypatch.setenv("VIBE_PAPER_ENABLED", "0")
     monkeypatch.setenv("VIBE_OPS_ROOT", str(tmp_path / "ops-guard"))
-    for _mcp_var in ("VIBE_MCP_COMMITTEE", "VIBE_MCP_ALLOW_TRIGGER", "VIBE_MCP_TRIGGER_BUDGET"):
+    for _mcp_var in (
+        "VIBE_MCP_COMMITTEE",
+        "VIBE_MCP_ALLOW_TRIGGER",
+        "VIBE_MCP_TRIGGER_BUDGET",
+        "VIBE_MCP_TRIGGER_AUDIT",
+    ):
         monkeypatch.delenv(_mcp_var, raising=False)
     yield

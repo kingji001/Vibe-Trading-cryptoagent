@@ -429,6 +429,108 @@ def _committee_run_cost_summary(window_hours: int | None, symbol: str | None) ->
             "avg_wall_clock_s": avg(walls)}
 
 
+# --- Trigger tool (gate 2): file-backed daily budget + audit -----------------
+_MCP_TRIGGER_BUDGET_ENV = "VIBE_MCP_TRIGGER_BUDGET"
+_MCP_TRIGGER_AUDIT_ENV = "VIBE_MCP_TRIGGER_AUDIT"  # test/ops override for the audit path
+DEFAULT_TRIGGER_BUDGET = 4
+
+
+def _trigger_budget() -> int:
+    raw = os.getenv(_MCP_TRIGGER_BUDGET_ENV, "").strip()
+    if not raw:
+        return DEFAULT_TRIGGER_BUDGET
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_TRIGGER_BUDGET
+
+
+def _mcp_triggers_path():
+    """Audit-log path. Default is the pinned ~/.vibe-trading/committee location;
+    VIBE_MCP_TRIGGER_AUDIT overrides it (hermetic tests / ops), mirroring the
+    journal's JOURNAL_PATH_ENV precedent. Keep this identical to the REST
+    layer's _mcp_triggers_path (committee_routes.py) — same file, same rows."""
+    env = os.getenv(_MCP_TRIGGER_AUDIT_ENV, "").strip()
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".vibe-trading" / "committee" / "mcp_triggers.jsonl"
+
+
+def _load_trigger_audit() -> list[dict]:
+    p = _mcp_triggers_path()
+    if not p.exists():
+        return []
+    rows: list[dict] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _append_trigger_audit(row: dict) -> None:
+    p = _mcp_triggers_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _triggers_used_today(rows: list[dict], *, now=None) -> int:
+    from datetime import datetime, timezone
+    now = now or datetime.now(timezone.utc)
+    today = now.astimezone(timezone.utc).date()
+    used = 0
+    for r in rows:
+        if not r.get("accepted"):
+            continue
+        dt = _parse_iso_utc(r.get("ts"))
+        if dt is not None and dt.astimezone(timezone.utc).date() == today:
+            used += 1
+    return used
+
+
+def _utc_day_reset(now) -> str:
+    from datetime import datetime, time, timedelta, timezone
+    tomorrow = now.astimezone(timezone.utc).date() + timedelta(days=1)
+    return datetime.combine(tomorrow, time.min, tzinfo=timezone.utc).isoformat()
+
+
+# Thin seams so tests can stub grounding + dispatch without touching the network
+# or launching a real 13-seat swarm (spec §3.5 permits a faked dispatch).
+def _grounding_resolve(symbol: str):
+    from src.swarm import grounding
+    return grounding.resolve_identity_symbol(symbol)
+
+
+def _grounding_fetch(symbol: str) -> dict:
+    from src.swarm import grounding
+    return grounding.fetch_grounding_data([symbol])
+
+
+def _dispatch_committee_run(symbol: str, timeframe: str) -> str:
+    """Start a crypto_committee run via the same runtime the scheduled job's
+    run_swarm path uses (structured variables), returning the run_id
+    immediately (execution is backgrounded)."""
+    from src.config import load_swarm_agent_config
+    from src.swarm.runtime import SwarmRuntime
+    store = _get_swarm_store()
+    runtime = SwarmRuntime(store=store, agent_config=load_swarm_agent_config())
+    run = runtime.start_run(
+        COMMITTEE_PRESET,
+        {"target": symbol, "timeframe": timeframe},
+        include_shell_tools=_include_shell_tools,
+    )
+    return run.id
+
+
+def _committee_timeframe() -> str:
+    return os.getenv("VIBE_COMMITTEE_TIMEFRAME", "").strip() or "72h swing"
+
+
 def _default_goal_criteria() -> list[str]:
     """Return the MVP finance protocol checklist."""
     from src.goal.context import default_goal_criteria
@@ -2277,6 +2379,80 @@ def _register_committee_read_tools(mcp: "FastMCP") -> None:
         equity = snaps[-1] if snaps else {"cash": (store.load_account() or {}).get("cash")}
         ledger_tail = list(store.iter_ledger())[-20:]
         return _json_ok(equity=equity, ledger_tail=ledger_tail)
+
+    if not _mcp_trigger_enabled():
+        return
+
+    @mcp.tool
+    def run_committee(symbol: str, note: str | None = None) -> str:
+        """Trigger a crypto_committee run for ``symbol`` (double-gated).
+
+        Fail-fast: the symbol is validated against the same instrument
+        resolution + grounding rules as scheduled runs (no ungrounded run can
+        be triggered). Capped at VIBE_MCP_TRIGGER_BUDGET runs per UTC day
+        (file-backed audit is the single source of truth — over budget returns
+        a structured refusal and never queues). Returns {run_id}; poll
+        list_committee_runs / get_run_transcript for completion.
+
+        Args:
+            symbol: Instrument to analyze, e.g. "BTC-USDT".
+            note: Optional free-text note recorded in the audit log.
+        """
+        from datetime import datetime, timezone
+
+        def _audit(accepted: bool, *, reason=None, run_id=None):
+            _append_trigger_audit({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol, "note": note, "accepted": accepted,
+                **({"reason": reason} if reason else {}),
+                **({"run_id": run_id} if run_id else {}),
+            })
+
+        # 1. Symbol shape resolution (cheap, deterministic).
+        resolved = _grounding_resolve(symbol)
+        if resolved is None:
+            _audit(False, reason="could not resolve a tradable symbol from input")
+            return _json_error(
+                f"could not resolve a tradable instrument from {symbol!r}",
+                error_type="validation")
+
+        # 2. Budget (file-backed; counts accepted rows in the current UTC day).
+        # Checked before the network grounding fetch below so an
+        # over-budget call never wastes a fetch, and a validation refusal
+        # (accepted=false) never consumes budget since only accepted=true
+        # rows are counted by _triggers_used_today.
+        now = datetime.now(timezone.utc)
+        used = _triggers_used_today(_load_trigger_audit(), now=now)
+        budget = _trigger_budget()
+        if used >= budget:
+            _audit(False, reason="budget_exhausted")
+            return json.dumps({
+                "status": "error", "error_type": "budget_exhausted",
+                "error": f"daily committee-trigger budget ({budget}) exhausted",
+                "resets_at": _utc_day_reset(now),
+            }, ensure_ascii=False, indent=2)
+
+        # 3. Deep grounding validation (real market data must exist).
+        try:
+            data = _grounding_fetch(resolved)
+        except Exception as exc:
+            _audit(False, reason=f"grounding fetch failed: {exc}")
+            return _json_error(f"grounding fetch failed for {resolved}: {exc}",
+                               error_type="validation")
+        if resolved not in data or not data.get(resolved):
+            _audit(False, reason="no market data for symbol (ungrounded)")
+            return _json_error(
+                f"no market data resolved for {resolved}; refusing ungrounded run",
+                error_type="validation")
+
+        # 4. Dispatch + record the accepted run.
+        try:
+            run_id = _dispatch_committee_run(resolved, _committee_timeframe())
+        except Exception as exc:
+            _audit(False, reason=f"dispatch failed: {exc}")
+            return _json_error(f"committee dispatch failed: {exc}")
+        _audit(True, run_id=run_id)
+        return _json_ok(run_id=run_id, symbol=resolved, note=note)
 
 
 if _mcp_committee_enabled():
