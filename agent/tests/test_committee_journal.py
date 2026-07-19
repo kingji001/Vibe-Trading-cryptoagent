@@ -334,7 +334,33 @@ def test_derive_run_id_anchored_to_swarm_runs_segment():
     assert _derive_run_id("") is None
 
 
-def test_tool_append_explicit_run_id_wins_over_run_dir(jtool, jpath, monkeypatch):
+def test_tool_append_derived_run_id_overrides_mismatched_explicit(jtool, jpath, monkeypatch):
+    """Live incident 2026-07-19 (run swarm-20260719-204809-6500134e): the PM
+    appended six rows by mutating its run_id ("-corrected-no-execution",
+    "-final", ...), defeating (run_id, symbol) idempotency. The runtime-injected
+    run_dir is ground truth — when it derives a run_id, a mismatched
+    model-supplied run_id must be overridden (and the correction surfaced)."""
+    monkeypatch.setenv("VIBE_PAPER_ENABLED", "")
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Hold",
+            time_horizon="72h swing",
+            run_id="derived-run-corrected-no-execution",
+            run_dir="/tmp/x/.swarm/runs/derived-run/artifacts/pm",
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["entry"]["run_id"] == "derived-run"
+    assert out["run_id_corrected"] == {
+        "from": "derived-run-corrected-no-execution", "to": "derived-run",
+    }
+
+
+def test_tool_append_explicit_run_id_used_when_run_dir_underivable(jtool, jpath, monkeypatch):
+    """Without a derivable run_dir (CLI/manual use) the caller's run_id still
+    stands — the override only fires when the injected path knows better."""
     monkeypatch.setenv("VIBE_PAPER_ENABLED", "")
     out = json.loads(
         jtool.execute(
@@ -343,10 +369,42 @@ def test_tool_append_explicit_run_id_wins_over_run_dir(jtool, jpath, monkeypatch
             rating="Hold",
             time_horizon="72h swing",
             run_id="explicit-run",
-            run_dir="/tmp/x/.swarm/runs/derived-run/artifacts/pm",
+            run_dir="/home/user/checkout/artifacts/pm",  # no .swarm/runs segment
         )
     )
     assert out["entry"]["run_id"] == "explicit-run"
+    assert "run_id_corrected" not in out
+
+
+def test_tool_append_mutated_run_ids_collapse_to_one_entry_with_dedupe_signal(
+    jtool, jpath, monkeypatch
+):
+    """The incident's exact shape: repeated appends with mutated run_id strings
+    but the same run_dir must (1) produce exactly ONE journal entry and
+    (2) tell the model so explicitly (deduplicated: true) instead of returning
+    an indistinguishable success it will keep 'correcting'."""
+    monkeypatch.setenv("VIBE_PAPER_ENABLED", "")
+    run_dir = "/tmp/x/.swarm/runs/run-abc/artifacts/portfolio_manager"
+    first = json.loads(
+        jtool.execute(
+            action="append", symbol="BTC-USDT", rating="Hold",
+            time_horizon="72h swing", run_id="run-abc", run_dir=run_dir,
+        )
+    )
+    assert "deduplicated" not in first
+    for mutated in ("run-abc-corrected-no-execution", "run-abc-final", ""):
+        out = json.loads(
+            jtool.execute(
+                action="append", symbol="BTC-USDT", rating="Hold",
+                time_horizon="72h swing", run_id=mutated, run_dir=run_dir,
+            )
+        )
+        assert out["status"] == "ok"
+        assert out["deduplicated"] is True
+        assert out["entry"]["id"] == first["entry"]["id"]
+    entries = journal.load_entries(jpath)
+    assert len(entries) == 1
+    assert entries[0]["run_id"] == "run-abc"
 
 
 def test_tool_append_retry_same_run_dir_idempotent_hook_runs_once(

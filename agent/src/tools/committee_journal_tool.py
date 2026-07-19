@@ -228,10 +228,23 @@ class DecisionJournalTool(BaseTool):
                             f"got {value}"
                         )
                     execution[field] = value
-                # Review C3: derive run_id from the injected run_dir when the PM
-                # didn't pass one explicitly, so (run_id, symbol) idempotency
-                # protects against retried-task double-execution.
-                run_id = kwargs.get("run_id") or _derive_run_id(kwargs.get("run_dir"))
+                # Review C3 + live incident 2026-07-19: the runtime-injected
+                # run_dir is ground truth for run identity. A model-supplied
+                # run_id that disagrees is overridden (the PM once mutated its
+                # run_id — "-corrected-no-execution", "-final" — to defeat
+                # (run_id, symbol) idempotency and spam six rows for one run).
+                # Without a derivable run_dir (CLI/manual), the caller's
+                # run_id stands.
+                supplied = kwargs.get("run_id") or None
+                derived = _derive_run_id(kwargs.get("run_dir"))
+                corrected = None
+                if derived and supplied and supplied != derived:
+                    corrected = {"from": supplied, "to": derived}
+                run_id = derived or supplied
+                already = bool(run_id) and any(
+                    e.get("run_id") == run_id and e.get("symbol") == kwargs["symbol"]
+                    for e in journal.load_entries()
+                )
                 entry = journal.append_decision(
                     symbol=kwargs["symbol"],
                     rating=kwargs["rating"],
@@ -245,11 +258,24 @@ class DecisionJournalTool(BaseTool):
                     "entry_id": entry["id"],
                     "entry": entry,
                 }
+                if corrected:
+                    result["run_id_corrected"] = corrected
+                if already:
+                    # Explicit stop signal — a silent identical-looking success
+                    # is what sent the PM into its re-append "correction" loop.
+                    result["deduplicated"] = True
+                    result["note"] = (
+                        "This (run_id, symbol) decision was already journaled — "
+                        "no new entry was created. Do NOT append again this run."
+                    )
+                    return json.dumps(result, ensure_ascii=False, default=str)
                 # Paper-trading execution hook (Task 5): translate the
                 # just-journaled decision into a paper order. Never fails the
                 # append — maybe_execute_paper catches everything and returns
                 # None fast when VIBE_PAPER_ENABLED is falsy, in which case
                 # the paper_execution key is omitted entirely (not null).
+                # Deduped repeats return above: the original append already
+                # ran the hook.
                 from src.paper.hook import maybe_execute_paper
 
                 paper_execution = maybe_execute_paper(entry)
