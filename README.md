@@ -670,6 +670,7 @@ The interactive TUI (`vibe-trading`) now uses a terminal-native transcript: a st
 vibe-trading               # interactive TUI
 vibe-trading run -p "..."  # single run
 vibe-trading serve         # API server
+vibe-trading ui            # build/start/attach + open the Committee Observatory (/committee)
 vibe-trading alpha list    # browse 456 pre-built alphas; show / bench / compare / export-manifest sub-commands available
 vibe-trading channels status --local  # inspect IM channel config and install hints
 vibe-trading provider doctor  # print redacted provider/proxy/package diagnostics
@@ -1043,6 +1044,12 @@ To use with OpenSpace, add both MCP servers to your agent config:
 OpenSpace will auto-discover all 79 skills, enabling auto-fix, auto-improve, and community sharing. Search for Vibe-Trading skills via `search_skills("finance backtest")` in any OpenSpace-connected agent.
 
 </details>
+
+**Committee-specific tools (opt-in, default OFF):** `committee_performance`,
+`list_decisions`, `get_decision`, `list_committee_runs`, `get_run_transcript`,
+`paper_account`, and (double-gated) `run_committee` — see
+[`docs/crypto-committee.md`, "Connecting an external agent (MCP)"](docs/crypto-committee.md#connecting-an-external-agent-mcp)
+for the env gates and connection instructions.
 
 ---
 

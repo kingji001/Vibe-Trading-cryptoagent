@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import uuid
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -4256,6 +4257,12 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--port", type=int, default=8000, help="Listen port")
     serve_parser.add_argument("--dev", action="store_true", help="Start the Vite dev server")
 
+    ui_parser = subparsers.add_parser(
+        "ui", help="Build the frontend if needed, start/attach the API server, and open the Committee Observatory"
+    )
+    ui_parser.add_argument("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
+    ui_parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
+
     provider_parser = subparsers.add_parser("provider", help="Manage OAuth providers")
     provider_subparsers = provider_parser.add_subparsers(dest="provider_command")
     login_parser = provider_subparsers.add_parser("login", help="Authenticate with an OAuth provider")
@@ -5566,6 +5573,115 @@ def cmd_dev(
     return EXIT_SUCCESS
 
 
+def _probe_health(url: str, *, timeout: float = 2.0) -> bool:
+    """Return True if a GET against `url` returns HTTP 200.
+
+    Local import mirrors the existing httpx-on-demand pattern used
+    elsewhere in this module (e.g. `_live_api_call`, `_channels_api_call`).
+    Any failure (connection refused, timeout, DNS) means "not healthy" —
+    never raises.
+    """
+    import httpx
+
+    try:
+        response = httpx.get(url, timeout=timeout)
+        return response.status_code == 200
+    except Exception:  # noqa: BLE001 -- unreachable server is a normal, expected state here
+        return False
+
+
+def _wait_for_health(url: str, *, timeout_s: float = 30.0, poll_interval: float = 0.5) -> bool:
+    """Poll `_probe_health(url)` until healthy or `timeout_s` elapses.
+
+    Returns True the moment a probe succeeds (no extra sleep after success);
+    returns False once the deadline passes with no healthy probe.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if _probe_health(url):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval)
+
+
+def cmd_ui(
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    frontend_dir: Optional[Path] = None,
+) -> int:
+    """Build the frontend if needed, start/attach the API server, and open
+    the Committee Observatory.
+
+    Three branches, in order:
+
+    1. `frontend/dist/index.html` missing -> build it via
+       `npm --prefix frontend run build` when npm is on PATH (reusing the
+       same `_build_frontend_cmd`/`_run_step` steps as `cmd_setup`);
+       otherwise refuse with the exact manual build command.
+    2. `GET /health` not answering on `host:port` -> start `vibe-trading
+       serve` backgrounded (same invocation `cmd_dev` uses) and wait for it
+       to become healthy; if it is already answering, attach instead of
+       double-starting.
+    3. Open the system browser at `http://<host>:<port>/committee` via
+       `webbrowser.open`, printing the URL either way.
+
+    Never wraps `scripts/ops/run72.sh` — supervised evidence runs are a
+    deliberately separate workflow; this always starts a plain,
+    unsupervised serve for interactive use.
+    """
+    frontend_dir = frontend_dir or (AGENT_DIR.parent / "frontend")
+    dist_index = frontend_dir / "dist" / "index.html"
+
+    if not dist_index.exists():
+        node, npm = _resolve_node_and_npm()
+        if not node or not npm:
+            console.print(
+                f"[red]No frontend build found at {dist_index}, and npm is not on PATH.[/red]\n"
+                "[dim]Install Node.js (>= 18) from https://nodejs.org, then run:\n"
+                "  npm --prefix frontend run build\n"
+                "or  vibe-trading setup[/dim]"
+            )
+            return EXIT_USAGE_ERROR
+        console.print(f"[dim]No frontend build found at {dist_index}; building…[/dim]")
+        for step in _build_frontend_cmd(frontend_dir):
+            description = " ".join(step[:3])
+            if not _run_step(description, step, frontend_dir):
+                console.print("[red]Frontend build failed.[/red] See the error above.")
+                return EXIT_RUN_FAILED
+        if not dist_index.exists():
+            console.print(f"[red]Build completed but {dist_index} is still missing.[/red]")
+            return EXIT_RUN_FAILED
+
+    base_url = f"http://{host}:{port}"
+    health_url = f"{base_url}/health"
+    committee_url = f"{base_url}/committee"
+
+    if _probe_health(health_url):
+        console.print(f"[dim]Server already running at {base_url} — attaching.[/dim]")
+    else:
+        console.print(f"[dim]Starting server at {base_url} …[/dim]")
+        subprocess.Popen(
+            [sys.executable, "-m", "cli._legacy", "serve", "--host", host, "--port", str(port)],
+            cwd=str(AGENT_DIR),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if not _wait_for_health(health_url):
+            console.print(
+                f"[red]Server did not become healthy within 30s at {health_url}.[/red]"
+            )
+            return EXIT_RUN_FAILED
+
+    console.print(f"[green]Committee Observatory:[/green] {committee_url}")
+    try:
+        webbrowser.open(committee_url)
+    except Exception as exc:  # noqa: BLE001 -- headless/no-display is not a command failure
+        console.print(f"[dim]Could not auto-open a browser ({exc}); open the URL above manually.[/dim]")
+    return EXIT_SUCCESS
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint returning a process exit code."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
@@ -5595,6 +5711,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "serve":
         return serve_main(raw_argv[1:])
+    if args.command == "ui":
+        return _coerce_exit_code(cmd_ui(host=args.host, port=args.port))
     if args.command == "provider":
         if args.provider_command == "login":
             return cmd_provider_login(args.provider)

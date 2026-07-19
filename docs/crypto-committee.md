@@ -915,3 +915,146 @@ for the 4-step operational cutover protocol (freeze configs, run the daily
 scheduler on a fixed universe for 10–14 days, compare journal metrics,
 cutover criteria + rollback) and the honest caveat on what that evaluation
 window can and cannot prove.
+
+## Observing the committee
+
+`vibe-trading ui` (`agent/cli/_legacy.py`, `cmd_ui`) is the one-command way to
+watch the committee operate. It runs three steps in order, each idempotent:
+
+1. If `frontend/dist/index.html` is missing, build it via `npm --prefix
+   frontend run build` (refuses with the manual command if `npm` isn't on
+   `PATH`).
+2. Probe `GET /health` on `host:port` (defaults `127.0.0.1:8000`); if it
+   already answers, attach to that server instead of starting a second one.
+   Otherwise start `vibe-trading serve` in the background and poll `/health`
+   for up to 30s.
+3. Print `Committee Observatory: http://<host>:<port>/committee` and open the
+   system browser at that URL (`webbrowser.open`; a headless/no-display
+   failure prints the URL instead of failing the command).
+
+```bash
+vibe-trading ui                 # 127.0.0.1:8000
+vibe-trading ui --port 8899     # custom port, e.g. alongside another serve
+```
+
+This never wraps `scripts/ops/run72.sh` — supervised evidence runs are a
+separate workflow; `ui` always starts a plain, unsupervised `serve` for
+interactive use.
+
+The `/committee` dashboard and `/committee/runs/:runId` detail page
+(`frontend/src/router.tsx`) are **100% read-only views** — every number comes
+from an on-disk store (`PaperStore`, the swarm run store, the journal), never
+a live re-computation, and there is no button anywhere in the UI that starts,
+cancels, or reconfigures a committee run. Triggering a run from outside the
+scheduler is only possible through the MCP `run_committee` tool described
+below, which is an env-level opt-in, not a UI control.
+
+**`/committee` dashboard** polls every 30–60s (no dedicated SSE emitter — the
+page reuses the existing swarm event stream only when a run is live) and
+shows:
+
+- Paper account summary + equity curve (`GET /paper/status`, `/paper/equity`).
+- Scheduler health (`GET /scheduler/health`) — last fire time, next fire,
+  whether the daily job is armed.
+- MCP status card (`GET /mcp/status`) — the two gates' live on/off state and
+  today's trigger budget usage, read from the real env and the trigger audit
+  log, never assumed.
+- A runs table (`GET /committee/runs`) — the last N `crypto_committee` runs
+  joined to their journal outcome (rating, journal status), newest first.
+
+**`/committee/runs/:runId` discussion view** (`GET /committee/runs/{run_id}`)
+renders one run in pipeline order: each seat's `report.md` grouped by phase
+(analysis → debate → research management → trading → risk → decision), the
+bull/bear debate broken out by round, the portfolio manager's decision
+artifact, the journal outcome once resolved (horizons, reflection), and paper
+PnL for that decision. While the run is still in flight, the page live-follows
+it over the existing swarm SSE stream (the same stream `run_swarm` runs
+already use) and falls back to polling if the stream drops. Missing artifacts
+(e.g. a seat that hasn't reported yet, or a decision not yet journaled) render
+an explicit "not available" / `missing: true` state — nothing is ever
+fabricated to fill a gap.
+
+## Connecting an external agent (MCP)
+
+The committee is also reachable read-only (and, opt-in, triggerable) from any
+MCP client — an external agent, not just the bundled TUI. Everything here is
+double-gated and **default OFF**; with both env vars unset, `vibe-trading
+serve` and the `vibe-trading-mcp` stdio entry point are byte-identical to
+before this feature existed.
+
+| Env var | Default | Effect when truthy (`1`/`true`/`yes`/`on`) |
+|---|---|---|
+| `VIBE_MCP_COMMITTEE` | off | Registers the six read tools below and mounts the MCP streamable-HTTP app at `/mcp` inside `serve`. |
+| `VIBE_MCP_ALLOW_TRIGGER` | off | Only meaningful with `VIBE_MCP_COMMITTEE` also on. Additionally registers `run_committee`. |
+| `VIBE_MCP_TRIGGER_BUDGET` | `4` | Max `run_committee` triggers accepted per UTC day (file-backed count from the audit log — no in-memory counter that resets on restart). |
+
+**Read tools** (gate 1, `agent/mcp_server.py:2326`):
+
+- `committee_performance(window_hours=None, symbol=None)` — aggregate
+  direction-correct rate / alpha / paper PnL / cost per run over resolved
+  journal horizons, with the standing single-symbol alpha caveat.
+- `list_decisions(limit=20, symbol=None)` — journaled decisions, newest first.
+- `get_decision(decision_id)` — one decision with full horizons + reflection.
+- `list_committee_runs(limit=20, status=None)` — `crypto_committee` runs
+  joined to their journal entry.
+- `get_run_transcript(run_id, seat=None)` — per-seat reports, debate rounds,
+  and the portfolio manager's decision for one run (run fields nested under
+  a `"run"` key to match the REST `/committee/runs/{run_id}` shape).
+- `paper_account()` — marked equity plus a recent ledger tail (store-only, no
+  live price fetch).
+
+**Trigger tool** (gate 2, `run_committee(symbol, note=None)`): validates the
+symbol through the same grounding/instrument-resolution rules as scheduled
+runs (an ungrounded symbol is refused, not queued), dispatches through the
+same run path scheduled runs use, and returns `{run_id}` immediately — poll
+`list_committee_runs` or `get_run_transcript` for completion. Every attempt,
+accepted or refused, is appended to
+`~/.vibe-trading/committee/mcp_triggers.jsonl`; over-budget attempts return a
+structured `{error_type: "budget_exhausted", resets_at}` refusal rather than
+queuing.
+
+**Never exposed via MCP, by design:** config/env mutation, `paper reset`,
+scheduler management (arming/disarming the daily job), or strategy/mandate
+parameters. The tool group is observability plus one narrowly-scoped trigger
+— nothing that can change how the committee behaves.
+
+**Caveat — keep the calling session open.** `run_committee` dispatches the
+swarm as a background thread inside the same `vibe-trading-mcp` process that
+served the call, then returns immediately; it does not spawn a separately
+detached process. A client that connects, calls `run_committee`, and
+disconnects right away (e.g. a one-shot script) closes that process's stdio
+pipe, which the server reads as EOF and exits on — killing the in-flight run
+before any seat reports. A normal long-lived MCP session (Claude Desktop, an
+operator's own persistent agent) stays connected for the whole conversation
+and does not hit this; poll completion with `list_committee_runs` /
+`get_run_transcript` over that same session, or watch `/committee/runs/:runId`
+in the UI, which reads the on-disk store independently of the triggering
+client's connection.
+
+**Stdio connection** (same entry point as the rest of the MCP plugin,
+`vibe-trading-mcp` — see the [MCP Plugin](../README.md#-mcp-plugin) section
+of the README):
+
+```json
+{
+  "mcpServers": {
+    "vibe-trading": {
+      "command": "vibe-trading-mcp"
+    }
+  }
+}
+```
+
+Set `VIBE_MCP_COMMITTEE=1` (and, if the trigger tool is wanted,
+`VIBE_MCP_ALLOW_TRIGGER=1`) in the environment of the process that launches
+`vibe-trading-mcp` — most MCP clients let you set per-server `env` alongside
+`command` in that same config block.
+
+**HTTP connection**: when `serve` runs with gate 1 on, the same tool group is
+also reachable as a streamable-HTTP MCP app mounted at
+`http://127.0.0.1:8000/mcp` (subject to the same auth policy as the rest of
+`serve` — non-loopback clients still need `API_AUTH_KEY`).
+
+Check the live gate state at any time with `GET /mcp/status` — it reports
+both env gates' current on/off state and today's trigger budget usage read
+from the real audit log, never a value assumed from config.

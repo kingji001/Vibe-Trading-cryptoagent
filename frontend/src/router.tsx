@@ -25,6 +25,12 @@ const Correlation = lazy(() =>
 const AlphaZoo = lazy(() =>
   import("@/pages/AlphaZoo").then((m) => ({ default: m.AlphaZoo })),
 );
+const Committee = lazy(() =>
+  import("@/pages/Committee").then((m) => ({ default: m.Committee })),
+);
+const CommitteeRunDetail = lazy(() =>
+  import("@/pages/CommitteeRunDetail").then((m) => ({ default: m.CommitteeRunDetail })),
+);
 
 function PageLoader() {
   return (
@@ -58,6 +64,8 @@ export const router = createBrowserRouter([
       { path: "/alpha-zoo/bench", element: wrap(AlphaZoo) },
       { path: "/alpha-zoo/compare", element: wrap(AlphaZoo) },
       { path: "/alpha-zoo/:alphaId", element: wrap(AlphaZoo) },
+      { path: "/committee", element: wrap(Committee) },
+      { path: "/committee/runs/:runId", element: wrap(CommitteeRunDetail) },
     ],
   },
 ]);

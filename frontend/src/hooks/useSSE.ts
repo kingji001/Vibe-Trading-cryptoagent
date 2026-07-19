@@ -83,6 +83,12 @@ export function useSSE(config?: SSEConfig) {
       "text_delta", "reasoning_delta", "stream_reset", "thinking_done", "tool_call", "tool_result", "compact",
       "tool_heartbeat", "tool_progress", "llm_usage",
       "swarm.started", "swarm.event",
+      // Raw swarm run event types — /swarm/runs/:id/events (agent/src/api/swarm_routes.py)
+      // sends each event's own `type` directly as the SSE event name, unlike the
+      // chat-session stream's "swarm.event" envelope. Only the completion-signaling
+      // ones consumers actually key off of (CommitteeRunDetail's live-follow).
+      "task_completed", "worker_completed", "task_failed", "worker_failed",
+      "worker_timeout", "worker_incomplete", "run_completed", "run_error",
       "attempt.created", "attempt.started", "attempt.completed", "attempt.failed",
       "message.received", "session.created",
       "goal.created", "goal.evidence", "goal.updated",
