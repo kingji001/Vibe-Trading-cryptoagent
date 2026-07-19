@@ -6,6 +6,19 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Committee Observatory UI + MCP interface.** A `/committee` operator
+  dashboard (paper account + equity, scheduler health, MCP status, runs
+  table) and a `/committee/runs/:runId` discussion view (every seat's report,
+  the debate, the decision, journal outcome, paper PnL; live-follows a
+  running committee via the existing swarm SSE stream). New read-only REST
+  endpoints (`/committee/runs`, `/journal/decisions`, `/scheduler/health`,
+  `/mcp/status`) plus paper endpoints per the ops-dashboard spec. A
+  double-gated MCP tool group (`VIBE_MCP_COMMITTEE` / `VIBE_MCP_ALLOW_TRIGGER`,
+  both default OFF) exposes committee performance/decisions/transcripts and
+  an optional, budget-capped `run_committee` trigger to external agents (no
+  strategy-knob mutation, ever). New `vibe-trading ui` command builds the
+  frontend if needed, starts/attaches `serve`, and opens the browser on
+  `/committee`.
 - **MiniMax M3 migration + provider hardening (#1).** New M3 provider path with
   a phased probe script and migration notes, `<think>`-tag stripping, and
   typed `reasoning_details` replay (live 400s on string/empty payloads). Adds
