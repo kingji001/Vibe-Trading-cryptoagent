@@ -187,6 +187,49 @@ def test_list_committee_runs_join_and_status_filter(monkeypatch, committee_env):
     assert [r["run_id"] for r in running["runs"]] == ["swarm-ccc33333"]
 
 
+def test_list_committee_runs_scans_past_hardcoded_cap_of_noncommittee_runs(
+        monkeypatch, committee_env):
+    """A committee run older than 200 non-committee runs must still surface.
+
+    Regression for list_committee_runs (and, by the same code path,
+    committee_performance) scanning only the newest N total runs (across all
+    presets) before filtering to crypto_committee: a committee run that
+    isn't in the newest N overall was silently dropped even though the
+    caller's `limit` was far from satisfied.
+    """
+    from src.swarm.models import RunStatus, SwarmRun
+
+    swarm_root = committee_env["swarm_root"]
+    base = datetime(2026, 7, 19, 0, 0, 0, tzinfo=timezone.utc)
+
+    # The committee run is older than every synthetic non-committee run
+    # seeded below, so the old hardcoded 200-run cap would bury it.
+    old_run = SwarmRun(
+        id="committee-old", preset_name="crypto_committee",
+        status=RunStatus.completed,
+        user_vars={"target": "BTC-USDT"},
+        created_at=(base - timedelta(hours=1)).isoformat(),
+    )
+    old_dir = swarm_root / "committee-old"
+    old_dir.mkdir()
+    (old_dir / "run.json").write_text(old_run.model_dump_json(), encoding="utf-8")
+
+    for i in range(250):
+        rd = swarm_root / f"other-{i:04d}"
+        rd.mkdir()
+        run = SwarmRun(
+            id=f"other-{i:04d}", preset_name="research_team",
+            status=RunStatus.completed,
+            created_at=(base + timedelta(seconds=i)).isoformat(),
+        )
+        (rd / "run.json").write_text(run.model_dump_json(), encoding="utf-8")
+
+    mod = _reload_mcp(monkeypatch, VIBE_MCP_COMMITTEE="1")
+    payload = _call(mod, "list_committee_runs", limit=10)
+    assert payload["status"] == "ok"
+    assert [r["run_id"] for r in payload["runs"]] == ["committee-old"]
+
+
 def test_get_run_transcript(monkeypatch, committee_env):
     _seed_committee_run(
         committee_env["swarm_root"], run_id="swarm-aaa11111",

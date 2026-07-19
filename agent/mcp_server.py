@@ -149,6 +149,17 @@ _MCP_COMMITTEE_ENV = "VIBE_MCP_COMMITTEE"
 _MCP_ALLOW_TRIGGER_ENV = "VIBE_MCP_ALLOW_TRIGGER"
 COMMITTEE_PRESET = "crypto_committee"
 
+# Safety ceiling on how many total swarm runs (all presets) the committee
+# projections scan looking for crypto_committee rows. SwarmStore.list_runs
+# already reads every run.json under the runs root before sorting/truncating,
+# so raising this ceiling costs nothing extra beyond that existing full scan
+# -- it only bounds how far back we're willing to look for committee rows
+# among heavy non-committee swarm usage. A low, hardcoded cap here previously
+# dropped committee runs older than the newest N runs overall even when the
+# caller's `limit` was far from satisfied. Sized generously (thousands) so it
+# only bites in extreme run-volume scenarios.
+_RUN_SCAN_CEILING = 5000
+
 ALPHA_CAVEAT = (
     "Alpha is measured against BTC-USDT. For a single-symbol universe (or the "
     "benchmark asset itself) alpha vs a same-symbol benchmark is definitionally "
@@ -248,7 +259,7 @@ def _committee_runs_joined(store, *, limit: int, status: str | None):
     from src.committee.journal import load_entries
     entries_by_run = {e.get("run_id"): e for e in load_entries() if e.get("run_id")}
     rows: list[dict] = []
-    for run in store.list_runs(limit=200):
+    for run in store.list_runs(limit=_RUN_SCAN_CEILING):
         if run.preset_name != COMMITTEE_PRESET:
             continue
         recon = store.reconcile_run(run, write=False)
@@ -416,7 +427,7 @@ def _committee_run_cost_summary(window_hours: int | None, symbol: str | None) ->
     if window_hours is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
     ins, outs, walls, n = [], [], [], 0
-    for run in store.list_runs(limit=500):
+    for run in store.list_runs(limit=_RUN_SCAN_CEILING):
         if run.preset_name != COMMITTEE_PRESET:
             continue
         if symbol and (run.user_vars or {}).get("target") != symbol:
