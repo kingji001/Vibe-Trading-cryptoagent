@@ -257,12 +257,14 @@ def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None)
         never fails because one run is unreadable).
         """
         journal_map = _journal_by_run_id()
-        runs = _swarm_store().list_runs(limit=_RUN_SCAN_CEILING)
+        store = _swarm_store()
+        runs = store.list_runs(limit=_RUN_SCAN_CEILING)
         sym = symbol.upper() if symbol else None
         items: list[dict[str, Any]] = []
         for run in runs:
             if run.preset_name != _COMMITTEE_PRESET:
                 continue
+            run = store.reconcile_run(run, write=False)
             if status is not None and run.status.value != status:
                 continue
             if sym is not None and (run.user_vars.get("target") or "").upper() != sym:
@@ -278,9 +280,11 @@ def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None)
         journal outcome, and paper PnL. Missing artifacts -> explicit markers,
         never fabricated."""
         _host_validate_path_param(run_id, "run_id")
-        run = _swarm_store().load_run(run_id)
+        store = _swarm_store()
+        run = store.load_run(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+        run = store.reconcile_run(run, write=False)
 
         run_dir = _swarm_runs_root() / run_id
         decision = _read_decision(run_dir)

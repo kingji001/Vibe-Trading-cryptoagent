@@ -189,6 +189,47 @@ def test_run_detail_rejects_path_traversal(_tmp_swarm_and_journal):
     assert _client().get("/committee/runs/..%2f..").status_code in (400, 404)
 
 
+def _seed_stale_run(runs_root: Path, run_id: str, *, target="BTC-USDT"):
+    """A run whose host process died mid-flight: run.json still says
+    "running" but there's no events.jsonl activity and created_at is far
+    past SwarmStore's stale threshold (60s minimum, see
+    compute_stale_threshold), and the one task is still non-terminal. No
+    events.jsonl file at all -> reconcile_run's is_run_stale falls back to
+    created_at for "last activity", so this alone is enough to trip the
+    reap path without needing a live heartbeat file.
+    """
+    rd = runs_root / run_id
+    (rd / "artifacts" / "portfolio_manager").mkdir(parents=True)
+    stale_created_at = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    tasks = [
+        SwarmTask(id="task-decision", agent_id="portfolio_manager", prompt_template="",
+                  status=TaskStatus.in_progress),
+    ]
+    run = SwarmRun(
+        id=run_id, preset_name="crypto_committee", status=RunStatus.running,
+        user_vars={"target": target, "timeframe": "72h swing"}, tasks=tasks,
+        created_at=stale_created_at,
+    )
+    (rd / "run.json").write_text(run.model_dump_json(indent=2), encoding="utf-8")
+    return rd
+
+
+def test_runs_list_reconciles_stale_running_to_failed(_tmp_swarm_and_journal):
+    """A run whose host process died mid-flight must not show "running"
+    forever in /committee/runs -- it should reconcile the same way MCP's
+    list_committee_runs does (store.reconcile_run(run, write=False))."""
+    _seed_stale_run(_tmp_swarm_and_journal, "swarm-stale-dead")
+    rows = _client().get("/committee/runs").json()
+    row = next(r for r in rows if r["run_id"] == "swarm-stale-dead")
+    assert row["status"] == "failed"
+
+
+def test_run_detail_reconciles_stale_running_to_failed(_tmp_swarm_and_journal):
+    _seed_stale_run(_tmp_swarm_and_journal, "swarm-stale-dead")
+    body = _client().get("/committee/runs/swarm-stale-dead").json()
+    assert body["run"]["status"] == "failed"
+
+
 # --- Task R3: journal / scheduler / mcp-status ------------------------------
 
 
