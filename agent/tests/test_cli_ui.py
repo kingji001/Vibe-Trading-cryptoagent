@@ -54,6 +54,45 @@ class TestNoDist:
         mock_popen.assert_called_once()  # serve was down -> started
         mock_open.assert_called_once_with("http://127.0.0.1:8000/committee")
 
+    def test_windows_build_invokes_resolved_npm_path(self, tmp_path: Path) -> None:
+        """On Windows npm ships as npm.cmd; subprocess.run does not consult
+        PATHEXT for bare names, so the build must invoke the resolved path
+        (cmd_setup already does — cmd_ui's build loop must too)."""
+        frontend_dir = _frontend_without_dist(tmp_path)
+        npm_path = r"C:\Program Files\nodejs\npm.cmd"
+
+        def _fake_run(cmd, **kwargs):
+            (frontend_dir / "dist").mkdir(exist_ok=True)
+            (frontend_dir / "dist" / "index.html").write_text("<html></html>")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(cli._legacy, "_resolve_node_and_npm", return_value=(r"C:\node.exe", npm_path)):
+            with patch.object(cli._legacy, "_is_windows", return_value=True):
+                with patch("cli._legacy.subprocess.run", side_effect=_fake_run) as mock_run:
+                    with patch.object(cli._legacy, "_wait_for_health", return_value=True):
+                        with patch("cli._legacy.subprocess.Popen"):
+                            with patch.object(cli._legacy.webbrowser, "open"):
+                                rc = cli._legacy.cmd_ui(frontend_dir=frontend_dir)
+
+        assert rc == cli._legacy.EXIT_SUCCESS
+        invoked = [call.args[0][0] for call in mock_run.call_args_list]
+        assert invoked and all(head == npm_path for head in invoked), invoked
+
+    def test_refusal_names_node_when_only_node_missing(self, tmp_path: Path, capsys) -> None:
+        """node absent but npm present must not claim "npm is not on PATH"."""
+        frontend_dir = _frontend_without_dist(tmp_path)
+        with patch.object(cli._legacy, "_resolve_node_and_npm", return_value=(None, "/usr/bin/npm")):
+            with patch("cli._legacy.subprocess.Popen") as mock_popen:
+                with patch.object(cli._legacy.webbrowser, "open") as mock_open:
+                    rc = cli._legacy.cmd_ui(frontend_dir=frontend_dir)
+        out = capsys.readouterr().out
+        assert rc == cli._legacy.EXIT_USAGE_ERROR
+        # Own short line so rich's wrapping can't split the phrase; must name
+        # exactly what's missing (node), not blame the npm that IS present.
+        assert "Required tools not on PATH: node." in out
+        mock_popen.assert_not_called()
+        mock_open.assert_not_called()
+
     def test_refuses_when_npm_missing(self, tmp_path: Path, capsys) -> None:
         frontend_dir = _frontend_without_dist(tmp_path)
         with patch.object(cli._legacy, "_resolve_node_and_npm", return_value=(None, None)):

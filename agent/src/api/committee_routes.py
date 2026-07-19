@@ -11,6 +11,7 @@ Auth/host-symbol resolution mirrors ``register_scheduled_routes`` (host
 from __future__ import annotations
 
 import json
+import os
 import sys as _sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -158,14 +159,10 @@ _MCP_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 def _truthy(env_name: str) -> bool:
-    import os
-
     return os.environ.get(env_name, "").strip().lower() in _MCP_TRUE_VALUES
 
 
 def _ops_root() -> Path:
-    import os
-
     override = os.environ.get("VIBE_OPS_ROOT")
     if override:
         return Path(override).expanduser()
@@ -176,8 +173,6 @@ def _mcp_triggers_path() -> Path:
     """Same file M3's run_committee writes. Honors the VIBE_MCP_TRIGGER_AUDIT
     override (hermetic tests / ops) exactly like mcp_server._mcp_triggers_path
     so REST and MCP always read/write one audit log."""
-    import os
-
     env = os.environ.get("VIBE_MCP_TRIGGER_AUDIT", "").strip()
     if env:
         return Path(env).expanduser()
@@ -399,8 +394,6 @@ def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None)
     @app.get("/mcp/status", dependencies=[Depends(require_auth)])
     async def mcp_status():
         """MCP interface gate state (read-only reflection of env toggles)."""
-        import os
-
         committee_on = _truthy("VIBE_MCP_COMMITTEE")
         try:
             budget = int(os.environ.get("VIBE_MCP_TRIGGER_BUDGET", "4"))
