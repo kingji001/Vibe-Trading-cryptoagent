@@ -106,5 +106,8 @@ def test_pnl_unknown_decision_is_not_executed_not_404():
 
 
 def test_pnl_rejects_path_traversal_decision_id():
-    resp = _client().get("/paper/pnl/..%2f..")
-    assert resp.status_code in (400, 404)
+    # %2f decodes to "/" before routing -> two segments, no route: 404.
+    assert _client().get("/paper/pnl/..%2f..").status_code == 404
+    # Backslash payload reaches the route as one segment -> the validator
+    # itself must fire with 400 (see test_committee_api counterpart).
+    assert _client().get("/paper/pnl/..%5c..").status_code == 400

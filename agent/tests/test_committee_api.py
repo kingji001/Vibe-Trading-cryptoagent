@@ -191,8 +191,24 @@ def test_run_detail_unknown_run_id_404(_tmp_swarm_and_journal):
     assert _client().get("/committee/runs/swarm-does-not-exist").status_code == 404
 
 
+def test_run_detail_corrupt_run_json_is_handled_500(_tmp_swarm_and_journal):
+    """A corrupt run.json must yield a deliberate 500 JSON error, not an
+    unhandled ValueError traceback (pre-store-fix it was even a TypeError)."""
+    rd = _seed_run(_tmp_swarm_and_journal, "run-corrupt")
+    (rd / "run.json").write_text("{ not json", encoding="utf-8")
+    resp = _client().get("/committee/runs/run-corrupt")
+    assert resp.status_code == 500
+    assert "corrupt" in resp.json()["detail"]
+
+
 def test_run_detail_rejects_path_traversal(_tmp_swarm_and_journal):
-    assert _client().get("/committee/runs/..%2f..").status_code in (400, 404)
+    # %2f decodes to "/" before routing, so "..%2f.." is two path segments and
+    # no route matches: deterministic 404 (was the loose `in (400, 404)`).
+    assert _client().get("/committee/runs/..%2f..").status_code == 404
+    # A backslash payload DOES reach the route as one segment — this is the
+    # probe that proves _validate_path_param itself fires (400, not a lookup
+    # 404 that a silently-skipped validator would produce).
+    assert _client().get("/committee/runs/..%5c..").status_code == 400
 
 
 def _seed_stale_run(runs_root: Path, run_id: str, *, target="BTC-USDT"):

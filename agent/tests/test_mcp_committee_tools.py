@@ -240,6 +240,11 @@ def test_get_run_transcript(monkeypatch, committee_env):
 
     payload = _call(mod, "get_run_transcript", run_id="swarm-aaa11111")
     assert payload["status"] == "ok"
+    # Run fields are nested under "run" so the run's own status can't clobber
+    # the envelope's "status": "ok" — assert the contents, not just the shape.
+    assert payload["run"] == {
+        "run_id": "swarm-aaa11111", "status": "completed", "target": "BTC-USDT",
+    }
     seats = {s["agent_id"]: s for s in payload["seats"]}
     assert "Bull case" in seats["bull_researcher"]["report_md"]
     assert seats["bull_researcher"]["round"] == 1

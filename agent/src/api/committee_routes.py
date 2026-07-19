@@ -281,7 +281,12 @@ def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None)
         never fabricated."""
         _host_validate_path_param(run_id, "run_id")
         store = _swarm_store()
-        run = store.load_run(run_id)
+        try:
+            run = store.load_run(run_id)
+        except ValueError:
+            # Unreadable/corrupt run.json (load_run flattens parse failures to
+            # ValueError) — a deliberate 500, not an unhandled traceback.
+            raise HTTPException(status_code=500, detail=f"Run {run_id} data corrupt")
         if run is None:
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
         run = store.reconcile_run(run, write=False)
