@@ -15,6 +15,10 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import Depends, FastAPI, Query
 
+from src.paper import pnl as pnl_mod
+from src.paper.broker import PaperBroker
+from src.paper.store import PaperStore, paper_root
+
 AuthDep = Callable[..., Awaitable[Any] | Any]
 
 
@@ -41,9 +45,6 @@ def register_paper_routes(app: FastAPI, require_auth: AuthDep | None = None) -> 
         positions are valued at ``avg_entry`` and flagged ``stale`` (never a
         fabricated price). Returns broker equity dict verbatim.
         """
-        from src.paper.broker import PaperBroker
-        from src.paper.store import PaperStore, paper_root
-
         return PaperBroker(PaperStore(paper_root())).equity()
 
     @app.get("/paper/ledger", dependencies=[Depends(require_auth)])
@@ -53,16 +54,12 @@ def register_paper_routes(app: FastAPI, require_auth: AuthDep | None = None) -> 
         Includes ``order_type=="noop"`` rows verbatim (they are real rows;
         the UI must not treat them as fills).
         """
-        from src.paper.store import PaperStore, paper_root
-
         rows = list(PaperStore(paper_root()).iter_ledger())
         return rows[-limit:]
 
     @app.get("/paper/equity", dependencies=[Depends(require_auth)])
     async def paper_equity():
         """All persisted equity snapshots (``store.iter_equity()``)."""
-        from src.paper.store import PaperStore, paper_root
-
         return list(PaperStore(paper_root()).iter_equity())
 
     @app.get("/paper/pnl/{decision_id}", dependencies=[Depends(require_auth)])
@@ -72,8 +69,5 @@ def register_paper_routes(app: FastAPI, require_auth: AuthDep | None = None) -> 
         Never 404s for a missing/unexecuted decision — resolves to
         ``executed: false``; only the path-param character class is validated.
         """
-        from src.paper import pnl as pnl_mod
-        from src.paper.store import PaperStore, paper_root
-
         _host_validate_path_param(decision_id, "decision_id")
         return pnl_mod.decision_pnl(decision_id, PaperStore(paper_root()))

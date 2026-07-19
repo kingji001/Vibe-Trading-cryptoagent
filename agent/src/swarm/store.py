@@ -196,7 +196,11 @@ class SwarmStore:
                 if attempt < len(_REPLACE_BACKOFF):
                     time.sleep(_REPLACE_BACKOFF[attempt])
         assert last is not None  # loop body sets `last` or returns
-        raise type(last)(redact_internal_paths(str(last))) from None
+        # ValueError subclasses (pydantic ValidationError, UnicodeDecodeError,
+        # json.JSONDecodeError) can't be rebuilt from a bare message — flatten
+        # them to ValueError; OSError subclasses re-raise as themselves.
+        kind = ValueError if isinstance(last, ValueError) else type(last)
+        raise kind(redact_internal_paths(str(last))) from None
 
     def update_run(self, run: SwarmRun) -> None:
         """Atomically update run state.

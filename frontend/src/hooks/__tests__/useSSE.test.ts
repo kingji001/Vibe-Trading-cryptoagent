@@ -193,6 +193,31 @@ describe("useSSE — event handling", () => {
   });
 });
 
+describe("useSSE — raw swarm run event names", () => {
+  // /swarm/runs/:id/events sends each event's own `type` as the SSE event
+  // name (no "swarm.event" envelope). CommitteeRunDetail's live-follow keys
+  // off these — if they drop out of knownTypes the hook silently never
+  // subscribes, so pin the subscription here.
+  it("delivers task_completed / run_completed to their handlers", () => {
+    const completions: unknown[] = [];
+    const runDone: unknown[] = [];
+    const { result } = renderHook(() => useSSE());
+
+    act(() =>
+      result.current.connect("http://test/events", {
+        task_completed: (data) => completions.push(data),
+        run_completed: (data) => runDone.push(data),
+      }),
+    );
+
+    act(() => MockEventSource.latest.emit("task_completed", { task_id: "task-bull" }, "evt-tc"));
+    act(() => MockEventSource.latest.emit("run_completed", { run_id: "swarm-x" }, "evt-rc"));
+
+    expect(completions).toEqual([{ task_id: "task-bull" }]);
+    expect(runDone).toEqual([{ run_id: "swarm-x" }]);
+  });
+});
+
 describe("useSSE — deduplication", () => {
   it("deduplicates events by lastEventId", () => {
     const messages: unknown[] = [];

@@ -604,9 +604,10 @@ class _McpHostAuthMiddleware:
     ``require_auth``/``Security(_security)`` machinery used by every REST
     route. This middleware wraps the mounted sub-app and calls
     ``_validate_api_auth`` directly -- the exact same policy function REST
-    routes use -- instead of re-deriving loopback/key logic here. Loopback
-    clients pass through untouched; non-loopback clients must present
-    ``API_AUTH_KEY`` via the same Bearer header REST routes require.
+    routes use -- instead of re-deriving loopback/key logic here. Every
+    request goes through the policy; it admits loopback clients without
+    credentials, while non-loopback clients must present ``API_AUTH_KEY``
+    via the same Bearer header REST routes require.
     """
 
     def __init__(self, asgi_app) -> None:

@@ -5304,14 +5304,31 @@ def _is_windows() -> bool:
 
 
 def _resolve_node_and_npm() -> tuple[Optional[str], Optional[str]]:
-    """Return ``(node_path, npm_path)`` if both are on PATH, else ``(None, None)``.
+    """Return ``(node_path, npm_path)``, each ``None`` when not on PATH.
 
-    Used by ``cmd_setup`` to fail fast with a clear message instead of
-    surfacing a cryptic ENOENT from npm itself.
+    Resolved independently so callers can name exactly which tool is
+    missing instead of surfacing a cryptic ENOENT from npm itself.
     """
     node = shutil.which("node")
     npm = shutil.which("npm")
     return node, npm
+
+
+def _frontend_build_steps(frontend_dir: Path, npm_path: str) -> list[list[str]]:
+    """`_build_frontend_cmd` steps with ``npm`` runnable via ``subprocess``.
+
+    On Windows npm ships as ``npm.cmd``; ``subprocess.run`` does not consult
+    ``PATHEXT`` for bare command names, so it would raise ``FileNotFoundError``
+    even though ``shutil.which("npm")`` returned a valid path. Substitute the
+    resolved path there; POSIX keeps the bare name.
+    """
+    steps = _build_frontend_cmd(frontend_dir)
+    if _is_windows():
+        steps = [
+            [npm_path, *step[1:]] if step and step[0] == "npm" else step
+            for step in steps
+        ]
+    return steps
 
 
 def _build_frontend_cmd(frontend_dir: Path) -> list[list[str]]:
@@ -5411,19 +5428,7 @@ def cmd_setup(frontend_dir: Path) -> int:
         )
         return EXIT_USAGE_ERROR
 
-    # On Windows, ``npm`` is shipped as ``npm.cmd``; ``subprocess.run`` does
-    # not consult ``PATHEXT`` for bare command names, so it would raise
-    # ``FileNotFoundError`` even though ``shutil.which("npm")`` returned a
-    # valid path. Resolve to the full path before invoking.
-    npm_path = npm
-    if _is_windows():
-        steps = [
-            [npm_path, *step[1:]] if step and step[0] == "npm" else step
-            for step in _build_frontend_cmd(frontend_dir)
-        ]
-    else:
-        steps = _build_frontend_cmd(frontend_dir)
-    for step in steps:
+    for step in _frontend_build_steps(frontend_dir, npm):
         description = " ".join(step[:3])  # e.g. "npm install --no-audit"
         if not _run_step(description, step, frontend_dir):
             return EXIT_RUN_FAILED
@@ -5637,15 +5642,17 @@ def cmd_ui(
     if not dist_index.exists():
         node, npm = _resolve_node_and_npm()
         if not node or not npm:
+            missing = [name for name, path_ in (("node", node), ("npm", npm)) if not path_]
             console.print(
-                f"[red]No frontend build found at {dist_index}, and npm is not on PATH.[/red]\n"
+                f"[red]No frontend build found at {dist_index}.[/red]\n"
+                f"[red]Required tools not on PATH: {', '.join(missing)}.[/red]\n"
                 "[dim]Install Node.js (>= 18) from https://nodejs.org, then run:\n"
                 "  npm --prefix frontend run build\n"
                 "or  vibe-trading setup[/dim]"
             )
             return EXIT_USAGE_ERROR
         console.print(f"[dim]No frontend build found at {dist_index}; building…[/dim]")
-        for step in _build_frontend_cmd(frontend_dir):
+        for step in _frontend_build_steps(frontend_dir, npm):
             description = " ".join(step[:3])
             if not _run_step(description, step, frontend_dir):
                 console.print("[red]Frontend build failed.[/red] See the error above.")

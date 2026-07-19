@@ -112,6 +112,24 @@ def test_load_run_retries_transient_read_then_parses(tmp_path, monkeypatch):
     assert calls["n"] >= 3
 
 
+@pytest.mark.parametrize("corrupt", ['{"id": 42}', "not-json{{{"])
+def test_load_run_corrupt_json_raises_plain_valueerror(tmp_path, corrupt):
+    """A persistently corrupt run.json must surface as a plain ValueError.
+
+    pydantic's ValidationError (and UnicodeDecodeError) can't be rebuilt from a
+    bare message string, so re-raising via ``type(last)(msg)`` turns a corrupt
+    run into a TypeError — reachable through /committee/runs/{run_id}.
+    """
+    store = SwarmStore(base_dir=tmp_path)
+    store.create_run(_run())
+    (tmp_path / "r" / "run.json").write_text(corrupt, encoding="utf-8")
+
+    with pytest.raises(ValueError) as excinfo:
+        store.load_run("r")
+    assert type(excinfo.value) is ValueError
+    assert str(excinfo.value)
+
+
 def test_load_run_missing_is_fast_none(tmp_path, monkeypatch):
     """Fast not-found path must stay immediate (guards get_run_result(bogus))."""
     store = SwarmStore(base_dir=tmp_path)
