@@ -530,14 +530,21 @@ class PaperBroker:
     def set_risk(
         self, symbol: str, *, stop: float | None, take_profit: float | None
     ) -> bool:
-        """Update stop / take-profit on a held position. Returns False if absent."""
+        """Update stop / take-profit on a held position. Returns False if absent.
+
+        Non-positive levels are IGNORED, never persisted: a stop of 0 is not
+        "no stop", it is a stop that can never trigger (``run_tick`` fires on
+        ``low <= stop``), so writing one would silently disarm a position that
+        already had real protection. Observed live — a PM journaled
+        ``stop_loss=0.0`` (run swarm-20260720-180033).
+        """
         positions = self.store.load_positions()
         held = self._find(positions, symbol)
         if held is None:
             return False
-        if stop is not None:
+        if stop is not None and stop > 0:
             held["stop"] = stop
-        if take_profit is not None:
+        if take_profit is not None and take_profit > 0:
             held["take_profits"] = [{"price": take_profit, "fraction": 1.0}]
         self.store.save_positions(positions)
         return True
