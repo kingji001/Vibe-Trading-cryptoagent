@@ -409,6 +409,20 @@ def test_set_risk_missing_symbol_returns_false(broker):
     assert broker.set_risk("ETH-USDT", stop=90.0, take_profit=None) is False
 
 
+@pytest.mark.parametrize("bad", [0.0, -1.0])
+def test_set_risk_ignores_non_positive_levels_keeping_existing(broker, bad):
+    """Live incident 2026-07-20 (run swarm-20260720-180033): the PM journaled
+    stop_loss=0.0 / take_profit=0.0. A zero stop is not "no stop" — it is a
+    stop that can NEVER trigger (the tick fires on low <= stop), and writing
+    it would silently erase a real protective stop on an open position.
+    Non-positive levels must be ignored, not persisted."""
+    broker.market_buy("BTC-USDT", 10_000.0, decision_id="d1", stop=90.0, take_profit=140.0)
+    assert broker.set_risk("BTC-USDT", stop=bad, take_profit=bad) is True
+    pos = broker.store.load_positions()[0]
+    assert pos["stop"] == pytest.approx(90.0, abs=ABS), "real stop must survive"
+    assert pos["take_profits"] == [{"price": 140.0, "fraction": 1.0}]
+
+
 def test_equity_reports_unrealized(broker):
     broker.market_buy("BTC-USDT", 10_000.0, decision_id="d1", stop=None, take_profit=None)
     fill = 100.0 * (1 + 5 / 10_000)

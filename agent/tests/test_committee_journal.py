@@ -334,6 +334,48 @@ def test_derive_run_id_anchored_to_swarm_runs_segment():
     assert _derive_run_id("") is None
 
 
+@pytest.mark.parametrize("bad", [0, 0.0, "0", -5])
+def test_tool_append_non_positive_price_levels_become_null(jtool, jpath, monkeypatch, bad):
+    """Live incident 2026-07-20: a Hold was journaled with stop_loss=0.0,
+    take_profit=0.0, price_target=0. Zero is not a price — carried downstream
+    it becomes a stop that can never trigger. Non-positive PRICE fields
+    resolve to None (the "not specified" contract the translator already
+    handles), and the drop is surfaced rather than silent."""
+    monkeypatch.setenv("VIBE_PAPER_ENABLED", "")
+    out = json.loads(
+        jtool.execute(
+            action="append", symbol="BTC-USDT", rating="Hold",
+            time_horizon="72h swing", run_id=f"run-zero-{bad}",
+            stop_loss=bad, take_profit=bad, price_target=bad,
+        )
+    )
+    assert out["status"] == "ok"
+    entry = out["entry"]
+    # append_decision omits null execution fields entirely (byte-shape
+    # preservation for pre-existing rows) — absent is the "not specified"
+    # shape, and satisfies the contract as well as an explicit null.
+    assert entry.get("stop_loss") is None
+    assert entry.get("take_profit") is None
+    assert entry.get("price_target") is None
+    assert sorted(out["dropped_price_fields"]) == ["price_target", "stop_loss", "take_profit"]
+
+
+def test_tool_append_position_size_pct_zero_is_still_valid(jtool, jpath, monkeypatch):
+    """Guard the boundary: 0 is meaningless for a PRICE but legitimate for
+    position_size_pct (no position). It must not be swept up by the fix."""
+    monkeypatch.setenv("VIBE_PAPER_ENABLED", "")
+    out = json.loads(
+        jtool.execute(
+            action="append", symbol="BTC-USDT", rating="Hold",
+            time_horizon="72h swing", run_id="run-size-zero",
+            position_size_pct=0, stop_loss=61000.0,
+        )
+    )
+    assert out["entry"]["position_size_pct"] == 0.0
+    assert out["entry"]["stop_loss"] == 61000.0
+    assert "dropped_price_fields" not in out
+
+
 def test_tool_append_derived_run_id_overrides_mismatched_explicit(jtool, jpath, monkeypatch):
     """Live incident 2026-07-19 (run swarm-20260719-204809-6500134e): the PM
     appended six rows by mutating its run_id ("-corrected-no-execution",

@@ -206,6 +206,14 @@ class DecisionJournalTool(BaseTool):
                 missing = [k for k in ("symbol", "rating", "time_horizon") if not kwargs.get(k)]
                 if missing:
                     return self._err(f"append requires: {', '.join(missing)}")
+                # A price level of 0 (or negative) is not a price — it is the
+                # model declining to specify one. Carried downstream it becomes
+                # a stop that can never trigger, so resolve it to None (the
+                # "not specified" contract the translator already handles) and
+                # report the drop instead of silently keeping a fake level.
+                # position_size_pct is NOT a price: 0 legitimately means "no
+                # position" and must survive.
+                dropped_price_fields: list[str] = []
                 execution: dict[str, float | None] = {}
                 for field in ("stop_loss", "take_profit", "position_size_pct"):
                     try:
@@ -215,6 +223,9 @@ class DecisionJournalTool(BaseTool):
                             f"append: {field} must be a number (or a nullish string "
                             f"like 'n/a'), got {kwargs.get(field)!r}"
                         )
+                    if field != "position_size_pct" and value is not None and value <= 0:
+                        dropped_price_fields.append(field)
+                        value = None
                     # Review C1: an out-of-range position_size_pct must be
                     # rejected fail-before-write (the schema enforces [0,100] but
                     # the PM reaches the journal directly through this tool).
@@ -235,6 +246,17 @@ class DecisionJournalTool(BaseTool):
                 # (run_id, symbol) idempotency and spam six rows for one run).
                 # Without a derivable run_dir (CLI/manual), the caller's
                 # run_id stands.
+                # Same rule for price_target (kept on its own path so a valid
+                # value passes through in its original numeric shape).
+                price_target = kwargs.get("price_target")
+                try:
+                    pt_value = _coerce_optional_float(price_target)
+                except (TypeError, ValueError):
+                    pt_value = None  # append_decision keeps its own tolerance
+                if pt_value is not None and pt_value <= 0:
+                    dropped_price_fields.append("price_target")
+                    price_target = None
+
                 supplied = kwargs.get("run_id") or None
                 derived = _derive_run_id(kwargs.get("run_dir"))
                 corrected = None
@@ -249,7 +271,7 @@ class DecisionJournalTool(BaseTool):
                     symbol=kwargs["symbol"],
                     rating=kwargs["rating"],
                     time_horizon=kwargs["time_horizon"],
-                    price_target=kwargs.get("price_target"),
+                    price_target=price_target,
                     run_id=run_id,
                     **execution,
                 )
@@ -258,6 +280,13 @@ class DecisionJournalTool(BaseTool):
                     "entry_id": entry["id"],
                     "entry": entry,
                 }
+                if dropped_price_fields:
+                    result["dropped_price_fields"] = dropped_price_fields
+                    result["note_price_fields"] = (
+                        "Dropped as not-a-price (must be > 0): "
+                        + ", ".join(dropped_price_fields)
+                        + ". Supply a real level or omit the field."
+                    )
                 if corrected:
                     result["run_id_corrected"] = corrected
                 if already:
