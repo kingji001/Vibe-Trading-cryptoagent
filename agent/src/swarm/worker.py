@@ -70,6 +70,19 @@ _PERSIST_TRANSCRIPTS_ENV = "VIBE_SWARM_PERSIST_TRANSCRIPTS"
 _PERSIST_TRANSCRIPTS_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
+# Loop 2 (Completion). A seat that terminates without a complete deliverable
+# must be visible to every consumer downstream, not silently promoted to a
+# binding ruling. The marker is a literal string so it is greppable in
+# events.jsonl, messages.json, and a rendered prompt alike.
+INCOMPLETE_UPSTREAM_MARKER = "[INCOMPLETE UPSTREAM]"
+UPSTREAM_DEGRADATION_FILENAME = "upstream_degradation.json"
+FAILURE_CONTEXT_FILENAME = "failure_context.json"
+
+# Cap on recorded tool errors: a 50-iteration worker retrying a bad schema
+# would otherwise write an unbounded artifact.
+_MAX_RECORDED_TOOL_ERRORS = 20
+
+
 def _persist_transcripts_enabled() -> bool:
     """``VIBE_SWARM_PERSIST_TRANSCRIPTS`` opt-in: unset/falsy -> OFF."""
     return (
@@ -402,6 +415,7 @@ def run_worker(
 
     _KEEP_RECENT_TOOLS = 3
     data_tool_calls = 0
+    tool_errors: list[dict] = []
     content_filter_count = 0
     consecutive_content_filter_count = 0
 
@@ -721,7 +735,9 @@ def run_worker(
                     result = registry.execute(tc.name, args)
                 except PolicyDenied as exc:
                     result = exc.user_safe_message
-            if tc.name != "load_skill" and not _is_error_result(result):
+            if _is_error_result(result):
+                _record_tool_error(tool_errors, tc.name, iteration, result)
+            elif tc.name != "load_skill":
                 data_tool_calls += 1
             tc_elapsed = time.monotonic() - tc_start
             _emit(
@@ -745,6 +761,12 @@ def run_worker(
     summary = _resolve_summary(artifact_dir, summary)
     _write_summary(artifact_dir, summary)
     _persist_messages(artifact_dir, messages)
+    _write_failure_context(
+        artifact_dir,
+        reason="iteration_limit",
+        iterations=max_iterations,
+        tool_errors=tool_errors,
+    )
     reason = _classify_deliverable(
         summary,
         is_data_agent=_is_data_agent(agent_spec),
@@ -764,12 +786,22 @@ def run_worker(
             output_tokens=total_output_tokens,
             content_filter_warnings=content_filter_warnings,
         )
-    _emit(event_callback, "worker_iteration_limit", agent_id, task_id)
+    # The worker burned its whole budget without ever choosing to stop: its
+    # last text is mid-work, not a conclusion. Reporting this "completed"
+    # is what let a truncated scratch note become a binding ruling on
+    # 2026-07-28 (spec §4.1). Degraded keeps the run alive but marks the
+    # deliverable untrustworthy for every consumer.
+    _emit(event_callback, "worker_iteration_limit", agent_id, task_id,
+          {"iterations": max_iterations, "tool_errors": len(tool_errors)})
     return WorkerResult(
-        status="completed",
+        status="degraded",
         summary=summary,
         artifact_paths=_collect_artifacts(artifact_dir),
         iterations=max_iterations,
+        error=(
+            f"hit iteration limit ({max_iterations}) without completing the "
+            "deliverable; output is a partial working note"
+        ),
         input_tokens=total_input_tokens,
         output_tokens=total_output_tokens,
         content_filter_warnings=content_filter_warnings,
@@ -983,6 +1015,78 @@ def _maybe_persist_transcript(
     if final_content:
         transcript = [*messages, {"role": "assistant", "content": final_content}]
     _persist_messages(artifact_dir, transcript)
+
+
+def _record_tool_error(
+    sink: list[dict], tool_name: str, iteration: int, result: str
+) -> None:
+    """Append one structured tool-error entry, bounded in size.
+
+    Microcompaction rewrites older tool messages to ``[cleared]`` (see the
+    top of the ReAct loop), so the transcript cannot be scraped for this
+    after the fact — the 07-28 run's three consecutive ``strategic_actions``
+    validation errors were unrecoverable from ``messages.json`` for exactly
+    that reason. Capture at execution time instead.
+    """
+    if len(sink) >= _MAX_RECORDED_TOOL_ERRORS:
+        return
+    entry: dict = {"iteration": iteration, "tool": tool_name}
+    try:
+        parsed = json.loads(result)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        entry["error"] = parsed.get("error")
+        if parsed.get("issues"):
+            entry["issues"] = parsed["issues"]
+    else:
+        entry["error"] = (result or "")[:500]
+    sink.append(entry)
+
+
+def _recurring_tool_errors(tool_errors: list[dict]) -> list[dict]:
+    """Group identical tool errors so a retry loop is visible at a glance."""
+    counts: dict[tuple[str, str], int] = {}
+    for entry in tool_errors:
+        signature = json.dumps(
+            entry.get("issues") or entry.get("error"),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        key = (entry.get("tool") or "", signature)
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {"tool": tool, "signature": signature, "count": count}
+        for (tool, signature), count in sorted(counts.items())
+        if count >= 2
+    ]
+
+
+def _write_failure_context(
+    artifact_dir: Path,
+    *,
+    reason: str,
+    iterations: int,
+    tool_errors: list[dict],
+) -> None:
+    """Persist the structured post-mortem for a terminal worker failure."""
+    payload = {
+        "reason": reason,
+        "iterations": iterations,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "tool_errors": tool_errors,
+        "recurring_tool_errors": _recurring_tool_errors(tool_errors),
+    }
+    try:
+        (artifact_dir / FAILURE_CONTEXT_FILENAME).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.warning(
+            "Failed to write failure context to %s", artifact_dir, exc_info=True
+        )
 
 
 def _write_summary(artifact_dir: Path, summary: str) -> None:
