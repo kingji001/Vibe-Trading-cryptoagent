@@ -23,7 +23,12 @@ from src.swarm.models import (
     WorkerResult,
     WorkerStatus,
 )
-from src.swarm.worker import _recurring_tool_errors, run_worker
+from src.swarm.worker import (
+    INCOMPLETE_UPSTREAM_MARKER,
+    _recurring_tool_errors,
+    build_worker_prompt,
+    run_worker,
+)
 
 
 # --- Task 1: enum ----------------------------------------------------------
@@ -163,3 +168,70 @@ def test_recurring_tool_errors_ignores_one_offs():
     assert len(recurring) == 1
     assert recurring[0]["tool"] == "submit_decision"
     assert recurring[0]["count"] == 2
+
+
+def test_degraded_worker_writes_upstream_marker_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(backoff_mod.time, "sleep", lambda *_: None)
+    with (
+        patch.object(
+            worker_mod, "build_swarm_registry", lambda *a, **k: _ErrorRegistry()
+        ),
+        patch.object(worker_mod, "ChatLLM", _NeverStopsLLM()),
+    ):
+        run_worker(
+            agent_spec=_spec(id="portfolio_manager"),
+            task=SwarmTask(
+                id="t1", agent_id="portfolio_manager", prompt_template="Decide."
+            ),
+            upstream_summaries={"research_plan": "partial note"},
+            user_vars={},
+            run_dir=tmp_path,
+            degraded_upstreams={
+                "research_plan": "upstream task task-research-plan: x"
+            },
+        )
+    payload = json.loads(
+        (
+            tmp_path / "artifacts" / "portfolio_manager" / "upstream_degradation.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert payload["degraded_upstreams"] == [
+        {
+            "context_key": "research_plan",
+            "reason": "upstream task task-research-plan: x",
+        }
+    ]
+
+
+# --- Task 3: prompt marker -------------------------------------------------
+
+
+def test_prompt_tags_degraded_section_and_adds_banner():
+    prompt = build_worker_prompt(
+        _spec(id="trader"),
+        {"research_plan": "a partial note", "market_report": "a full report"},
+        "(no matching skills)",
+        degraded_upstreams={"research_plan": "upstream task task-research-plan: died"},
+    )
+    assert f"### research_plan {INCOMPLETE_UPSTREAM_MARKER}" in prompt
+    assert "### market_report\n" in prompt
+    assert "Upstream Integrity Warning" in prompt
+    assert "Buy / Overweight / Sell / Underweight" in prompt
+
+
+def test_prompt_unchanged_when_nothing_degraded():
+    args = (
+        _spec(id="trader"),
+        {"research_plan": "a full plan"},
+        "(no matching skills)",
+    )
+
+    def _stable(text: str) -> str:
+        # The trailing "Current Date & Time" section is clock-derived; drop it
+        # so this comparison cannot flake across a minute boundary.
+        return text.split("## Current Date & Time")[0]
+
+    assert _stable(build_worker_prompt(*args)) == _stable(
+        build_worker_prompt(*args, degraded_upstreams={})
+    )
+    assert INCOMPLETE_UPSTREAM_MARKER not in build_worker_prompt(*args)

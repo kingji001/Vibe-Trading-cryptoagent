@@ -198,6 +198,7 @@ def build_worker_prompt(
     upstream_summaries: dict[str, str],
     skill_descriptions: str,
     grounding_block: str = "",
+    degraded_upstreams: dict[str, str] | None = None,
 ) -> str:
     """Build the worker's system prompt with role, upstream context, and skills.
 
@@ -210,19 +211,40 @@ def build_worker_prompt(
             ahead of the Execution Rules section so the worker sees real
             recent prices before any tool decision. Empty string skips the
             section entirely.
+        degraded_upstreams: Mapping of context_key -> reason for upstream
+            deliverables that did NOT complete. Each matching section is
+            tagged with :data:`INCOMPLETE_UPSTREAM_MARKER` and a hard-rule
+            banner is appended, so a consuming seat can never mistake a
+            truncated working note for a binding ruling. Empty / ``None``
+            renders exactly the pre-Loop-2 prompt.
 
     Returns:
         Complete system prompt string for the worker LLM.
     """
-    upstream_block = ""
-    if upstream_summaries:
-        sections = []
-        for key, summary in upstream_summaries.items():
+    degraded = degraded_upstreams or {}
+    sections = []
+    for key, summary in upstream_summaries.items():
+        reason = degraded.get(key)
+        if reason:
+            sections.append(
+                f"### {key} {INCOMPLETE_UPSTREAM_MARKER}\n"
+                f"{INCOMPLETE_UPSTREAM_MARKER} — this upstream seat terminated "
+                f"before finishing its deliverable ({reason}). What follows is "
+                "an unfinished working note, NOT a binding ruling.\n\n"
+                f"{summary}"
+            )
+        else:
             sections.append(f"### {key}\n{summary}")
+
+    upstream_block = ""
+    if sections:
         upstream_block = (
             "## Upstream Context (from previous agents)\n\n"
             + "\n\n".join(sections)
         )
+    if degraded:
+        notice = _format_degradation_notice(degraded)
+        upstream_block = f"{upstream_block}\n\n{notice}" if upstream_block else notice
 
     prompt_parts = [
         f"## Role\n\n{agent_spec.role}",
@@ -318,6 +340,7 @@ def run_worker(
     include_shell_tools: bool = False,
     grounding_block: str = "",
     agent_config: AgentConfig | None = None,
+    degraded_upstreams: dict[str, str] | None = None,
 ) -> WorkerResult:
     """Execute a single worker task using a lightweight ReAct loop.
 
@@ -346,6 +369,11 @@ def run_worker(
             consumed by :func:`build_swarm_registry` to merge remote MCP
             tools with the local-tool pool before applying the agent's
             whitelist. ``None`` preserves the prior local-only behavior.
+        degraded_upstreams: Mapping of context_key -> reason for upstream
+            deliverables that did not complete. Rendered into the system
+            prompt by :func:`build_worker_prompt` and mirrored to
+            ``upstream_degradation.json`` in the artifact dir so the
+            ``submit_decision`` gate can refuse a sized directional call.
 
     Returns:
         WorkerResult with status, summary, artifacts, and iteration count.
@@ -372,7 +400,11 @@ def run_worker(
     skills_loader = SkillsLoader()
     skill_desc = _filter_skill_descriptions(skills_loader, agent_spec.skills)
     system_prompt = build_worker_prompt(
-        agent_spec, upstream_summaries, skill_desc, grounding_block=grounding_block,
+        agent_spec,
+        upstream_summaries,
+        skill_desc,
+        grounding_block=grounding_block,
+        degraded_upstreams=degraded_upstreams,
     )
 
     # 4. Resolve prompt template with user vars (missing vars → LLM infers)
@@ -402,6 +434,8 @@ def run_worker(
     # 6. ReAct loop
     artifact_dir = run_dir / "artifacts" / agent_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    if degraded_upstreams:
+        _write_upstream_degradation(artifact_dir, degraded_upstreams)
 
     t0 = time.monotonic()
     iteration = 0
@@ -1015,6 +1049,51 @@ def _maybe_persist_transcript(
     if final_content:
         transcript = [*messages, {"role": "assistant", "content": final_content}]
     _persist_messages(artifact_dir, transcript)
+
+
+def _format_degradation_notice(degraded_upstreams: dict[str, str]) -> str:
+    """Render the hard-rule banner for incomplete upstream deliverables."""
+    lines = "\n".join(
+        f"- `{key}` — {reason}" for key, reason in degraded_upstreams.items()
+    )
+    return (
+        f"## {INCOMPLETE_UPSTREAM_MARKER} Upstream Integrity Warning (HARD RULE)\n\n"
+        "These upstream deliverables are INCOMPLETE — the seat that produced "
+        "each one terminated before finishing:\n\n"
+        f"{lines}\n\n"
+        "Treat their content as an unfinished working note, never as a binding "
+        "ruling, and state in your own output which conclusions rest on one. If "
+        "you are the portfolio manager you MUST NOT submit a sized directional "
+        "decision (Buy / Overweight / Sell / Underweight) on this run — the "
+        "decision gate accepts only Hold while an upstream is incomplete."
+    )
+
+
+def _write_upstream_degradation(
+    artifact_dir: Path, degraded_upstreams: dict[str, str]
+) -> None:
+    """Mirror the degraded-upstream set into the artifact dir.
+
+    ``run_dir`` injected into every tool call IS this artifact dir, so
+    ``SubmitDecisionTool`` reads this file to enforce the Hold-only gate
+    without needing any knowledge of the run layout.
+    """
+    payload = {
+        "degraded_upstreams": [
+            {"context_key": key, "reason": reason}
+            for key, reason in degraded_upstreams.items()
+        ]
+    }
+    try:
+        (artifact_dir / UPSTREAM_DEGRADATION_FILENAME).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        logger.warning(
+            "Failed to write upstream degradation marker to %s",
+            artifact_dir,
+            exc_info=True,
+        )
 
 
 def _record_tool_error(
