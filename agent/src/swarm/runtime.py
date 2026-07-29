@@ -415,15 +415,23 @@ class SwarmRuntime:
                         # directional call while it stands (spec §4.2 C2.2).
                         all_succeeded = False
                         task_summaries[tid] = result.summary
-                        degraded_tasks[tid] = (
+                        # Hoisted once so the propagated (degraded_tasks),
+                        # persisted (update_status), and emitted (event data)
+                        # copies of the reason agree. redact_internal_paths
+                        # returns "" for None (src/tools/redaction.py:131-132),
+                        # so applying it to a bare `result.error` before the
+                        # fallback would have silently dropped the evidence
+                        # the fallback exists to preserve.
+                        reason = (
                             result.error or "seat did not complete its deliverable"
                         )
+                        degraded_tasks[tid] = reason
                         now_iso = datetime.now(timezone.utc).isoformat()
                         task_store.update_status(
                             tid,
                             TaskStatus.degraded,
                             summary=result.summary,
-                            error=redact_internal_paths(result.error),
+                            error=redact_internal_paths(reason),
                             completed_at=now_iso,
                             artifacts=result.artifact_paths,
                             worker_iterations=result.iterations,
@@ -437,7 +445,7 @@ class SwarmRuntime:
                                 data={
                                     "status": result.status,
                                     "iterations": result.iterations,
-                                    "error": redact_internal_paths(result.error),
+                                    "error": redact_internal_paths(reason),
                                     "input_tokens": result.input_tokens,
                                     "output_tokens": result.output_tokens,
                                 },
@@ -690,7 +698,12 @@ class SwarmRuntime:
             Mapping of task_id -> WorkerResult for all tasks in this layer.
         """
         results: dict[str, WorkerResult] = {}
-        degraded = degraded_tasks or {}
+        # `is not None` (not `or {}`): task_summaries is always the caller's
+        # live object, and the whole degraded-propagation contract rests on
+        # these two staying in lockstep. `or {}` would rebind `degraded` to a
+        # fresh dict whenever the accumulator is empty, decoupling it from
+        # any later mutation of the caller's degraded_tasks for this layer.
+        degraded = degraded_tasks if degraded_tasks is not None else {}
 
         def _event_callback(event: SwarmEvent) -> None:
             self._emit_event(run.id, event)

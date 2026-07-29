@@ -28,6 +28,7 @@ from src.swarm.models import (
     WorkerStatus,
 )
 from src.swarm.store import SwarmStore
+from src.swarm.task_store import TaskStore
 from src.swarm.worker import (
     INCOMPLETE_UPSTREAM_MARKER,
     _recurring_tool_errors,
@@ -386,3 +387,17 @@ def test_marker_is_always_co_delivered_with_the_content(tmp_path, monkeypatch):
     # is never orphaned by a seat that produced no text at all.
     assert trader["upstream"] == {"research_plan"}
     assert trader["degraded"] == {"research_plan"}
+
+
+def test_cancellation_does_not_erase_a_degraded_task(tmp_path):
+    """A degraded task is terminal: cancelling the run must not overwrite it."""
+    store, runtime, run = _two_task_run(tmp_path)
+    task_store = TaskStore(tmp_path / run.id)
+    for t in run.tasks:
+        task_store.save_task(t)
+    task_store.update_status(
+        "task-judge", TaskStatus.degraded, error="hit iteration limit"
+    )
+    runtime._cancel_remaining_tasks(task_store, ["task-trader"], task_store.load_all())
+    assert task_store.load_task("task-judge").status is TaskStatus.degraded
+    assert task_store.load_task("task-trader").status is TaskStatus.cancelled
