@@ -180,6 +180,52 @@ def test_run_detail_missing_report_marks_missing(_tmp_swarm_and_journal):
     assert market["missing"] is True
 
 
+def test_run_detail_forwards_degraded_seat_reason(_tmp_swarm_and_journal):
+    """Whole-branch review I4: the degraded seat's reason is the diagnostic
+    this whole branch exists to produce. It is persisted on the task and
+    emitted over SSE, but the detail endpoint built the seat dict from
+    status/phase/round alone and dropped ``task.error`` on the floor."""
+    rd = _seed_run(_tmp_swarm_and_journal, "run-degraded")
+    run = SwarmRun.model_validate_json((rd / "run.json").read_text(encoding="utf-8"))
+    for task in run.tasks:
+        if task.agent_id == "bull_researcher":
+            task.status = TaskStatus.degraded
+            task.error = "hit iteration limit (15) without completing the deliverable"
+    (rd / "run.json").write_text(run.model_dump_json(indent=2), encoding="utf-8")
+
+    body = _client().get("/committee/runs/run-degraded").json()
+    seat = next(s for s in body["seats"] if s["agent_id"] == "bull_researcher")
+    assert seat["status"] == "degraded"
+    assert seat["status_error"] == (
+        "hit iteration limit (15) without completing the deliverable"
+    )
+    # a healthy seat carries the key as null, not absent — the client renders
+    # on presence of a value, never on presence of a key.
+    healthy = next(s for s in body["seats"] if s["agent_id"] == "market_analyst")
+    assert healthy["status_error"] is None
+
+
+def test_run_detail_status_error_does_not_clobber_report_read_error(
+    _tmp_swarm_and_journal,
+):
+    """``_read_report``'s own ``error`` key (corrupt/unreadable report.md) and
+    the task's ``status_error`` are separate fields; neither overwrites the
+    other."""
+    rd = _seed_run(_tmp_swarm_and_journal, "run-both-errors", with_reports=False)
+    report = rd / "artifacts" / "market_analyst" / "report.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("# market_analyst report\n", encoding="utf-8")
+    report.chmod(0o000)
+    try:
+        body = _client().get("/committee/runs/run-both-errors").json()
+    finally:
+        report.chmod(0o644)
+    seat = next(s for s in body["seats"] if s["agent_id"] == "market_analyst")
+    assert seat["report_md"] is None
+    assert seat["error"]  # from _read_report
+    assert seat["status_error"] is None  # the task itself carries no error
+
+
 def test_run_detail_corrupt_decision_reports_error_not_500(_tmp_swarm_and_journal):
     _seed_run(_tmp_swarm_and_journal, "run-baddec", corrupt_decision=True)
     resp = _client().get("/committee/runs/run-baddec")

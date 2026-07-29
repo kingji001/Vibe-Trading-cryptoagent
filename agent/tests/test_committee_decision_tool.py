@@ -15,8 +15,13 @@ from pathlib import Path
 
 import pytest
 
-from src.committee.schemas import render_markdown
-from src.tools.committee_decision_tool import SubmitDecisionTool
+from src.committee.schemas import Rating, render_markdown
+from src.swarm.worker import UPSTREAM_DEGRADATION_FILENAME
+from src.tools.committee_decision_tool import (
+    _DIRECTIONAL_RATINGS,
+    _UPSTREAM_DEGRADATION_FILENAME,
+    SubmitDecisionTool,
+)
 
 LONG = "x" * 120
 
@@ -303,3 +308,226 @@ class TestPersistence:
         assert persisted["action"] == "Sell"
         assert persisted != r1["decision"]
         assert persisted == r2["decision"]
+
+
+# ---------------------------------------------------------------------------
+# Loop 2 decision gate: no sized directional call on a degraded run
+# ---------------------------------------------------------------------------
+
+
+def _mark_degraded(run_dir: Path) -> None:
+    (run_dir / "upstream_degradation.json").write_text(
+        json.dumps(
+            {
+                "degraded_upstreams": [
+                    {
+                        "context_key": "research_plan",
+                        "reason": "upstream task task-research-plan: hit iteration limit",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class TestDegradedUpstreamGate:
+    @pytest.mark.parametrize("rating", ["Buy", "Overweight", "Sell", "Underweight"])
+    def test_directional_rating_rejected_on_degraded_run(
+        self, tool: SubmitDecisionTool, tmp_path: Path, rating: str
+    ) -> None:
+        _mark_degraded(tmp_path)
+        payload = dict(VALID_PAYLOADS["portfolio_decision"])
+        payload["rating"] = rating
+        payload["position_size_pct"] = 34.0
+
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision", payload=payload, run_dir=str(tmp_path)
+            )
+        )
+
+        assert result["status"] == "error"
+        assert rating in result["error"]
+        assert "research_plan" in result["error"]
+        assert result["degraded_upstreams"][0]["context_key"] == "research_plan"
+        assert not (tmp_path / "decision.portfolio_decision.json").exists()
+
+    def test_hold_still_accepted_on_degraded_run(
+        self, tool: SubmitDecisionTool, tmp_path: Path
+    ) -> None:
+        _mark_degraded(tmp_path)
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision",
+                payload=VALID_PAYLOADS["portfolio_decision"],
+                run_dir=str(tmp_path),
+            )
+        )
+        assert result["status"] == "ok"
+        assert (tmp_path / "decision.portfolio_decision.json").exists()
+
+    def test_directional_rating_accepted_when_nothing_degraded(
+        self, tool: SubmitDecisionTool, tmp_path: Path
+    ) -> None:
+        """False-reject guard: a clean run is unaffected by the gate."""
+        payload = dict(VALID_PAYLOADS["portfolio_decision"])
+        payload["rating"] = "Buy"
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision", payload=payload, run_dir=str(tmp_path)
+            )
+        )
+        assert result["status"] == "ok"
+
+    def test_other_schemas_are_not_gated(
+        self, tool: SubmitDecisionTool, tmp_path: Path
+    ) -> None:
+        """Only the PM's binding call is gated; upstream seats still submit."""
+        _mark_degraded(tmp_path)
+        result = json.loads(
+            tool.execute(
+                schema="research_plan",
+                payload=VALID_PAYLOADS["research_plan"],
+                run_dir=str(tmp_path),
+            )
+        )
+        assert result["status"] == "ok"
+
+    def test_unreadable_marker_does_not_break_submission(
+        self, tool: SubmitDecisionTool, tmp_path: Path
+    ) -> None:
+        """A corrupt marker must fail open, not brick the committee."""
+        (tmp_path / "upstream_degradation.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+        payload = dict(VALID_PAYLOADS["portfolio_decision"])
+        payload["rating"] = "Buy"
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision", payload=payload, run_dir=str(tmp_path)
+            )
+        )
+        assert result["status"] == "ok"
+
+    @pytest.mark.parametrize("tampering", ["deleted", "emptied"])
+    def test_out_of_band_value_still_gates_after_marker_tampered(
+        self, tool: SubmitDecisionTool, tmp_path: Path, tampering: str
+    ) -> None:
+        """``upstream_degradation.json`` lives in the PM's own run_dir, and
+        ``write_file`` can overwrite any filename there (no blocklist in
+        ``resolve_safe_path``) -- a model can clear the marker itself to
+        unlock a sized directional call on a run with an incomplete
+        upstream. The worker must pass the seat's real degraded-upstream set
+        out-of-band (``degraded_upstreams`` kwarg, injected only for
+        ``submit_decision`` calls -- see worker.py) so the gate does not
+        depend on file contents a tool call already touched.
+
+        Simulates the tampering directly (delete / empty the marker) and
+        proves the gate still refuses when the out-of-band kwarg says
+        degraded.
+        """
+        marker = tmp_path / "upstream_degradation.json"
+        if tampering == "emptied":
+            marker.write_text("{}", encoding="utf-8")
+        # "deleted" case: never create it at all.
+
+        payload = dict(VALID_PAYLOADS["portfolio_decision"])
+        payload["rating"] = "Buy"
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision",
+                payload=payload,
+                run_dir=str(tmp_path),
+                degraded_upstreams=[
+                    {"context_key": "research_plan", "reason": "died mid-work"}
+                ],
+            )
+        )
+
+        assert result["status"] == "error"
+        assert "research_plan" in result["error"]
+        assert not (tmp_path / "decision.portfolio_decision.json").exists()
+
+    def test_wrong_shaped_marker_fails_open_rather_than_raising(
+        self, tool: SubmitDecisionTool, tmp_path: Path
+    ) -> None:
+        """Well-formed JSON of the wrong shape is the plausible drift mode --
+        e.g. a writer emitting a bare list of context keys instead of a list
+        of {context_key, reason} dicts. The three shape guards in
+        ``_degraded_upstreams`` must fail open (treat it as "nothing
+        degraded") rather than raise, same as the malformed-JSON case
+        already covered above."""
+        (tmp_path / "upstream_degradation.json").write_text(
+            json.dumps({"degraded_upstreams": ["research_plan"]}),
+            encoding="utf-8",
+        )
+        payload = dict(VALID_PAYLOADS["portfolio_decision"])
+        payload["rating"] = "Buy"
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision", payload=payload, run_dir=str(tmp_path)
+            )
+        )
+        assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Constants pinned against silent drift between committee_decision_tool.py
+# and its two independent sources of truth (worker.py's writer, Rating enum).
+# ---------------------------------------------------------------------------
+
+
+def test_gate_reads_the_filename_the_worker_writes() -> None:
+    """``_UPSTREAM_DEGRADATION_FILENAME`` here and
+    ``UPSTREAM_DEGRADATION_FILENAME`` in worker.py are two independent string
+    literals, each anchored only by its own test. Rename the file in one
+    place without the other and every test still passes -- the gate reads a
+    path the writer no longer writes to, dead in production with nothing
+    red."""
+    assert _UPSTREAM_DEGRADATION_FILENAME == UPSTREAM_DEGRADATION_FILENAME
+
+
+def test_submit_decision_tool_name_matches_worker_dispatch_string() -> None:
+    """worker.py:761 injects ``degraded_upstreams`` by testing
+    ``tc.name == "submit_decision"``, a string literal independent of this
+    class attribute. Renaming ``SubmitDecisionTool.name`` would silently stop
+    the out-of-band injection -- the gate would fall back to the tamperable
+    on-disk marker with nothing red (test_crypto_committee_preset.py:115
+    pins the preset's tool-name string, not this class attribute, so it
+    would not catch the drift either)."""
+    assert SubmitDecisionTool.name == "submit_decision"
+
+
+def test_directional_ratings_matches_rating_enum_minus_hold() -> None:
+    """``_DIRECTIONAL_RATINGS`` is a hand-maintained frozenset copy of
+    ``Rating``'s members (minus Hold). Adding a new rating to the enum
+    without updating this set would silently let it bypass the gate --
+    nothing else would fail."""
+    assert _DIRECTIONAL_RATINGS | {"Hold"} == {r.value for r in Rating}
+
+
+def test_directional_ratings_matches_paper_executor_executable_set() -> None:
+    """The gate's directional set (``_DIRECTIONAL_RATINGS``, this module) and
+    the paper executor's executable set (``_POSITIVE_RATINGS |
+    _REDUCE_RATINGS``, ``src/paper/translator.py:63-64``) are two independent
+    literals compared under different case rules: the gate matches
+    ``_canonical_rating`` (``strip().lower()`` against the ``Rating`` enum,
+    ``src/tools/committee_journal_tool.py``) while the executor matches
+    ``str(entry.get("rating") or "").strip().lower()`` against this pair of
+    sets (``src/paper/translator.py:282``). If the two sets ever diverge, the
+    gate silently stops covering something the executor will still trade --
+    the exact class of bug this test exists to pin (a degraded run bypassing
+    the gate on one tool, then on a rating the gate didn't recognize as
+    directional).
+
+    Imported here rather than in the tool module: committee_decision_tool.py
+    has no production reason to import the paper package, and pulling it in
+    only for this identity check would add a layering dependency the gate
+    doesn't need at runtime -- the existing sibling pin tests in this file
+    take the same cross-module-import-at-test-level approach."""
+    from src.paper import translator
+
+    assert {r.lower() for r in _DIRECTIONAL_RATINGS} == (
+        translator._POSITIVE_RATINGS | translator._REDUCE_RATINGS
+    )

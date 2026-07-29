@@ -133,6 +133,8 @@
     "reportUnavailable": "レポートは利用できません",
     "reportUnavailableHint": "この席はこの実行で report.md を生成しませんでした。",
     "seatError": "この席は読み込めませんでした",
+    "seatDegraded": "シートは完了しませんでした",
+    "seatFailed": "シートは失敗しました",
     "expand": "展開",
     "collapse": "折りたたむ",
     "decision": "決定",

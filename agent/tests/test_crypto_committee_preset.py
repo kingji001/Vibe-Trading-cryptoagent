@@ -232,12 +232,17 @@ def test_pm_append_step_enumerates_execution_and_run_id_fields():
     """Final review I2/C3: the PM's step-2 decision_journal append enumeration
     must name the execution fields (stop_loss, take_profit, position_size_pct)
     and run_id — otherwise the prompt-requested execution data never reaches
-    journal.append_decision / the paper executor."""
-    from src.swarm.presets import PRESETS_DIR
+    journal.append_decision / the paper executor.
 
-    raw = (PRESETS_DIR / f"{PRESET}.yaml").read_text(encoding="utf-8")
-    idx = raw.index('action "append"')
-    segment = raw[idx : idx + 600]
+    Scoped to the PM's own built prompt and bounded by the next numbered step.
+    It used to scan the whole YAML for the first 'action "append"' with a fixed
+    600-character window, so any earlier match in any seat's prompt would
+    silently re-anchor it and let the assertion pass against the wrong text.
+    """
+    pm = {a.id: a for a in build_run_from_preset(PRESET, USER_VARS).agents}["portfolio_manager"]
+    prompt = pm.system_prompt
+    start = prompt.index('2. Call decision_journal with action "append"')
+    segment = prompt[start : prompt.index("3. Write report.md")]
     for field in ("stop_loss", "take_profit", "position_size_pct", "run_id"):
         assert field in segment, f"{field!r} missing from PM append enumeration"
 
@@ -271,3 +276,89 @@ def test_snapshot_tool_json_keys_match_prompt_references():
     snapshot = build_snapshot("BTC-USDT", fetch_row=_fetch_row)
     for field in SNAPSHOT_FIELD_NAMES:
         assert field in snapshot, field
+
+
+# --------------------------------------------------------------------------- #
+# Loop 2 — degraded-upstream protocol (PM must be told the gate exists)
+# --------------------------------------------------------------------------- #
+
+
+def test_pm_prompt_carries_degraded_upstream_protocol(run):
+    """Loop 2: the PM must be told the gate exists before it hits it."""
+    pm = {a.id: a for a in run.agents}["portfolio_manager"]
+    assert "[INCOMPLETE UPSTREAM]" in pm.system_prompt
+    assert "rating MUST be Hold" in pm.system_prompt
+    assert "Buy / Overweight / Sell / Underweight" in pm.system_prompt
+
+
+def test_pm_prompt_states_both_tools_gate(run):
+    """Whole-branch review C1: the PM holds submit_decision AND decision_journal,
+    and only the latter reaches the paper broker. The protocol block must say
+    both refuse, or the PM reads the gate as a formatting rule it can route
+    around by journaling directly."""
+    pm = {a.id: a for a in run.agents}["portfolio_manager"]
+    protocol = pm.system_prompt.split("## Degraded upstream protocol (HARD RULE)")[1]
+    protocol = protocol.split("\n## ")[0]
+    assert "submit_decision will" in protocol
+    assert "decision_journal append step below enforces the SAME rule" in protocol
+
+
+def _transitive_deps(tasks: dict, task_id: str) -> set[str]:
+    seen: set[str] = set()
+
+    def walk(tid: str) -> None:
+        for dep in tasks[tid].depends_on:
+            if dep not in seen:
+                seen.add(dep)
+                walk(dep)
+
+    walk(task_id)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "debate_rounds,expected_tasks,expected_layers,plan_layer,decision_layer",
+    [("1", 13, 9, 3, 8), ("2", 15, 11, 5, 10)],
+)
+def test_degraded_research_plan_reaches_the_pm_gate_at_both_round_counts(
+    debate_rounds, expected_tasks, expected_layers, plan_layer, decision_layer
+) -> None:
+    """The Loop 2 gate is only reachable if the PM is ORDERED after the judge.
+
+    ``topological_layers`` counts only ``depends_on`` (task_store.py:220) and
+    ``blocked_by`` derives from ``depends_on`` alone (presets.py:197,205,548)
+    — an ``input_from`` edge creates no ordering guarantee. task-decision
+    reads ``research_plan`` from task-research-plan by ``input_from`` but does
+    NOT depend on it directly; ordering comes transitively through
+    trader -> risk rotation. Pin that, at both round counts, because
+    ``_expand_debate`` moves every position after the debate and the shared
+    ``run`` fixture only ever exercises rounds=1 while ``.env`` ships rounds=2.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        for var in _RUN_SHAPING_ENVS:
+            mp.delenv(var, raising=False)
+        mp.setenv("VIBE_DEBATE_ROUNDS", debate_rounds)
+        built = build_run_from_preset(PRESET, USER_VARS)
+
+    assert len(built.tasks) == expected_tasks
+    layers = topological_layers(built.tasks)
+    assert len(layers) == expected_layers
+    position = {tid: i for i, layer in enumerate(layers) for tid in layer}
+    assert position["task-research-plan"] == plan_layer
+    assert position["task-decision"] == decision_layer
+
+    tasks = {t.id: t for t in built.tasks}
+    # the edge the gate depends on: read by input_from, ordered transitively
+    assert tasks["task-decision"].input_from["research_plan"] == "task-research-plan"
+    assert "task-research-plan" not in tasks["task-decision"].depends_on
+    assert "task-research-plan" in _transitive_deps(tasks, "task-decision")
+
+    # stronger: no consumer anywhere reads from a task it is not ordered after
+    for task in built.tasks:
+        closure = _transitive_deps(tasks, task.id)
+        for key, source in task.input_from.items():
+            assert source in closure, (
+                f"{task.id}.input_from[{key}] -> {source} has no depends_on path; "
+                "the consumer may run first and would silently see neither the "
+                "upstream summary nor its degradation marker"
+            )

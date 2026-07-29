@@ -15,13 +15,20 @@ class TaskStatus(str, Enum):
     """SwarmTask lifecycle status.
 
     Transitions:
-        pending -> blocked -> in_progress -> completed | failed | cancelled
+        pending -> blocked -> in_progress -> completed | degraded | failed | cancelled
+
+    ``degraded`` is terminal-but-permissive: the seat ran to a terminal state
+    without producing a complete deliverable, yet the run continues so a
+    13-seat committee is not aborted over one seat (fail-visible, not
+    fail-closed). Downstream consumers are dispatched WITH an explicit
+    incomplete-upstream marker; ``failed`` still blocks them.
     """
 
     pending = "pending"
     blocked = "blocked"
     in_progress = "in_progress"
     completed = "completed"
+    degraded = "degraded"
     failed = "failed"
     cancelled = "cancelled"
 
@@ -51,6 +58,7 @@ class WorkerStatus(str, Enum):
     """
 
     completed = "completed"
+    degraded = "degraded"
     failed = "failed"
     timeout = "timeout"
     token_limit = "token_limit"

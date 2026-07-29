@@ -115,4 +115,34 @@ describe("SwarmStatusCard", () => {
       status: "completed",
     });
   });
+
+  it("renders a degraded seat with its own tone and icon, not the waiting fallback", () => {
+    const html = renderToStaticMarkup(
+      <SwarmStatusCard
+        status={makeStatus({
+          agents: [{ agentId: "research_manager", status: "degraded", error: "hit iteration limit (15)" }],
+        })}
+      />,
+    );
+
+    expect(html).toContain("degraded");
+    expect(html).toContain("bg-orange-500/10");
+    expect(html).toContain("lucide-triangle-alert");
+    expect(html).not.toContain("lucide-circle");
+  });
+
+  it("counts a degraded seat as terminal in the progress readout", () => {
+    const html = renderToStaticMarkup(
+      <SwarmStatusCard
+        status={makeStatus({
+          agents: [
+            { agentId: "research_manager", status: "degraded" },
+            { agentId: "trader", status: "running" },
+          ],
+        })}
+      />,
+    );
+
+    expect(html).toContain("1/2 agents");
+  });
 });

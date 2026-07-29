@@ -70,6 +70,19 @@ _PERSIST_TRANSCRIPTS_ENV = "VIBE_SWARM_PERSIST_TRANSCRIPTS"
 _PERSIST_TRANSCRIPTS_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
+# Loop 2 (Completion). A seat that terminates without a complete deliverable
+# must be visible to every consumer downstream, not silently promoted to a
+# binding ruling. The marker is a literal string so it is greppable in
+# events.jsonl, messages.json, and a rendered prompt alike.
+INCOMPLETE_UPSTREAM_MARKER = "[INCOMPLETE UPSTREAM]"
+UPSTREAM_DEGRADATION_FILENAME = "upstream_degradation.json"
+FAILURE_CONTEXT_FILENAME = "failure_context.json"
+
+# Cap on recorded tool errors: a 50-iteration worker retrying a bad schema
+# would otherwise write an unbounded artifact.
+_MAX_RECORDED_TOOL_ERRORS = 20
+
+
 def _persist_transcripts_enabled() -> bool:
     """``VIBE_SWARM_PERSIST_TRANSCRIPTS`` opt-in: unset/falsy -> OFF."""
     return (
@@ -185,6 +198,7 @@ def build_worker_prompt(
     upstream_summaries: dict[str, str],
     skill_descriptions: str,
     grounding_block: str = "",
+    degraded_upstreams: dict[str, str] | None = None,
 ) -> str:
     """Build the worker's system prompt with role, upstream context, and skills.
 
@@ -197,19 +211,40 @@ def build_worker_prompt(
             ahead of the Execution Rules section so the worker sees real
             recent prices before any tool decision. Empty string skips the
             section entirely.
+        degraded_upstreams: Mapping of context_key -> reason for upstream
+            deliverables that did NOT complete. Each matching section is
+            tagged with :data:`INCOMPLETE_UPSTREAM_MARKER` and a hard-rule
+            banner is appended, so a consuming seat can never mistake a
+            truncated working note for a binding ruling. Empty / ``None``
+            renders exactly the pre-Loop-2 prompt.
 
     Returns:
         Complete system prompt string for the worker LLM.
     """
-    upstream_block = ""
-    if upstream_summaries:
-        sections = []
-        for key, summary in upstream_summaries.items():
+    degraded = degraded_upstreams or {}
+    sections = []
+    for key, summary in upstream_summaries.items():
+        reason = degraded.get(key)
+        if reason:
+            sections.append(
+                f"### {key} {INCOMPLETE_UPSTREAM_MARKER}\n"
+                f"{INCOMPLETE_UPSTREAM_MARKER} — this upstream seat terminated "
+                f"before finishing its deliverable ({reason}). What follows is "
+                "an unfinished working note, NOT a binding ruling.\n\n"
+                f"{summary}"
+            )
+        else:
             sections.append(f"### {key}\n{summary}")
+
+    upstream_block = ""
+    if sections:
         upstream_block = (
             "## Upstream Context (from previous agents)\n\n"
             + "\n\n".join(sections)
         )
+    if degraded:
+        notice = _format_degradation_notice(degraded)
+        upstream_block = f"{upstream_block}\n\n{notice}" if upstream_block else notice
 
     prompt_parts = [
         f"## Role\n\n{agent_spec.role}",
@@ -305,6 +340,7 @@ def run_worker(
     include_shell_tools: bool = False,
     grounding_block: str = "",
     agent_config: AgentConfig | None = None,
+    degraded_upstreams: dict[str, str] | None = None,
 ) -> WorkerResult:
     """Execute a single worker task using a lightweight ReAct loop.
 
@@ -333,6 +369,11 @@ def run_worker(
             consumed by :func:`build_swarm_registry` to merge remote MCP
             tools with the local-tool pool before applying the agent's
             whitelist. ``None`` preserves the prior local-only behavior.
+        degraded_upstreams: Mapping of context_key -> reason for upstream
+            deliverables that did not complete. Rendered into the system
+            prompt by :func:`build_worker_prompt` and mirrored to
+            ``upstream_degradation.json`` in the artifact dir so the
+            ``submit_decision`` gate can refuse a sized directional call.
 
     Returns:
         WorkerResult with status, summary, artifacts, and iteration count.
@@ -359,7 +400,11 @@ def run_worker(
     skills_loader = SkillsLoader()
     skill_desc = _filter_skill_descriptions(skills_loader, agent_spec.skills)
     system_prompt = build_worker_prompt(
-        agent_spec, upstream_summaries, skill_desc, grounding_block=grounding_block,
+        agent_spec,
+        upstream_summaries,
+        skill_desc,
+        grounding_block=grounding_block,
+        degraded_upstreams=degraded_upstreams,
     )
 
     # 4. Resolve prompt template with user vars (missing vars → LLM infers)
@@ -389,6 +434,20 @@ def run_worker(
     # 6. ReAct loop
     artifact_dir = run_dir / "artifacts" / agent_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    if degraded_upstreams:
+        _write_upstream_degradation(artifact_dir, degraded_upstreams)
+
+    # Out-of-band mirror of the same set, injected straight into
+    # submit_decision's kwargs below rather than trusted from the file above.
+    # write_file resolves paths relative to run_dir with no filename
+    # blocklist (resolve_safe_path), so a model can overwrite
+    # upstream_degradation.json itself and clear the gate. This in-memory
+    # value never transits a model-writable file, so tampering with the
+    # marker cannot unlock a sized directional call.
+    degraded_upstream_entries = [
+        {"context_key": key, "reason": reason}
+        for key, reason in (degraded_upstreams or {}).items()
+    ]
 
     t0 = time.monotonic()
     iteration = 0
@@ -402,6 +461,7 @@ def run_worker(
 
     _KEEP_RECENT_TOOLS = 3
     data_tool_calls = 0
+    tool_errors: list[dict] = []
     content_filter_count = 0
     consecutive_content_filter_count = 0
 
@@ -698,6 +758,24 @@ def run_worker(
             )
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
+            if tc.name in ("submit_decision", "decision_journal"):
+                # Both tools the PM can use to act on a rating: submit_decision
+                # validates and renders, decision_journal's append is what
+                # reaches the paper broker. Each gates on this set, so each
+                # needs it out-of-band — the on-disk marker sits in the
+                # model-writable run_dir.
+                #
+                # Scoped to these two rather than injected universally:
+                # run_dir is forwarded to every swarm tool call including
+                # remote MCP tools, and MCPRemoteTool._filter_arguments only
+                # strips names in _LOCAL_ONLY_ARGUMENTS (mcp.py) before
+                # relaying the rest to the remote server. A universally
+                # injected kwarg would leak this run's degraded-upstream
+                # reasons to any remote MCP tool whose schema allows
+                # additional properties unless that filter set were also
+                # updated — a membership test avoids touching that surface
+                # at all.
+                args["degraded_upstreams"] = degraded_upstream_entries
 
             # Wrap tool execution in a heartbeat so the events.jsonl tail has a
             # fresh timestamp every few seconds. The stale-run reaper relies on
@@ -721,7 +799,9 @@ def run_worker(
                     result = registry.execute(tc.name, args)
                 except PolicyDenied as exc:
                     result = exc.user_safe_message
-            if tc.name != "load_skill" and not _is_error_result(result):
+            if _is_error_result(result):
+                _record_tool_error(tool_errors, tc.name, iteration, result)
+            elif tc.name != "load_skill":
                 data_tool_calls += 1
             tc_elapsed = time.monotonic() - tc_start
             _emit(
@@ -745,6 +825,12 @@ def run_worker(
     summary = _resolve_summary(artifact_dir, summary)
     _write_summary(artifact_dir, summary)
     _persist_messages(artifact_dir, messages)
+    _write_failure_context(
+        artifact_dir,
+        reason="iteration_limit",
+        iterations=max_iterations,
+        tool_errors=tool_errors,
+    )
     reason = _classify_deliverable(
         summary,
         is_data_agent=_is_data_agent(agent_spec),
@@ -764,12 +850,22 @@ def run_worker(
             output_tokens=total_output_tokens,
             content_filter_warnings=content_filter_warnings,
         )
-    _emit(event_callback, "worker_iteration_limit", agent_id, task_id)
+    # The worker burned its whole budget without ever choosing to stop: its
+    # last text is mid-work, not a conclusion. Reporting this "completed"
+    # is what let a truncated scratch note become a binding ruling on
+    # 2026-07-28 (spec §4.1). Degraded keeps the run alive but marks the
+    # deliverable untrustworthy for every consumer.
+    _emit(event_callback, "worker_iteration_limit", agent_id, task_id,
+          {"iterations": max_iterations, "tool_errors": len(tool_errors)})
     return WorkerResult(
-        status="completed",
+        status="degraded",
         summary=summary,
         artifact_paths=_collect_artifacts(artifact_dir),
         iterations=max_iterations,
+        error=(
+            f"hit iteration limit ({max_iterations}) without completing the "
+            "deliverable; output is a partial working note"
+        ),
         input_tokens=total_input_tokens,
         output_tokens=total_output_tokens,
         content_filter_warnings=content_filter_warnings,
@@ -983,6 +1079,123 @@ def _maybe_persist_transcript(
     if final_content:
         transcript = [*messages, {"role": "assistant", "content": final_content}]
     _persist_messages(artifact_dir, transcript)
+
+
+def _format_degradation_notice(degraded_upstreams: dict[str, str]) -> str:
+    """Render the hard-rule banner for incomplete upstream deliverables."""
+    lines = "\n".join(
+        f"- `{key}` — {reason}" for key, reason in degraded_upstreams.items()
+    )
+    return (
+        f"## {INCOMPLETE_UPSTREAM_MARKER} Upstream Integrity Warning (HARD RULE)\n\n"
+        "These upstream deliverables are INCOMPLETE — the seat that produced "
+        "each one terminated before finishing:\n\n"
+        f"{lines}\n\n"
+        "Treat their content as an unfinished working note, never as a binding "
+        "ruling, and state in your own output which conclusions rest on one. If "
+        "you are the portfolio manager you MUST NOT submit a sized directional "
+        "decision (Buy / Overweight / Sell / Underweight) on this run — the "
+        "decision gate accepts only Hold while an upstream is incomplete."
+    )
+
+
+def _write_upstream_degradation(
+    artifact_dir: Path, degraded_upstreams: dict[str, str]
+) -> None:
+    """Mirror the degraded-upstream set into the artifact dir.
+
+    ``run_dir`` injected into every tool call IS this artifact dir, so
+    ``SubmitDecisionTool`` reads this file to enforce the Hold-only gate
+    without needing any knowledge of the run layout.
+    """
+    payload = {
+        "degraded_upstreams": [
+            {"context_key": key, "reason": reason}
+            for key, reason in degraded_upstreams.items()
+        ]
+    }
+    try:
+        (artifact_dir / UPSTREAM_DEGRADATION_FILENAME).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        logger.warning(
+            "Failed to write upstream degradation marker to %s",
+            artifact_dir,
+            exc_info=True,
+        )
+
+
+def _record_tool_error(
+    sink: list[dict], tool_name: str, iteration: int, result: str
+) -> None:
+    """Append one structured tool-error entry, bounded in size.
+
+    Microcompaction rewrites older tool messages to ``[cleared]`` (see the
+    top of the ReAct loop), so the transcript cannot be scraped for this
+    after the fact — the 07-28 run's three consecutive ``strategic_actions``
+    validation errors were unrecoverable from ``messages.json`` for exactly
+    that reason. Capture at execution time instead.
+    """
+    if len(sink) >= _MAX_RECORDED_TOOL_ERRORS:
+        return
+    entry: dict = {"iteration": iteration, "tool": tool_name}
+    try:
+        parsed = json.loads(result)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        entry["error"] = parsed.get("error")
+        if parsed.get("issues"):
+            entry["issues"] = parsed["issues"]
+    else:
+        entry["error"] = (result or "")[:500]
+    sink.append(entry)
+
+
+def _recurring_tool_errors(tool_errors: list[dict]) -> list[dict]:
+    """Group identical tool errors so a retry loop is visible at a glance."""
+    counts: dict[tuple[str, str], int] = {}
+    for entry in tool_errors:
+        signature = json.dumps(
+            entry.get("issues") or entry.get("error"),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        key = (entry.get("tool") or "", signature)
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        {"tool": tool, "signature": signature, "count": count}
+        for (tool, signature), count in sorted(counts.items())
+        if count >= 2
+    ]
+
+
+def _write_failure_context(
+    artifact_dir: Path,
+    *,
+    reason: str,
+    iterations: int,
+    tool_errors: list[dict],
+) -> None:
+    """Persist the structured post-mortem for a terminal worker failure."""
+    payload = {
+        "reason": reason,
+        "iterations": iterations,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "tool_errors": tool_errors,
+        "recurring_tool_errors": _recurring_tool_errors(tool_errors),
+    }
+    try:
+        (artifact_dir / FAILURE_CONTEXT_FILENAME).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.warning(
+            "Failed to write failure context to %s", artifact_dir, exc_info=True
+        )
 
 
 def _write_summary(artifact_dir: Path, summary: str) -> None:

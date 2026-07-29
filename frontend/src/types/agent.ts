@@ -7,6 +7,7 @@ export type SwarmAgentDisplayStatus =
   | "waiting"
   | "running"
   | "done"
+  | "degraded"
   | "failed"
   | "blocked"
   | "retry"

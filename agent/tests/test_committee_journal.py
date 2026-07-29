@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.committee import journal
+from src.tools.committee_decision_tool import _DIRECTIONAL_RATINGS
 
 T0 = datetime(2026, 7, 1, 0, 0, tzinfo=timezone.utc)
 
@@ -300,6 +301,185 @@ def test_tool_append_position_size_pct_boundaries_accepted(jtool, jpath):
     )
     assert out["status"] == "ok"
     assert out["entry"]["position_size_pct"] == 0.0
+
+
+# ---------------------------------------- decision gate on the append path
+# Whole-branch review C1: submit_decision only validates and renders; the tool
+# that commits capital is this one (append_decision -> paper.hook
+# .maybe_execute_paper -> paper.translator.execute_decision, which sizes from
+# the journal ENTRY's rating). The degraded-upstream gate has to sit here too,
+# or a degraded run can still buy.
+
+_DEGRADED = [
+    {
+        "context_key": "research_plan",
+        "reason": "upstream task task-research-plan: hit iteration limit (15) "
+        "without completing the deliverable",
+    }
+]
+
+
+# Fix wave 2 blocker 1: nothing validates this tool's JSON-schema enum
+# (agent/tools.py calls execute(**params) unvalidated), so the model picks the
+# rating string freely. The gate compared it exact-case against
+# _DIRECTIONAL_RATINGS while the executor (paper/translator.py) matches
+# .strip().lower() against lowercase sets — so 'overweight', ' Buy ' and
+# friends walked past the gate and reached the broker. Every spelling the
+# EXECUTOR would act on must be refused here.
+_CASING_BYPASSES = ["overweight", "OVERWEIGHT", " Buy ", "buy", "sell", "  underweight  "]
+
+
+@pytest.mark.parametrize("rating", sorted(_DIRECTIONAL_RATINGS) + _CASING_BYPASSES)
+def test_tool_append_rejects_directional_rating_on_degraded_run(jtool, jpath, rating):
+    """Every directional rating is refused: the translator sizes a Buy /
+    Overweight / Sell / Underweight from the rating alone (size_frac), so
+    omitting position_size_pct does not make the order harmless."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating=rating,
+            time_horizon="72h swing",
+            position_size_pct=34.0,
+            run_id="run-degraded",
+            degraded_upstreams=_DEGRADED,
+        )
+    )
+    assert out["status"] == "error"
+    assert out["error"].startswith("Decision gate: ")
+    assert "research_plan" in out["error"]
+    assert out["degraded_upstreams"] == _DEGRADED
+    assert journal.load_entries(jpath) == []  # append-only store, nothing written
+
+
+def test_tool_append_accepts_hold_on_degraded_run(jtool, jpath):
+    """Hold stays open — a degraded run yields a no-op, not a blocked run."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Hold",
+            time_horizon="72h swing",
+            run_id="run-degraded-hold",
+            degraded_upstreams=_DEGRADED,
+        )
+    )
+    assert out["status"] == "ok"
+    assert [e["rating"] for e in journal.load_entries(jpath)] == ["Hold"]
+
+
+def test_tool_append_directional_allowed_when_nothing_degraded(jtool, jpath):
+    """The gate is scoped to degraded runs; a healthy run still trades."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Buy",
+            time_horizon="72h swing",
+            position_size_pct=34.0,
+            run_id="run-healthy",
+            degraded_upstreams=[],
+        )
+    )
+    assert out["status"] == "ok"
+    assert [e["rating"] for e in journal.load_entries(jpath)] == ["Buy"]
+
+
+@pytest.mark.parametrize(
+    ("supplied", "canonical"),
+    [(" buy ", "Buy"), ("OVERWEIGHT", "Overweight"), ("sell", "Sell"), ("Hold", "Hold")],
+)
+def test_tool_append_journals_the_canonical_rating_spelling(
+    jtool, jpath, supplied, canonical
+):
+    """The append branch canonicalizes before it writes, so the journal stops
+    storing arbitrary casing. journal.append_decision hashes the rating into
+    the ``dec_`` id, so casing drift otherwise perturbs decision ids for what
+    is the same call."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating=supplied,
+            time_horizon="72h swing",
+            run_id=f"run-canon-{canonical}",
+            degraded_upstreams=[],
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["entry"]["rating"] == canonical
+    assert [e["rating"] for e in journal.load_entries(jpath)] == [canonical]
+
+
+def test_tool_append_keeps_an_unrecognized_rating_verbatim(jtool, jpath):
+    """Canonicalization maps known spellings only — a genuinely unrecognized
+    value is left alone for the existing validation rather than silently
+    coerced into a tradeable rating."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Strong Buy!!",
+            time_horizon="72h swing",
+            run_id="run-unknown-rating",
+            degraded_upstreams=[],
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["entry"]["rating"] == "Strong Buy!!"
+
+
+def test_tool_append_gate_falls_back_to_on_disk_marker(jtool, jpath, tmp_path):
+    """Callers outside the swarm (CLI, tests) pass no injected set; the
+    ``upstream_degradation.json`` marker in run_dir is the fallback source,
+    same precedence rule as submit_decision's gate."""
+    run_dir = tmp_path / ".swarm" / "runs" / "run-marker" / "artifacts" / "pm"
+    run_dir.mkdir(parents=True)
+    (run_dir / "upstream_degradation.json").write_text(
+        json.dumps({"degraded_upstreams": _DEGRADED}), encoding="utf-8"
+    )
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Overweight",
+            time_horizon="72h swing",
+            run_dir=str(run_dir),
+        )
+    )
+    assert out["status"] == "error"
+    assert journal.load_entries(jpath) == []
+
+
+def test_tool_append_gate_message_matches_submit_decision(jtool):
+    """Both gates return the same shape and wording so the PM reads one rule,
+    not two — the seat holds both tools (crypto_committee.yaml)."""
+    from src.tools.committee_decision_tool import SubmitDecisionTool
+
+    long_text = "x" * 120
+    submit = json.loads(
+        SubmitDecisionTool().execute(
+            schema="portfolio_decision",
+            payload={
+                "rating": "Overweight",
+                "executive_summary": long_text,
+                "investment_thesis": long_text * 2,
+                "time_horizon": "72h swing",
+            },
+            degraded_upstreams=_DEGRADED,
+        )
+    )
+    append = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Overweight",
+            time_horizon="72h swing",
+            degraded_upstreams=_DEGRADED,
+        )
+    )
+    assert submit["error"] == append["error"]
+    assert submit["degraded_upstreams"] == append["degraded_upstreams"]
 
 
 def test_tool_append_derives_run_id_from_run_dir(jtool, jpath, monkeypatch):

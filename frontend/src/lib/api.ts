@@ -1078,7 +1078,10 @@ export interface CommitteeSeat {
   report_md: string | null;
   decision_json?: Record<string, unknown> | null;
   missing?: boolean;
+  /** report.md was present but unreadable — distinct from status_error. */
   error?: string;
+  /** The seat's own failure reason (SwarmTask.error), e.g. why it degraded. */
+  status_error?: string | null;
 }
 
 export interface CommitteeDebate {

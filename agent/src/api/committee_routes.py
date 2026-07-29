@@ -301,6 +301,13 @@ def register_committee_routes(app: FastAPI, require_auth: AuthDep | None = None)
                 "status": task.status.value,
             }
             seat.update(_read_report(run_dir, task.agent_id))
+            # Why the seat's own error is forwarded under a distinct key, set
+            # after the report read: _read_report owns "error" (a corrupt or
+            # unreadable report.md), and a degraded seat's diagnostic is a
+            # different fact about a different thing. Without this the reason
+            # the runtime persists and streams over SSE is dropped here, so a
+            # degraded seat reaches the Observatory with no explanation.
+            seat.setdefault("status_error", task.error)
             if task.agent_id == "portfolio_manager":
                 seat["decision_json"] = decision
             seats.append(seat)

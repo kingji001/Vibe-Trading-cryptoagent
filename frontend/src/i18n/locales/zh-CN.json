@@ -133,6 +133,8 @@
     "reportUnavailable": "报告不可用",
     "reportUnavailableHint": "该席位在本次运行中未生成 report.md 文件。",
     "seatError": "该席位读取失败",
+    "seatDegraded": "席位未完成",
+    "seatFailed": "席位失败",
     "expand": "展开",
     "collapse": "收起",
     "decision": "决策",

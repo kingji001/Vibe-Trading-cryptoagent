@@ -26,6 +26,7 @@ const RUNNING_POLL_MS = 30_000;
 const REFETCH_EVENT_TYPES = [
   "task_completed", "worker_completed",
   "task_failed", "worker_failed", "worker_timeout", "worker_incomplete",
+  "task_degraded", "worker_iteration_limit",
   "run_completed", "run_error",
 ] as const;
 
