@@ -505,3 +505,29 @@ def test_directional_ratings_matches_rating_enum_minus_hold() -> None:
     without updating this set would silently let it bypass the gate --
     nothing else would fail."""
     assert _DIRECTIONAL_RATINGS | {"Hold"} == {r.value for r in Rating}
+
+
+def test_directional_ratings_matches_paper_executor_executable_set() -> None:
+    """The gate's directional set (``_DIRECTIONAL_RATINGS``, this module) and
+    the paper executor's executable set (``_POSITIVE_RATINGS |
+    _REDUCE_RATINGS``, ``src/paper/translator.py:63-64``) are two independent
+    literals compared under different case rules: the gate matches
+    ``_canonical_rating`` (``strip().lower()`` against the ``Rating`` enum,
+    ``src/tools/committee_journal_tool.py``) while the executor matches
+    ``str(entry.get("rating") or "").strip().lower()`` against this pair of
+    sets (``src/paper/translator.py:282``). If the two sets ever diverge, the
+    gate silently stops covering something the executor will still trade --
+    the exact class of bug this test exists to pin (a degraded run bypassing
+    the gate on one tool, then on a rating the gate didn't recognize as
+    directional).
+
+    Imported here rather than in the tool module: committee_decision_tool.py
+    has no production reason to import the paper package, and pulling it in
+    only for this identity check would add a layering dependency the gate
+    doesn't need at runtime -- the existing sibling pin tests in this file
+    take the same cross-module-import-at-test-level approach."""
+    from src.paper import translator
+
+    assert {r.lower() for r in _DIRECTIONAL_RATINGS} == (
+        translator._POSITIVE_RATINGS | translator._REDUCE_RATINGS
+    )
