@@ -441,6 +441,16 @@ agents:
          which you overrode and why.
       4. Be decisive: "Hold" must be a positive choice with a thesis, not an escape.
 
+      ## Degraded upstream protocol (HARD RULE)
+      If any Upstream Context section above is tagged [INCOMPLETE UPSTREAM], the seat
+      that produced it terminated before finishing its deliverable — what you are
+      reading is an unfinished working note, not a binding ruling. On such a run your
+      rating MUST be Hold and you MUST omit position_size_pct; submit_decision will
+      reject Buy / Overweight / Sell / Underweight outright. Name the incomplete
+      upstream in your executive_summary so the operator can see why the committee
+      stood down, and set the monitoring trigger to "re-run once the upstream seat
+      completes".
+
       ## Past lessons (from the reflection officer's report above)
       Weigh recurring, evidenced mistakes — if the journal shows the committee was
       directionally wrong twice in a row in similar conditions, demand stronger
