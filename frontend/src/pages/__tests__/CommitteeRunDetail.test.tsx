@@ -1,12 +1,13 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { CommitteeRunDetail } from "../CommitteeRunDetail";
 import type { CommitteeRunDetail as Detail } from "@/lib/api";
 
 const apiMock = vi.hoisted(() => ({ getCommitteeRun: vi.fn(), swarmSseUrl: vi.fn(() => "") }));
+const sseMock = vi.hoisted(() => ({ connect: vi.fn(), disconnect: vi.fn(), onStatusChange: vi.fn() }));
 vi.mock("@/lib/api", () => ({ api: apiMock }));
 vi.mock("@/hooks/useSSE", () => ({
-  useSSE: () => ({ connect: vi.fn(), disconnect: vi.fn(), getStatus: () => "disconnected", onStatusChange: vi.fn() }),
+  useSSE: () => ({ ...sseMock, getStatus: () => "disconnected" }),
 }));
 
 function renderAt(runId: string) {
@@ -33,7 +34,10 @@ function makeDetail(over: Partial<Detail> = {}): Detail {
 }
 
 describe("CommitteeRunDetail", () => {
-  beforeEach(() => apiMock.getCommitteeRun.mockReset());
+  beforeEach(() => {
+    apiMock.getCommitteeRun.mockReset();
+    sseMock.connect.mockClear();
+  });
 
   it("renders seats, rendered markdown, decision, journal and pnl", async () => {
     apiMock.getCommitteeRun.mockResolvedValue(makeDetail());
@@ -60,5 +64,24 @@ describe("CommitteeRunDetail", () => {
     apiMock.getCommitteeRun.mockResolvedValue(makeDetail({ decision: { missing: true } }));
     renderAt("r1");
     expect(await screen.findByText("No portfolio decision recorded for this run")).toBeInTheDocument();
+  });
+
+  // Loop 2: a degraded seat still means "something happened to this run" —
+  // the live-follow panel must refetch on it like it does for
+  // task_completed/task_failed, or an operator watching a running run would
+  // never see the seat settle.
+  it("refetches run detail when a task_degraded event arrives while running", async () => {
+    apiMock.getCommitteeRun.mockResolvedValue(makeDetail({ run: { run_id: "r1", status: "running" } }));
+    renderAt("r1");
+    await screen.findByText("running");
+
+    expect(sseMock.connect).toHaveBeenCalledTimes(1);
+    const handlers = sseMock.connect.mock.calls[0][1] as Record<string, (data: Record<string, unknown>) => void>;
+    expect(handlers.task_degraded).toBeTypeOf("function");
+
+    apiMock.getCommitteeRun.mockClear();
+    handlers.task_degraded({ task_id: "task-research-plan" });
+
+    await waitFor(() => expect(apiMock.getCommitteeRun).toHaveBeenCalledWith("r1"));
   });
 });

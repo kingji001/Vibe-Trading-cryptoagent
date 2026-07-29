@@ -216,6 +216,25 @@ describe("useSSE — raw swarm run event names", () => {
     expect(completions).toEqual([{ task_id: "task-bull" }]);
     expect(runDone).toEqual([{ run_id: "swarm-x" }]);
   });
+
+  // Loop 2: a seat that dies mid-work settles as "degraded" rather than
+  // hanging forever — but only if this hook actually subscribes to the
+  // event. If "task_degraded" drops out of knownTypes, addEventListener is
+  // never called for it and the handler below never fires.
+  it("delivers task_degraded to its handler", () => {
+    const degraded: unknown[] = [];
+    const { result } = renderHook(() => useSSE());
+
+    act(() =>
+      result.current.connect("http://test/events", {
+        task_degraded: (data) => degraded.push(data),
+      }),
+    );
+
+    act(() => MockEventSource.latest.emit("task_degraded", { task_id: "task-research-plan" }, "evt-td"));
+
+    expect(degraded).toEqual([{ task_id: "task-research-plan" }]);
+  });
 });
 
 describe("useSSE — deduplication", () => {

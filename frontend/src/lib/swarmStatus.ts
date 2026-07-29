@@ -38,6 +38,8 @@ function mapTaskStatus(value: unknown): SwarmAgentDisplayStatus {
       return "running";
     case "completed":
       return "done";
+    case "degraded":
+      return "degraded";
     case "failed":
       return "failed";
     case "blocked":
@@ -218,6 +220,16 @@ export function applySwarmEvent(current: SwarmRunStatus, rawEvent: unknown, now 
       elapsed_s: agent.startedAt ? Math.max(0, (eventTime - agent.startedAt) / 1000) : agent.elapsed_s,
       iterations: asNumber(data.iterations) ?? agent.iterations,
       lastText: asString(data.summary) || agent.lastText,
+    }));
+  }
+
+  if (type === "task_degraded" || type === "worker_iteration_limit") {
+    return updateAgent(current, { agentId, taskId }, (agent) => ({
+      ...agent,
+      status: "degraded",
+      elapsed_s: agent.startedAt ? Math.max(0, (eventTime - agent.startedAt) / 1000) : agent.elapsed_s,
+      iterations: asNumber(data.iterations) ?? agent.iterations,
+      error: asString(data.error) || agent.error,
     }));
   }
 

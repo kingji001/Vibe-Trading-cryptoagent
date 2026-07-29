@@ -1,6 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { memo } from "react";
 import {
+  AlertTriangle,
   CheckCircle2,
   Circle,
   Clock,
@@ -30,6 +31,8 @@ function statusTone(status: SwarmAgentDisplayStatus): string {
   switch (status) {
     case "done":
       return "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400";
+    case "degraded":
+      return "bg-orange-500/10 text-orange-600 dark:text-orange-400";
     case "failed":
       return "bg-destructive/10 text-destructive";
     case "blocked":
@@ -50,6 +53,8 @@ function StatusIcon({ status }: { status: SwarmAgentDisplayStatus }) {
   switch (status) {
     case "done":
       return <CheckCircle2 className="h-3 w-3" />;
+    case "degraded":
+      return <AlertTriangle className="h-3 w-3" />;
     case "failed":
       return <XCircle className="h-3 w-3" />;
     case "blocked":
@@ -85,7 +90,7 @@ function runTone(status: SwarmRunStatus["status"]): string {
 
 export const SwarmStatusCard = memo(function SwarmStatusCard({ status }: Props) {
   const { t } = useTranslation();
-  const done = status.agents.filter((agent) => ["done", "failed", "blocked", "cancelled"].includes(agent.status)).length;
+  const done = status.agents.filter((agent) => ["done", "degraded", "failed", "blocked", "cancelled"].includes(agent.status)).length;
   const total = status.agents.length;
   const layerTotal = Math.max(status.totalLayers, status.currentLayer + 1, 1);
   const layerCurrent = Math.min(status.currentLayer + 1, layerTotal);
