@@ -467,6 +467,75 @@ def test_degraded_result_marks_task_degraded_and_run_failed(tmp_path, monkeypatc
     assert reloaded.status is RunStatus.failed
 
 
+def test_degraded_reason_is_redacted_on_every_copy(tmp_path, monkeypatch):
+    """Whole-branch review I3: the copy that leaves the box was the raw one.
+
+    ``degraded_tasks`` held the unredacted ``result.error`` while the
+    persisted task and the emitted event held the redacted form. The raw copy
+    travels furthest: ``_execute_layer`` splices it into the string handed to
+    ``build_worker_prompt``, i.e. into the LLM request body, and the worker
+    mirrors it to ``upstream_degradation.json``. Redacting at the source
+    makes all three byte-identical.
+    """
+    seen: list[dict] = []
+    secret = f"{Path.home()}/.vibe-trading/committee/journal.jsonl"
+
+    def fake_worker(agent_spec, task, **kwargs):
+        seen.append({"task": task.id, "degraded": kwargs.get("degraded_upstreams")})
+        if task.id == "task-judge":
+            return WorkerResult(
+                status="degraded",
+                summary="a partial working note",
+                error=f"hit iteration limit (15); last write target {secret}",
+                iterations=15,
+            )
+        return WorkerResult(status="completed", summary="trader done", iterations=3)
+
+    monkeypatch.setattr(rt, "run_worker", fake_worker)
+    store, runtime, run = _two_task_run(tmp_path)
+    runtime._execute_run(run, threading.Event())
+
+    propagated = seen[-1]["degraded"]["research_plan"]
+    assert str(Path.home()) not in propagated, propagated
+    assert "<redacted>/.vibe-trading/committee/journal.jsonl" in propagated
+
+    persisted = {t.id: t for t in store.load_run(run.id).tasks}["task-judge"].error
+    events = [
+        json.loads(line)
+        for line in (tmp_path / run.id / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    emitted = next(
+        e["data"]["error"]
+        for e in events
+        if e["type"] == "task_degraded" and e["task_id"] == "task-judge"
+    )
+    # one reason, three sinks, byte-identical
+    assert persisted == emitted
+    assert propagated == f"upstream task task-judge: {persisted}"
+
+
+def test_degraded_fallback_reason_survives_redaction(tmp_path, monkeypatch):
+    """The fallback still fires when the worker reports no error at all.
+
+    ``redact_internal_paths(None)`` returns ``""`` and ``"" or fallback``
+    yields the fallback, so applying redaction before the ``or`` is safe —
+    the comment that claimed otherwise is what this pins.
+    """
+
+    def fake_worker(agent_spec, task, **kwargs):
+        if task.id == "task-judge":
+            return WorkerResult(status="degraded", summary="partial", error=None)
+        return WorkerResult(status="completed", summary="trader done", iterations=1)
+
+    monkeypatch.setattr(rt, "run_worker", fake_worker)
+    store, runtime, run = _two_task_run(tmp_path)
+    runtime._execute_run(run, threading.Event())
+
+    judge = {t.id: t for t in store.load_run(run.id).tasks}["task-judge"]
+    assert judge.error == "seat did not complete its deliverable"
+
+
 def test_degraded_emits_task_degraded_event(tmp_path, monkeypatch):
     monkeypatch.setattr(
         rt,

@@ -415,15 +415,22 @@ class SwarmRuntime:
                         # directional call while it stands (spec §4.2 C2.2).
                         all_succeeded = False
                         task_summaries[tid] = result.summary
-                        # Hoisted once so the propagated (degraded_tasks),
-                        # persisted (update_status), and emitted (event data)
-                        # copies of the reason agree. redact_internal_paths
-                        # returns "" for None (src/tools/redaction.py:131-132),
-                        # so applying it to a bare `result.error` before the
-                        # fallback would have silently dropped the evidence
-                        # the fallback exists to preserve.
+                        # Redacted once at the source so the propagated
+                        # (degraded_tasks), persisted (update_status), and
+                        # emitted (event data) copies of the reason are
+                        # byte-identical. The propagated copy travels
+                        # furthest -- _execute_layer splices it into the
+                        # string passed to build_worker_prompt, i.e. into the
+                        # LLM request body, and the worker mirrors it to
+                        # upstream_degradation.json -- so it is the one that
+                        # most needs redacting, not the one that can skip it.
+                        # Redacting before the fallback is safe:
+                        # redact_internal_paths returns "" for None
+                        # (src/tools/redaction.py), and "" or fallback yields
+                        # the fallback.
                         reason = (
-                            result.error or "seat did not complete its deliverable"
+                            redact_internal_paths(result.error)
+                            or "seat did not complete its deliverable"
                         )
                         degraded_tasks[tid] = reason
                         now_iso = datetime.now(timezone.utc).isoformat()
@@ -431,7 +438,7 @@ class SwarmRuntime:
                             tid,
                             TaskStatus.degraded,
                             summary=result.summary,
-                            error=redact_internal_paths(reason),
+                            error=reason,
                             completed_at=now_iso,
                             artifacts=result.artifact_paths,
                             worker_iterations=result.iterations,
@@ -445,7 +452,7 @@ class SwarmRuntime:
                                 data={
                                     "status": result.status,
                                     "iterations": result.iterations,
-                                    "error": redact_internal_paths(reason),
+                                    "error": reason,
                                     "input_tokens": result.input_tokens,
                                     "output_tokens": result.output_tokens,
                                 },
