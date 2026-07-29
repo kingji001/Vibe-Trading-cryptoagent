@@ -319,7 +319,17 @@ _DEGRADED = [
 ]
 
 
-@pytest.mark.parametrize("rating", sorted(_DIRECTIONAL_RATINGS))
+# Fix wave 2 blocker 1: nothing validates this tool's JSON-schema enum
+# (agent/tools.py calls execute(**params) unvalidated), so the model picks the
+# rating string freely. The gate compared it exact-case against
+# _DIRECTIONAL_RATINGS while the executor (paper/translator.py) matches
+# .strip().lower() against lowercase sets — so 'overweight', ' Buy ' and
+# friends walked past the gate and reached the broker. Every spelling the
+# EXECUTOR would act on must be refused here.
+_CASING_BYPASSES = ["overweight", "OVERWEIGHT", " Buy ", "buy", "sell", "  underweight  "]
+
+
+@pytest.mark.parametrize("rating", sorted(_DIRECTIONAL_RATINGS) + _CASING_BYPASSES)
 def test_tool_append_rejects_directional_rating_on_degraded_run(jtool, jpath, rating):
     """Every directional rating is refused: the translator sizes a Buy /
     Overweight / Sell / Underweight from the rating alone (size_frac), so
@@ -373,6 +383,50 @@ def test_tool_append_directional_allowed_when_nothing_degraded(jtool, jpath):
     )
     assert out["status"] == "ok"
     assert [e["rating"] for e in journal.load_entries(jpath)] == ["Buy"]
+
+
+@pytest.mark.parametrize(
+    ("supplied", "canonical"),
+    [(" buy ", "Buy"), ("OVERWEIGHT", "Overweight"), ("sell", "Sell"), ("Hold", "Hold")],
+)
+def test_tool_append_journals_the_canonical_rating_spelling(
+    jtool, jpath, supplied, canonical
+):
+    """The append branch canonicalizes before it writes, so the journal stops
+    storing arbitrary casing. journal.append_decision hashes the rating into
+    the ``dec_`` id, so casing drift otherwise perturbs decision ids for what
+    is the same call."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating=supplied,
+            time_horizon="72h swing",
+            run_id=f"run-canon-{canonical}",
+            degraded_upstreams=[],
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["entry"]["rating"] == canonical
+    assert [e["rating"] for e in journal.load_entries(jpath)] == [canonical]
+
+
+def test_tool_append_keeps_an_unrecognized_rating_verbatim(jtool, jpath):
+    """Canonicalization maps known spellings only — a genuinely unrecognized
+    value is left alone for the existing validation rather than silently
+    coerced into a tradeable rating."""
+    out = json.loads(
+        jtool.execute(
+            action="append",
+            symbol="ETH-USDT",
+            rating="Strong Buy!!",
+            time_horizon="72h swing",
+            run_id="run-unknown-rating",
+            degraded_upstreams=[],
+        )
+    )
+    assert out["status"] == "ok"
+    assert out["entry"]["rating"] == "Strong Buy!!"
 
 
 def test_tool_append_gate_falls_back_to_on_disk_marker(jtool, jpath, tmp_path):

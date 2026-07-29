@@ -56,6 +56,33 @@ def _derive_run_id(run_dir: Any) -> str | None:
     return match.group(1) if match else None
 
 
+def _canonical_rating(value: Any) -> Any:
+    """Map a rating onto the canonical ``Rating`` spelling, case-insensitively.
+
+    Nothing validates this tool's JSON-schema ``rating`` enum --
+    ``src/agent/tools.py`` calls ``execute(**params)`` with whatever the model
+    emitted -- so the string arrives raw. That mattered because the two
+    consumers disagreed on how to read it: the degraded gate compared it
+    exact-case against ``_DIRECTIONAL_RATINGS`` while the paper executor
+    (``paper/translator.py``) matches ``.strip().lower()`` against lowercase
+    sets, so ``'overweight'`` or ``' Buy '`` slipped past the gate and still
+    sized an order. Canonicalizing once, before both the gate and
+    ``append_decision``, makes every reader see the same spelling -- and stops
+    the journal storing arbitrary casing, which ``journal.append_decision``
+    hashes into the ``dec_`` entry id.
+
+    Genuinely unrecognized values are returned unchanged, for the existing
+    validation to handle -- never silently coerced into a tradeable rating.
+    """
+    from src.committee.schemas import Rating
+
+    text = str(value or "").strip()
+    for rating in Rating:
+        if text.lower() == rating.value.lower():
+            return rating.value
+    return value
+
+
 def _degraded_gate(kwargs: dict[str, Any]) -> dict[str, Any] | None:
     """Refusal payload when an append would size a directional call on a run
     with a degraded upstream; None when the append may proceed.
@@ -239,6 +266,11 @@ class DecisionJournalTool(BaseTool):
                 # directional call harmless. Same precedent as the
                 # position_size_pct range check below — the PM reaches the
                 # journal directly through this tool.
+                # Canonicalize FIRST: the gate and the executor must read the
+                # same spelling, or a casing variant walks past the gate and
+                # still sizes an order (see _canonical_rating).
+                rating = _canonical_rating(kwargs["rating"])
+                kwargs["rating"] = rating
                 gate = _degraded_gate(kwargs)
                 if gate is not None:
                     return json.dumps(gate, ensure_ascii=False)
@@ -305,7 +337,7 @@ class DecisionJournalTool(BaseTool):
                 )
                 entry = journal.append_decision(
                     symbol=kwargs["symbol"],
-                    rating=kwargs["rating"],
+                    rating=rating,
                     time_horizon=kwargs["time_horizon"],
                     price_target=price_target,
                     run_id=run_id,
