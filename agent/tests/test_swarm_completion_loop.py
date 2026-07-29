@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -216,7 +217,7 @@ class _TamperMarkerThenSubmitLLM:
     The ``submit_decision`` call also supplies its own ``degraded_upstreams:
     []`` argument -- a model asserting "nothing is degraded" through the
     tool-call arguments themselves, not just the on-disk marker. This is
-    deliberate: worker.py:772 must inject the seat's real degraded set
+    deliberate: worker.py's tool-call loop must inject the seat's real set
     *after* the ``{**tc.arguments, ...}`` merge so it overrides this
     model-supplied value; a merge-order regression that let the model's
     value win would otherwise go undetected, since an empty ``arguments``
@@ -591,18 +592,55 @@ def test_reconcile_treats_degraded_as_terminal(tmp_path):
     assert {t.id: t.status for t in reconciled.tasks}["t1"] is TaskStatus.degraded
 
 
+def test_reconcile_terminal_branch_alone_treats_degraded_as_terminal(tmp_path):
+    """Whole-branch review I1: pin ``reconcile_run``'s OWN terminal set.
+
+    ``test_reconcile_treats_degraded_as_terminal`` dates its run in 2026-07
+    and so is stale: drop ``TaskStatus.degraded`` from ``reconcile_run``'s
+    ``terminal_task`` set (store.py:402-407) and ``all_terminal`` goes False,
+    but ``is_run_stale`` is True, so ``_reap_stale`` — whose own set IS
+    guarded — derives the same ``failed``. The revert stayed green.
+
+    Here ``created_at`` is now and ``events.jsonl`` is empty, so
+    ``is_run_stale`` is False and the stale branch cannot answer. Every task
+    is terminal, so the only path to ``failed`` is the ``all_terminal``
+    branch — which requires ``degraded`` to be in that set. Reverting
+    store.py:404 makes this return ``RunStatus.running``.
+    """
+    store = SwarmStore(base_dir=tmp_path)
+    run = SwarmRun(
+        id="r-fresh",
+        preset_name="demo",
+        status=RunStatus.running,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        tasks=[
+            SwarmTask(
+                id="t1", agent_id="a", prompt_template="x", status=TaskStatus.degraded
+            ),
+            SwarmTask(
+                id="t2", agent_id="b", prompt_template="x", status=TaskStatus.completed
+            ),
+        ],
+    )
+    store.create_run(run)
+    loaded = store.load_run(run.id)
+    assert store.is_run_stale(loaded) is False, "fixture must not be stale"
+
+    assert store.reconcile_run(loaded, write=False).status is RunStatus.failed
+
+
 def test_reap_stale_preserves_degraded_task_and_reaps_pending(tmp_path):
     """A degraded task must survive the stale-run reaper unmodified.
 
-    Task 5 added ``degraded`` to ``_reap_stale``'s terminal set
-    (store.py:466-471) so a seat that already reported its own failure
-    isn't overwritten with the reaper's generic "host process likely
-    exited" message. ``test_reconcile_treats_degraded_as_terminal`` cannot
-    prove this on its own: its fixture (degraded + completed) is
+    Task 5 added ``degraded`` to the terminal set ``_reap_stale`` consults
+    (now ``store._TERMINAL_TASK_STATUSES``) so a seat that already reported
+    its own failure isn't overwritten with the reaper's generic "host process
+    likely exited" message. ``test_reconcile_treats_degraded_as_terminal``
+    cannot prove this on its own: its fixture (degraded + completed) is
     all-terminal, so ``reconcile_run`` returns via ``_recover_terminal``
-    (store.py:412-417) before the ``is_run_stale`` check ever runs, and
-    ``_reap_stale`` is never reached. Here, ``t2`` is kept genuinely
-    non-terminal (``pending``) so the stale path is actually exercised.
+    before the ``is_run_stale`` check ever runs, and ``_reap_stale`` is never
+    reached. Here, ``t2`` is kept genuinely non-terminal (``pending``) so the
+    stale path is actually exercised.
     """
     store = SwarmStore(base_dir=tmp_path)
     run = SwarmRun(

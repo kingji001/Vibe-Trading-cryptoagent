@@ -18,8 +18,23 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.swarm.models import SwarmEvent, SwarmRun
+from src.swarm.models import SwarmEvent, SwarmRun, TaskStatus
 from src.tools.redaction import redact_internal_paths
+
+# A task in one of these states will never change again on its own. Both
+# recovery paths in ``reconcile_run`` need the same answer — the terminal
+# branch to decide the run is over, ``_reap_stale`` to decide which tasks it
+# may overwrite — and they used to keep byte-identical hand-maintained
+# copies. That is how ``degraded`` came to be added to one and not the other
+# (Task 5), so there is one set now.
+_TERMINAL_TASK_STATUSES = frozenset(
+    {
+        TaskStatus.completed,
+        TaskStatus.degraded,
+        TaskStatus.failed,
+        TaskStatus.cancelled,
+    }
+)
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -394,22 +409,18 @@ class SwarmStore:
         Returns:
             Reconciled ``SwarmRun`` (a new instance — original is not mutated).
         """
-        from src.swarm.models import RunStatus, TaskStatus
+        from src.swarm.models import RunStatus
 
         hydrated = self.hydrate_run(run)
         now = datetime.now(timezone.utc)
         terminal_run = {RunStatus.completed, RunStatus.failed, RunStatus.cancelled}
-        terminal_task = {
-            TaskStatus.completed,
-            TaskStatus.degraded,
-            TaskStatus.failed,
-            TaskStatus.cancelled,
-        }
 
         if hydrated.status in terminal_run:
             return hydrated
 
-        all_terminal = bool(hydrated.tasks) and all(t.status in terminal_task for t in hydrated.tasks)
+        all_terminal = bool(hydrated.tasks) and all(
+            t.status in _TERMINAL_TASK_STATUSES for t in hydrated.tasks
+        )
         if all_terminal:
             recovered = self._recover_terminal(hydrated, now=now)
             if write and recovered is not hydrated:
@@ -461,14 +472,6 @@ class SwarmStore:
 
     def _reap_stale(self, run: SwarmRun, *, now: datetime) -> SwarmRun:
         """Pure: mark non-terminal tasks failed; derive run status from tasks."""
-        from src.swarm.models import TaskStatus
-
-        terminal_task = {
-            TaskStatus.completed,
-            TaskStatus.degraded,
-            TaskStatus.failed,
-            TaskStatus.cancelled,
-        }
         last_event_at = _last_event_timestamp(self.run_dir(run.id) / "events.jsonl")
         threshold = int(self.compute_stale_threshold(run))
         error_msg = (
@@ -479,7 +482,7 @@ class SwarmStore:
 
         updated_tasks = []
         for task in run.tasks:
-            if task.status in terminal_task:
+            if task.status in _TERMINAL_TASK_STATUSES:
                 updated_tasks.append(task)
             else:
                 updated_tasks.append(
