@@ -20,10 +20,13 @@ function renderAt(runId: string) {
 function makeDetail(over: Partial<Detail> = {}): Detail {
   return {
     run: { run_id: "r1", status: "completed" },
+    // Statuses are the values GET /committee/runs/{id} actually sends —
+    // task.status.value, i.e. completed/degraded/failed/cancelled. "done" is
+    // a swarmStatus.ts display value that never reaches this endpoint.
     seats: [
-      { agent_id: "market_analyst", phase: "analysts", round: null, status: "done", report_md: "# Market view\nBullish." },
-      { agent_id: "bull_researcher", phase: "debate", round: 1, status: "done", report_md: "Bull case." },
-      { agent_id: "risk_manager", phase: "risk", round: null, status: "done", report_md: null, missing: true },
+      { agent_id: "market_analyst", phase: "analysts", round: null, status: "completed", report_md: "# Market view\nBullish." },
+      { agent_id: "bull_researcher", phase: "debate", round: 1, status: "completed", report_md: "Bull case." },
+      { agent_id: "risk_manager", phase: "risk", round: null, status: "completed", report_md: null, missing: true },
     ],
     debate: { rounds: 1, order: ["bull-r1", "bear-r1"] },
     decision: { rating: "Buy", price_target: 70000, position_size_pct: 5 },
@@ -64,6 +67,64 @@ describe("CommitteeRunDetail", () => {
     apiMock.getCommitteeRun.mockResolvedValue(makeDetail({ decision: { missing: true } }));
     renderAt("r1");
     expect(await screen.findByText("No portfolio decision recorded for this run")).toBeInTheDocument();
+  });
+
+  // Whole-branch review I4: SeatSection coloured on `seat.status === "done"`,
+  // a value this endpoint never sends, so `degraded` rendered in the same
+  // muted grey as `completed` — the degradation was invisible exactly where
+  // an operator looks for it.
+  it("colours a degraded seat as a warning and a completed seat as success", async () => {
+    apiMock.getCommitteeRun.mockResolvedValue(
+      makeDetail({
+        // run status "running" so the header badge doesn't collide with the
+        // seat badge this test queries by text.
+        run: { run_id: "r1", status: "running" },
+        seats: [
+          { agent_id: "market_analyst", phase: "analysts", round: null, status: "completed", report_md: "ok" },
+          { agent_id: "research_manager", phase: "research_manager", round: null, status: "degraded", report_md: null, missing: true },
+        ],
+      } as Partial<Detail>),
+    );
+    renderAt("r1");
+
+    const degraded = await screen.findByText("degraded");
+    expect(degraded.className).toContain("text-warning");
+    expect(screen.getByText("completed").className).toContain("text-success");
+  });
+
+  it("renders the degraded seat's reason instead of leaving it unexplained", async () => {
+    apiMock.getCommitteeRun.mockResolvedValue(
+      makeDetail({
+        seats: [
+          {
+            agent_id: "research_manager",
+            phase: "research_manager",
+            round: null,
+            status: "degraded",
+            report_md: null,
+            missing: true,
+            status_error: "hit iteration limit (15) without completing the deliverable",
+          },
+        ],
+      } as Partial<Detail>),
+    );
+    renderAt("r1");
+
+    expect(
+      await screen.findByText(/hit iteration limit \(15\) without completing the deliverable/),
+    ).toBeInTheDocument();
+  });
+
+  it("colours a failed seat as danger", async () => {
+    apiMock.getCommitteeRun.mockResolvedValue(
+      makeDetail({
+        seats: [
+          { agent_id: "trader", phase: "trader", round: null, status: "failed", report_md: null, missing: true },
+        ],
+      } as Partial<Detail>),
+    );
+    renderAt("r1");
+    expect((await screen.findByText("failed")).className).toContain("text-danger");
   });
 
   // Loop 2: a degraded seat still means "something happened to this run" —

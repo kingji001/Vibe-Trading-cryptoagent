@@ -133,6 +133,7 @@
     "reportUnavailable": "보고서를 사용할 수 없습니다",
     "reportUnavailableHint": "이 좌석은 이번 실행에서 report.md 파일을 생성하지 않았습니다.",
     "seatError": "이 좌석을 읽을 수 없습니다",
+    "seatDegraded": "좌석이 완료되지 않음",
     "expand": "펼치기",
     "collapse": "접기",
     "decision": "결정",

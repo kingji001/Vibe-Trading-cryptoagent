@@ -10,6 +10,15 @@ import type { CommitteeSeat } from "@/lib/api";
 const remarkPlugins = [remarkGfm];
 const rehypePlugins = [rehypeHighlight];
 
+// Keyed on the values GET /committee/runs/{id} actually sends — task.status
+// .value, i.e. the TaskStatus enum. Anything else (pending, in_progress,
+// blocked) is not an outcome and stays muted.
+const STATUS_TONE: Record<string, string> = {
+  completed: "text-success",
+  degraded: "text-warning",
+  failed: "text-danger",
+};
+
 export function SeatSection({ seat, defaultOpen = true }: { seat: CommitteeSeat; defaultOpen?: boolean }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(defaultOpen);
@@ -23,10 +32,13 @@ export function SeatSection({ seat, defaultOpen = true }: { seat: CommitteeSeat;
         {open ? <ChevronDown className="h-4 w-4 shrink-0" /> : <ChevronRight className="h-4 w-4 shrink-0" />}
         <span className="font-mono text-sm font-medium">{seat.agent_id}</span>
         {seat.round ? <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">{t("committee.round", { n: seat.round })}</span> : null}
-        <span className={cn("ms-auto text-xs", seat.status === "done" ? "text-success" : "text-muted-foreground")}>{seat.status}</span>
+        <span className={cn("ms-auto text-xs", STATUS_TONE[seat.status] ?? "text-muted-foreground")}>{seat.status}</span>
       </button>
       {open ? (
         <div className="border-t p-3">
+          {seat.status_error ? (
+            <p className="mb-3 text-sm text-warning">{t("committee.seatDegraded")}: {seat.status_error}</p>
+          ) : null}
           {seat.error ? (
             <p className="text-sm text-danger">{t("committee.seatError")}: {seat.error}</p>
           ) : seat.report_md ? (
