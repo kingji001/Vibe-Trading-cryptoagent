@@ -235,6 +235,28 @@ describe("useSSE — raw swarm run event names", () => {
 
     expect(degraded).toEqual([{ task_id: "task-research-plan" }]);
   });
+
+  // Loop 2 fix round: `worker_iteration_limit` is emitted by the worker
+  // (agent/src/swarm/worker.py) through the same _emit_event path as
+  // task_degraded and reaches the SSE stream identically — if it drops out
+  // of knownTypes, addEventListener is never called for it and the handler
+  // below never fires.
+  it("delivers worker_iteration_limit to its handler", () => {
+    const limitHit: unknown[] = [];
+    const { result } = renderHook(() => useSSE());
+
+    act(() =>
+      result.current.connect("http://test/events", {
+        worker_iteration_limit: (data) => limitHit.push(data),
+      }),
+    );
+
+    act(() =>
+      MockEventSource.latest.emit("worker_iteration_limit", { task_id: "task-research-plan" }, "evt-wil"),
+    );
+
+    expect(limitHit).toEqual([{ task_id: "task-research-plan" }]);
+  });
 });
 
 describe("useSSE — deduplication", () => {

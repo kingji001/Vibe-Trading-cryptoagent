@@ -84,4 +84,23 @@ describe("CommitteeRunDetail", () => {
 
     await waitFor(() => expect(apiMock.getCommitteeRun).toHaveBeenCalledWith("r1"));
   });
+
+  // Loop 2 fix round: worker_iteration_limit is emitted by the worker via the
+  // same _emit_event path as task_degraded and reaches this SSE stream
+  // identically — the live-follow panel must refetch on it too, or an
+  // operator watching a running run would never see the seat settle.
+  it("refetches run detail when a worker_iteration_limit event arrives while running", async () => {
+    apiMock.getCommitteeRun.mockResolvedValue(makeDetail({ run: { run_id: "r1", status: "running" } }));
+    renderAt("r1");
+    await screen.findByText("running");
+
+    expect(sseMock.connect).toHaveBeenCalledTimes(1);
+    const handlers = sseMock.connect.mock.calls[0][1] as Record<string, (data: Record<string, unknown>) => void>;
+    expect(handlers.worker_iteration_limit).toBeTypeOf("function");
+
+    apiMock.getCommitteeRun.mockClear();
+    handlers.worker_iteration_limit({ task_id: "task-research-plan" });
+
+    await waitFor(() => expect(apiMock.getCommitteeRun).toHaveBeenCalledWith("r1"));
+  });
 });

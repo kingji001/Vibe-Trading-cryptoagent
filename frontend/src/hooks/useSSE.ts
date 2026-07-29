@@ -88,7 +88,7 @@ export function useSSE(config?: SSEConfig) {
       // chat-session stream's "swarm.event" envelope. Only the completion-signaling
       // ones consumers actually key off of (CommitteeRunDetail's live-follow).
       "task_completed", "worker_completed", "task_failed", "worker_failed",
-      "worker_timeout", "worker_incomplete", "task_degraded", "run_completed", "run_error",
+      "worker_timeout", "worker_incomplete", "task_degraded", "worker_iteration_limit", "run_completed", "run_error",
       "attempt.created", "attempt.started", "attempt.completed", "attempt.failed",
       "message.received", "session.created",
       "goal.created", "goal.evidence", "goal.updated",
