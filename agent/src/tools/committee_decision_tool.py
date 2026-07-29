@@ -26,13 +26,14 @@ from src.agent.tools import BaseTool
 # Loop 2 (Completion) decision gate. ``run_dir`` injected into every swarm
 # tool call is the calling seat's artifact dir, and the worker mirrors its
 # degraded-upstream set there as ``upstream_degradation.json``; the worker
-# also passes that set directly into ``submit_decision``'s kwargs, which
-# takes precedence -- see ``_degraded_upstreams``. The file fallback still
-# exists for callers outside the swarm (tests, the single-agent loop) but is
-# never the source of truth inside a swarm run. A sized directional call on
-# a run whose required upstream never completed is what committed $16,965 on
-# a truncated scratch note (spec §4.1); Hold stays open so a degraded run
-# yields a no-op rather than a blind trade.
+# also passes that set directly into the kwargs of the two gated tools
+# (``submit_decision`` and ``decision_journal``), which takes precedence --
+# see ``_degraded_upstreams``. The file fallback still exists for callers
+# outside the swarm (tests, the single-agent loop) but is never the source of
+# truth inside a swarm run. A sized directional call on a run whose required
+# upstream never completed is what committed $16,965 on a truncated scratch
+# note (spec §4.1); Hold stays open so a degraded run yields a no-op rather
+# than a blind trade.
 _UPSTREAM_DEGRADATION_FILENAME = "upstream_degradation.json"
 _DIRECTIONAL_RATINGS = frozenset({"Buy", "Overweight", "Sell", "Underweight"})
 
@@ -45,8 +46,8 @@ def _degraded_upstreams(run_dir: Any, injected: Any = None) -> list[dict]:
             source when ``injected`` is absent, for backward compatibility
             with callers that never pass the kwarg.
         injected: The seat's degraded-upstream set passed out-of-band by the
-            swarm worker (worker.py's tool-call loop injects this for
-            ``submit_decision`` calls specifically). Preferred over the
+            swarm worker (worker.py's tool-call loop injects this for the
+            gated tools specifically). Preferred over the
             on-disk marker: ``upstream_degradation.json`` lives inside the
             model-writable ``run_dir``, and ``write_file`` can overwrite any
             filename there (``resolve_safe_path`` has no filename blocklist),
@@ -74,6 +75,31 @@ def _degraded_upstreams(run_dir: Any, injected: Any = None) -> list[dict]:
     if not isinstance(entries, list):
         return []
     return [e for e in entries if isinstance(e, dict)]
+
+
+def degraded_gate_error(rating: str, degraded: list[dict]) -> dict:
+    """The gate's refusal payload, shared by both tools that can commit capital.
+
+    ``submit_decision`` validates and renders; ``decision_journal(action=
+    "append")`` is what actually reaches the broker (append_decision ->
+    paper.hook.maybe_execute_paper -> paper.translator.execute_decision, which
+    sizes the order from the journal entry's rating). The portfolio manager
+    holds both, so both gate — and returning one message from one place keeps
+    the two refusals byte-identical rather than drifting apart.
+    """
+    names = ", ".join(
+        str(e.get("context_key") or e.get("task_id") or "?") for e in degraded
+    )
+    return {
+        "status": "error",
+        "error": (
+            f"Decision gate: rating '{rating}' is a sized directional call, "
+            "but a required upstream deliverable on this run is degraded "
+            f"({names}). Resubmit with rating 'Hold' — it is the only rating "
+            "accepted while an upstream is incomplete."
+        ),
+        "degraded_upstreams": degraded,
+    }
 
 
 class SubmitDecisionTool(BaseTool):
@@ -177,22 +203,8 @@ class SubmitDecisionTool(BaseTool):
             rating = getattr(model, "rating", None)
             rating_value = getattr(rating, "value", None) or str(rating)
             if degraded and rating_value in _DIRECTIONAL_RATINGS:
-                names = ", ".join(
-                    str(e.get("context_key") or e.get("task_id") or "?")
-                    for e in degraded
-                )
                 return json.dumps(
-                    {
-                        "status": "error",
-                        "error": (
-                            f"Decision gate: rating '{rating_value}' is a sized "
-                            "directional call, but a required upstream "
-                            f"deliverable on this run is degraded ({names}). "
-                            "Resubmit with rating 'Hold' — it is the only "
-                            "rating accepted while an upstream is incomplete."
-                        ),
-                        "degraded_upstreams": degraded,
-                    },
+                    degraded_gate_error(rating_value, degraded),
                     ensure_ascii=False,
                 )
 

@@ -758,17 +758,23 @@ def run_worker(
             )
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
-            if tc.name == "submit_decision":
-                # Scoped to this one tool rather than injected universally:
+            if tc.name in ("submit_decision", "decision_journal"):
+                # Both tools the PM can use to act on a rating: submit_decision
+                # validates and renders, decision_journal's append is what
+                # reaches the paper broker. Each gates on this set, so each
+                # needs it out-of-band — the on-disk marker sits in the
+                # model-writable run_dir.
+                #
+                # Scoped to these two rather than injected universally:
                 # run_dir is forwarded to every swarm tool call including
                 # remote MCP tools, and MCPRemoteTool._filter_arguments only
                 # strips names in _LOCAL_ONLY_ARGUMENTS (mcp.py) before
-                # relaying the rest to the remote server. A second
-                # universally-injected kwarg would leak this run's degraded-
-                # upstream reasons to any remote MCP tool whose schema
-                # allows additional properties unless that filter set were
-                # also updated — scoping to submit_decision avoids touching
-                # that surface at all.
+                # relaying the rest to the remote server. A universally
+                # injected kwarg would leak this run's degraded-upstream
+                # reasons to any remote MCP tool whose schema allows
+                # additional properties unless that filter set were also
+                # updated — a membership test avoids touching that surface
+                # at all.
                 args["degraded_upstreams"] = degraded_upstream_entries
 
             # Wrap tool execution in a heartbeat so the events.jsonl tail has a

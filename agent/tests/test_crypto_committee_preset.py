@@ -286,6 +286,18 @@ def test_pm_prompt_carries_degraded_upstream_protocol(run):
     assert "Buy / Overweight / Sell / Underweight" in pm.system_prompt
 
 
+def test_pm_prompt_states_both_tools_gate(run):
+    """Whole-branch review C1: the PM holds submit_decision AND decision_journal,
+    and only the latter reaches the paper broker. The protocol block must say
+    both refuse, or the PM reads the gate as a formatting rule it can route
+    around by journaling directly."""
+    pm = {a.id: a for a in run.agents}["portfolio_manager"]
+    protocol = pm.system_prompt.split("## Degraded upstream protocol (HARD RULE)")[1]
+    protocol = protocol.split("\n## ")[0]
+    assert "submit_decision will" in protocol
+    assert "decision_journal append step below enforces the SAME rule" in protocol
+
+
 def _transitive_deps(tasks: dict, task_id: str) -> set[str]:
     seen: set[str] = set()
 

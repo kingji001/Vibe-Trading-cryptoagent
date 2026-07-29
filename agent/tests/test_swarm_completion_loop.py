@@ -267,7 +267,7 @@ class _TamperRegistry:
         return VALIDATION_ERROR
 
 
-def test_degraded_upstreams_injected_only_into_submit_decision_and_survives_marker_tampering(
+def test_degraded_upstreams_injected_only_into_gated_tools_and_survives_marker_tampering(
     monkeypatch, tmp_path
 ):
     """Finding A integration proof. Even after a tool call clears the
@@ -275,9 +275,10 @@ def test_degraded_upstreams_injected_only_into_submit_decision_and_survives_mark
     calling ``write_file`` to unlock a sized directional call, since the
     marker sits in the model-writable run_dir with no filename blocklist --
     the worker's ``submit_decision`` call still carries the seat's real
-    degraded-upstream set, injected out-of-band. No other tool receives it,
-    confirming the injection is scoped to ``submit_decision`` rather than
-    universal (see worker.py's tool-call loop)."""
+    degraded-upstream set, injected out-of-band. Tools outside the gated pair
+    (``submit_decision``, ``decision_journal``) receive nothing, confirming
+    the injection is scoped rather than universal (see worker.py's tool-call
+    loop)."""
     monkeypatch.setattr(backoff_mod.time, "sleep", lambda *_: None)
     registry = _TamperRegistry()
     with (
@@ -305,6 +306,62 @@ def test_degraded_upstreams_injected_only_into_submit_decision_and_survives_mark
     write_args, submit_args = registry.calls[0][1], registry.calls[1][1]
     assert "degraded_upstreams" not in write_args
     assert submit_args["degraded_upstreams"] == [
+        {
+            "context_key": "research_plan",
+            "reason": "upstream task task-research-plan: x",
+        }
+    ]
+
+
+class _JournalAppendLLM:
+    """Calls ``decision_journal(action="append", ...)`` every iteration."""
+
+    def __init__(self, model_name: str | None = None, **kwargs) -> None:
+        self.model_name = model_name
+
+    def __call__(self, *args, **kwargs) -> "_JournalAppendLLM":
+        return _JournalAppendLLM(**kwargs)
+
+    def stream_chat(self, messages, tools=None, on_text_chunk=None, timeout=None):
+        return LLMResponse(
+            content=LONG_NOTE,
+            tool_calls=[
+                ToolCallRequest(
+                    id="tc1",
+                    name="decision_journal",
+                    arguments={"action": "append", "rating": "Overweight"},
+                )
+            ],
+        )
+
+
+def test_degraded_upstreams_injected_into_decision_journal(monkeypatch, tmp_path):
+    """``decision_journal`` is the tool that commits capital (append ->
+    maybe_execute_paper -> translator.execute_decision), so its gate needs the
+    same out-of-band degraded set ``submit_decision`` gets. Without the
+    injection the journal gate would fall back to the model-writable on-disk
+    marker, i.e. be cooperative rather than enforced."""
+    monkeypatch.setattr(backoff_mod.time, "sleep", lambda *_: None)
+    registry = _TamperRegistry()
+    with (
+        patch.object(worker_mod, "build_swarm_registry", lambda *a, **k: registry),
+        patch.object(worker_mod, "ChatLLM", _JournalAppendLLM()),
+    ):
+        run_worker(
+            agent_spec=_spec(id="portfolio_manager", max_iterations=1),
+            task=SwarmTask(
+                id="t1", agent_id="portfolio_manager", prompt_template="Decide."
+            ),
+            upstream_summaries={"research_plan": "partial note"},
+            user_vars={},
+            run_dir=tmp_path,
+            degraded_upstreams={
+                "research_plan": "upstream task task-research-plan: x"
+            },
+        )
+
+    assert [name for name, _ in registry.calls] == ["decision_journal"]
+    assert registry.calls[0][1]["degraded_upstreams"] == [
         {
             "context_key": "research_plan",
             "reason": "upstream task task-research-plan: x",

@@ -6,14 +6,18 @@ The research_manager seat burned its 15-iteration budget retrying
 mid-thought scratch note was marked ``status: "completed"`` and handed to the
 trader and the PM as the binding research plan.
 
-Four things must hold (spec §4.3):
+Five things must hold (spec §4.3, plus the whole-branch review's C1):
   1. a worker that hits the iteration limit does not report ``completed``;
   2. the triggering validation error survives in the task's artifacts;
   3. every downstream consumer's rendered prompt carries an explicit
      incomplete-upstream marker (fail-visible, not fail-closed — the run
      continues rather than burning 0.9M tokens on an abort);
   4. the PM gate rejects a sized directional decision on a degraded run and
-     still accepts Hold.
+     still accepts Hold;
+  5. the SAME gate holds on ``decision_journal(action="append")`` — the tool
+     that actually commits capital (append_decision -> maybe_execute_paper ->
+     translator.execute_decision sizes from the JOURNAL entry's rating), not
+     ``submit_decision``, which only validates and renders.
 
 Every assertion below except the Hold guard fails on pre-fix code.
 """
@@ -28,11 +32,13 @@ from unittest.mock import patch
 import src.providers.backoff as backoff_mod
 import src.swarm.runtime as rt
 import src.swarm.worker as worker_mod
+from src.committee import journal
 from src.providers.chat import LLMResponse, ToolCallRequest
 from src.swarm.models import SwarmAgentSpec, SwarmRun, SwarmTask, TaskStatus
 from src.swarm.store import SwarmStore
 from src.swarm.worker import run_worker
 from src.tools.committee_decision_tool import SubmitDecisionTool
+from src.tools.committee_journal_tool import DecisionJournalTool
 
 # The real 821-byte scratch note pattern: long enough to survive
 # _best_summary and _classify_deliverable, ending mid-thought.
@@ -337,3 +343,58 @@ def test_pm_gate_accepts_hold_on_degraded_run(tmp_path):
     )
     assert result["status"] == "ok", result
     assert (artifact_dir / "decision.portfolio_decision.json").exists()
+
+
+# --------------------------------------------------------------------------
+# 5: the gate holds on the tool that MOVES MONEY, not just the one that
+#    validates. decision.portfolio_decision.json never reaches the broker;
+#    the journal entry does (journal.append_decision -> paper.hook
+#    .maybe_execute_paper -> paper.translator.execute_decision, which sizes
+#    the order from the ENTRY's rating). A gate only on submit_decision left
+#    the capital-committing path open.
+# --------------------------------------------------------------------------
+
+
+def test_journal_append_rejects_sized_directional_on_degraded_run(
+    monkeypatch, tmp_path
+):
+    journal_file = tmp_path / "journal.jsonl"
+    monkeypatch.setenv("VIBE_TRADING_COMMITTEE_JOURNAL", str(journal_file))
+    artifact_dir = _degraded_artifact_dir(tmp_path)
+
+    result = json.loads(
+        DecisionJournalTool().execute(
+            action="append",
+            symbol="BTC-USDT",
+            rating="Overweight",
+            time_horizon="72h swing",
+            position_size_pct=34.0,
+            run_dir=str(artifact_dir),
+        )
+    )
+
+    assert result["status"] == "error", result
+    assert "degraded" in result["error"].lower(), result
+    # Nothing appended: the paper hook fires off the journal entry, so an
+    # entry written before the refusal would already have committed capital.
+    assert not journal_file.exists(), journal_file.read_text(encoding="utf-8")
+    assert journal.load_entries(journal_file) == []
+
+
+def test_journal_append_accepts_hold_on_degraded_run(monkeypatch, tmp_path):
+    journal_file = tmp_path / "journal.jsonl"
+    monkeypatch.setenv("VIBE_TRADING_COMMITTEE_JOURNAL", str(journal_file))
+    artifact_dir = _degraded_artifact_dir(tmp_path)
+
+    result = json.loads(
+        DecisionJournalTool().execute(
+            action="append",
+            symbol="BTC-USDT",
+            rating="Hold",
+            time_horizon="72h swing",
+            run_dir=str(artifact_dir),
+        )
+    )
+
+    assert result["status"] == "ok", result
+    assert [e["rating"] for e in journal.load_entries(journal_file)] == ["Hold"]

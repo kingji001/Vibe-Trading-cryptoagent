@@ -450,6 +450,13 @@ agents:
       upstream in your executive_summary so the operator can see why the committee
       stood down, and set the monitoring trigger to "re-run once the upstream seat
       completes".
+      The decision_journal append step below enforces the SAME rule and will reject a
+      Buy / Overweight / Sell / Underweight append on such a run — the journal drives
+      the paper-trading executor, so this is the step that would otherwise commit
+      capital on an unfinished deliverable. Both tools accept Hold; append the Hold
+      exactly as you submitted it. There is no rating that gets a directional call
+      through on a degraded run: re-run the committee once the upstream seat
+      completes.
 
       ## Past lessons (from the reflection officer's report above)
       Weigh recurring, evidenced mistakes — if the journal shows the committee was

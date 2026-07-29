@@ -56,6 +56,29 @@ def _derive_run_id(run_dir: Any) -> str | None:
     return match.group(1) if match else None
 
 
+def _degraded_gate(kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    """Refusal payload when an append would size a directional call on a run
+    with a degraded upstream; None when the append may proceed.
+
+    Both the rating set and the degraded-upstream lookup come from
+    ``committee_decision_tool`` so this gate and ``submit_decision``'s cannot
+    diverge — the PM holds both tools and must read one rule.
+    """
+    from src.tools.committee_decision_tool import (
+        _DIRECTIONAL_RATINGS,
+        _degraded_upstreams,
+        degraded_gate_error,
+    )
+
+    rating = str(kwargs.get("rating") or "")
+    if rating not in _DIRECTIONAL_RATINGS:
+        return None
+    degraded = _degraded_upstreams(kwargs.get("run_dir"), kwargs.get("degraded_upstreams"))
+    if not degraded:
+        return None
+    return degraded_gate_error(rating, degraded)
+
+
 def _coerce_optional_float(value: Any) -> float | None:
     """Nullish-tolerant float coercion, same rule as the schema fields.
 
@@ -206,6 +229,19 @@ class DecisionJournalTool(BaseTool):
                 missing = [k for k in ("symbol", "rating", "time_horizon") if not kwargs.get(k)]
                 if missing:
                     return self._err(f"append requires: {', '.join(missing)}")
+                # Whole-branch review C1: the decision gate has to sit HERE,
+                # not only on submit_decision. submit_decision validates and
+                # renders; decision.portfolio_decision.json never reaches the
+                # broker. This append does: append_decision -> the paper hook
+                # below -> translator.execute_decision, which sizes the order
+                # from the ENTRY's rating alone (size_frac 1.0 Buy / 0.5
+                # Overweight), so omitting position_size_pct does not make a
+                # directional call harmless. Same precedent as the
+                # position_size_pct range check below — the PM reaches the
+                # journal directly through this tool.
+                gate = _degraded_gate(kwargs)
+                if gate is not None:
+                    return json.dumps(gate, ensure_ascii=False)
                 # A price level of 0 (or negative) is not a price — it is the
                 # model declining to specify one. Carried downstream it becomes
                 # a stop that can never trigger, so resolve it to None (the
