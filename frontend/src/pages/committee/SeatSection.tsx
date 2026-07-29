@@ -31,7 +31,11 @@ export function SeatSection({ seat, defaultOpen = true }: { seat: CommitteeSeat;
       >
         {open ? <ChevronDown className="h-4 w-4 shrink-0" /> : <ChevronRight className="h-4 w-4 shrink-0" />}
         <span className="font-mono text-sm font-medium">{seat.agent_id}</span>
-        {seat.round ? <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">{t("committee.round", { n: seat.round })}</span> : null}
+        {/* Debate seats only. committee_routes.py sends round on every seat —
+            _debate_round returns 1 for any task id without an -r{n} suffix —
+            so a truthiness check put a meaningless "Round 1" on the trader,
+            the PM and every analyst. A round number is a debate fact. */}
+        {seat.phase === "debate" && seat.round ? <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">{t("committee.round", { n: seat.round })}</span> : null}
         <span className={cn("ms-auto text-xs", STATUS_TONE[seat.status] ?? "text-muted-foreground")}>{seat.status}</span>
       </button>
       {open ? (

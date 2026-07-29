@@ -24,9 +24,9 @@ function makeDetail(over: Partial<Detail> = {}): Detail {
     // task.status.value, i.e. completed/degraded/failed/cancelled. "done" is
     // a swarmStatus.ts display value that never reaches this endpoint.
     seats: [
-      { agent_id: "market_analyst", phase: "analysts", round: null, status: "completed", report_md: "# Market view\nBullish." },
+      { agent_id: "market_analyst", phase: "analysts", round: 1, status: "completed", report_md: "# Market view\nBullish." },
       { agent_id: "bull_researcher", phase: "debate", round: 1, status: "completed", report_md: "Bull case." },
-      { agent_id: "risk_manager", phase: "risk", round: null, status: "completed", report_md: null, missing: true },
+      { agent_id: "risk_manager", phase: "risk", round: 1, status: "completed", report_md: null, missing: true },
     ],
     debate: { rounds: 1, order: ["bull-r1", "bear-r1"] },
     decision: { rating: "Buy", price_target: 70000, position_size_pct: 5 },
@@ -80,8 +80,8 @@ describe("CommitteeRunDetail", () => {
         // seat badge this test queries by text.
         run: { run_id: "r1", status: "running" },
         seats: [
-          { agent_id: "market_analyst", phase: "analysts", round: null, status: "completed", report_md: "ok" },
-          { agent_id: "research_manager", phase: "research_manager", round: null, status: "degraded", report_md: null, missing: true },
+          { agent_id: "market_analyst", phase: "analysts", round: 1, status: "completed", report_md: "ok" },
+          { agent_id: "research_manager", phase: "research_manager", round: 1, status: "degraded", report_md: null, missing: true },
         ],
       } as Partial<Detail>),
     );
@@ -99,7 +99,7 @@ describe("CommitteeRunDetail", () => {
           {
             agent_id: "research_manager",
             phase: "research_manager",
-            round: null,
+            round: 1,
             status: "degraded",
             report_md: null,
             missing: true,
@@ -150,6 +150,41 @@ describe("CommitteeRunDetail", () => {
     expect(reason.className).not.toContain("text-warning");
   });
 
+  // Fix wave 2 hardening: every fixture above used to say `round: null`, which
+  // production never sends — committee_routes.py::_debate_round has no None
+  // branch (it returns 1 for non-debate task ids) and the key is set
+  // unconditionally, so every seat arrives with round: 1. SeatSection keyed the
+  // pill on truthiness alone, so the trader, the PM and every analyst carried a
+  // "Round 1" badge that means nothing outside the debate — and the fixtures
+  // were the only reason no test could see it.
+  it("shows no round pill on a non-debate seat, which the API still sends round 1 for", async () => {
+    apiMock.getCommitteeRun.mockResolvedValue(
+      makeDetail({
+        seats: [
+          { agent_id: "trader", phase: "trader", round: 1, status: "completed", report_md: "Trade plan." },
+        ],
+        debate: { rounds: 1, order: [] },
+      } as Partial<Detail>),
+    );
+    renderAt("r1");
+    await screen.findByText("trader");
+    expect(screen.queryByText("Round 1")).toBeNull();
+  });
+
+  it("keeps the round pill on a debate seat, where the number is real", async () => {
+    apiMock.getCommitteeRun.mockResolvedValue(
+      makeDetail({
+        seats: [
+          { agent_id: "bear_researcher", phase: "debate", round: 2, status: "completed", report_md: "Bear case." },
+        ],
+        debate: { rounds: 2, order: ["bear-r2"] },
+      } as Partial<Detail>),
+    );
+    renderAt("r1");
+    // Two: the debate group heading CommitteeRunDetail renders per round, and
+    // the seat's own pill.
+    await waitFor(() => expect(screen.getAllByText("Round 2")).toHaveLength(2));
+  });
 
   // Loop 2: a degraded seat still means "something happened to this run" —
   // the live-follow panel must refetch on it like it does for
