@@ -429,3 +429,56 @@ def test_reconcile_treats_degraded_as_terminal(tmp_path):
     assert reconciled.completed_at
     # a degraded task must survive reconciliation unmodified
     assert {t.id: t.status for t in reconciled.tasks}["t1"] is TaskStatus.degraded
+
+
+def test_reap_stale_preserves_degraded_task_and_reaps_pending(tmp_path):
+    """A degraded task must survive the stale-run reaper unmodified.
+
+    Task 5 added ``degraded`` to ``_reap_stale``'s terminal set
+    (store.py:466-471) so a seat that already reported its own failure
+    isn't overwritten with the reaper's generic "host process likely
+    exited" message. ``test_reconcile_treats_degraded_as_terminal`` cannot
+    prove this on its own: its fixture (degraded + completed) is
+    all-terminal, so ``reconcile_run`` returns via ``_recover_terminal``
+    (store.py:412-417) before the ``is_run_stale`` check ever runs, and
+    ``_reap_stale`` is never reached. Here, ``t2`` is kept genuinely
+    non-terminal (``pending``) so the stale path is actually exercised.
+    """
+    store = SwarmStore(base_dir=tmp_path)
+    run = SwarmRun(
+        id="r-stale",
+        preset_name="demo",
+        status=RunStatus.running,
+        # Far enough in the past that, with no events.jsonl to supersede it,
+        # is_run_stale's created_at fallback (store.py:360-365) trips
+        # regardless of the heartbeat-derived threshold.
+        created_at="2020-01-01T00:00:00+00:00",
+        tasks=[
+            SwarmTask(
+                id="t1",
+                agent_id="a",
+                prompt_template="x",
+                status=TaskStatus.degraded,
+                error="hit iteration limit (15) without completing the deliverable",
+            ),
+            SwarmTask(
+                id="t2", agent_id="b", prompt_template="x", status=TaskStatus.pending
+            ),
+        ],
+    )
+    store.create_run(run)
+    reconciled = store.reconcile_run(store.load_run(run.id), write=True)
+
+    by_id = {t.id: t for t in reconciled.tasks}
+    # the degraded task is untouched: same status, original error intact —
+    # NOT overwritten with the reaper's fabricated "host process likely
+    # exited before completion" message.
+    assert by_id["t1"].status is TaskStatus.degraded
+    assert (
+        by_id["t1"].error
+        == "hit iteration limit (15) without completing the deliverable"
+    )
+    # live control: the still-pending task WAS reaped, proving _reap_stale
+    # actually ran rather than no-opping.
+    assert by_id["t2"].status is TaskStatus.failed
+    assert "host process likely exited" in by_id["t2"].error
