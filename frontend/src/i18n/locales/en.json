@@ -139,6 +139,7 @@
     "reportUnavailableHint": "This seat produced no report.md artifact for this run.",
     "seatError": "Seat could not be read",
     "seatDegraded": "Seat did not complete",
+    "seatFailed": "Seat failed",
     "expand": "Expand",
     "collapse": "Collapse",
     "decision": "Decision",

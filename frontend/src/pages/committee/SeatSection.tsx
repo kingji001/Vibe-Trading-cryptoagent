@@ -36,8 +36,15 @@ export function SeatSection({ seat, defaultOpen = true }: { seat: CommitteeSeat;
       </button>
       {open ? (
         <div className="border-t p-3">
+          {/* Keyed on seat.status, not on field presence: committee_routes.py
+              forwards task.error as status_error for EVERY seat, and it is
+              non-empty for failed, blocked and reaped seats too. Labelling all
+              of them "Seat did not complete" in degraded orange conflated the
+              two categories, beside a badge that had them right. */}
           {seat.status_error ? (
-            <p className="mb-3 text-sm text-warning">{t("committee.seatDegraded")}: {seat.status_error}</p>
+            <p className={cn("mb-3 text-sm", seat.status === "degraded" ? "text-warning" : "text-danger")}>
+              {t(seat.status === "degraded" ? "committee.seatDegraded" : "committee.seatFailed")}: {seat.status_error}
+            </p>
           ) : null}
           {seat.error ? (
             <p className="text-sm text-danger">{t("committee.seatError")}: {seat.error}</p>

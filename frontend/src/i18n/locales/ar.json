@@ -134,6 +134,7 @@
     "reportUnavailableHint": "لم ينتج هذا المقعد ملف report.md لهذا التشغيل.",
     "seatError": "تعذّرت قراءة هذا المقعد",
     "seatDegraded": "لم يُكمل المقعد مهمته",
+    "seatFailed": "أخفق المقعد",
     "expand": "توسيع",
     "collapse": "طي",
     "decision": "القرار",

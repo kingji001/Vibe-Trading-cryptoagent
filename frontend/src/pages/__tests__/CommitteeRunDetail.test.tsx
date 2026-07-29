@@ -110,22 +110,46 @@ describe("CommitteeRunDetail", () => {
     );
     renderAt("r1");
 
-    expect(
-      await screen.findByText(/hit iteration limit \(15\) without completing the deliverable/),
-    ).toBeInTheDocument();
+    const reason = await screen.findByText(
+      /hit iteration limit \(15\) without completing the deliverable/,
+    );
+    expect(reason.textContent).toContain("Seat did not complete");
+    expect(reason.className).toContain("text-warning");
   });
 
-  it("colours a failed seat as danger", async () => {
+  // Fix wave 2: committee_routes.py forwards task.error as status_error for
+  // EVERY seat, and it is non-empty for failed, blocked and reaped seats — not
+  // only degraded ones. Keying the body label on field presence rather than on
+  // seat.status labelled a failed seat "Seat did not complete" in degraded
+  // orange, beside a correct red `failed` badge. This fixture carries the
+  // status_error the producer actually sets; without it the bug is invisible.
+  it("colours a failed seat as danger and never labels it degraded", async () => {
     apiMock.getCommitteeRun.mockResolvedValue(
       makeDetail({
         seats: [
-          { agent_id: "trader", phase: "trader", round: null, status: "failed", report_md: null, missing: true },
+          {
+            agent_id: "trader",
+            phase: "trader",
+            round: 1,
+            status: "failed",
+            report_md: null,
+            missing: true,
+            status_error: "worker raised RuntimeError: provider returned 500",
+          },
         ],
       } as Partial<Detail>),
     );
     renderAt("r1");
     expect((await screen.findByText("failed")).className).toContain("text-danger");
+
+    // The reason is still shown — under the failed label, in danger tone.
+    const reason = screen.getByText(/provider returned 500/);
+    expect(reason.textContent).toContain("Seat failed");
+    expect(reason.textContent).not.toContain("Seat did not complete");
+    expect(reason.className).toContain("text-danger");
+    expect(reason.className).not.toContain("text-warning");
   });
+
 
   // Loop 2: a degraded seat still means "something happened to this run" —
   // the live-follow panel must refetch on it like it does for
