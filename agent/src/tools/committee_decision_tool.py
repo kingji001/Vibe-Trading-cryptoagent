@@ -23,6 +23,34 @@ from typing import Any
 
 from src.agent.tools import BaseTool
 
+# Loop 2 (Completion) decision gate. ``run_dir`` injected into every swarm
+# tool call is the calling seat's artifact dir, and the worker mirrors its
+# degraded-upstream set there as ``upstream_degradation.json``. A sized
+# directional call on a run whose required upstream never completed is what
+# committed $16,965 on a truncated scratch note (spec §4.1); Hold stays open
+# so a degraded run yields a no-op rather than a blind trade.
+_UPSTREAM_DEGRADATION_FILENAME = "upstream_degradation.json"
+_DIRECTIONAL_RATINGS = frozenset({"Buy", "Overweight", "Sell", "Underweight"})
+
+
+def _degraded_upstreams(run_dir: Any) -> list[dict]:
+    """Return the degraded-upstream entries recorded for this seat, if any."""
+    if not run_dir:
+        return []
+    try:
+        path = Path(run_dir) / _UPSTREAM_DEGRADATION_FILENAME
+        if not path.is_file():
+            return []
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    entries = payload.get("degraded_upstreams")
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict)]
+
 
 class SubmitDecisionTool(BaseTool):
     """Validate a committee decision against its Pydantic schema."""
@@ -119,6 +147,30 @@ class SubmitDecisionTool(BaseTool):
                 },
                 ensure_ascii=False,
             )
+
+        if schema_name == "portfolio_decision":
+            degraded = _degraded_upstreams(run_dir)
+            rating = getattr(model, "rating", None)
+            rating_value = getattr(rating, "value", None) or str(rating)
+            if degraded and rating_value in _DIRECTIONAL_RATINGS:
+                names = ", ".join(
+                    str(e.get("context_key") or e.get("task_id") or "?")
+                    for e in degraded
+                )
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": (
+                            f"Decision gate: rating '{rating_value}' is a sized "
+                            "directional call, but a required upstream "
+                            f"deliverable on this run is degraded ({names}). "
+                            "Resubmit with rating 'Hold' — it is the only "
+                            "rating accepted while an upstream is incomplete."
+                        ),
+                        "degraded_upstreams": degraded,
+                    },
+                    ensure_ascii=False,
+                )
 
         rendered = render_markdown(schema_name, model)
 

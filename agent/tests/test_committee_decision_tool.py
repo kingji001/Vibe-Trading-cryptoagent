@@ -303,3 +303,104 @@ class TestPersistence:
         assert persisted["action"] == "Sell"
         assert persisted != r1["decision"]
         assert persisted == r2["decision"]
+
+
+# ---------------------------------------------------------------------------
+# Loop 2 decision gate: no sized directional call on a degraded run
+# ---------------------------------------------------------------------------
+
+
+def _mark_degraded(run_dir: Path) -> None:
+    (run_dir / "upstream_degradation.json").write_text(
+        json.dumps(
+            {
+                "degraded_upstreams": [
+                    {
+                        "context_key": "research_plan",
+                        "reason": "upstream task task-research-plan: hit iteration limit",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class TestDegradedUpstreamGate:
+    @pytest.mark.parametrize("rating", ["Buy", "Overweight", "Sell", "Underweight"])
+    def test_directional_rating_rejected_on_degraded_run(
+        self, tool: SubmitDecisionTool, tmp_path: Path, rating: str
+    ) -> None:
+        _mark_degraded(tmp_path)
+        payload = dict(VALID_PAYLOADS["portfolio_decision"])
+        payload["rating"] = rating
+        payload["position_size_pct"] = 34.0
+
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision", payload=payload, run_dir=str(tmp_path)
+            )
+        )
+
+        assert result["status"] == "error"
+        assert rating in result["error"]
+        assert "research_plan" in result["error"]
+        assert result["degraded_upstreams"][0]["context_key"] == "research_plan"
+        assert not (tmp_path / "decision.portfolio_decision.json").exists()
+
+    def test_hold_still_accepted_on_degraded_run(
+        self, tool: SubmitDecisionTool, tmp_path: Path
+    ) -> None:
+        _mark_degraded(tmp_path)
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision",
+                payload=VALID_PAYLOADS["portfolio_decision"],
+                run_dir=str(tmp_path),
+            )
+        )
+        assert result["status"] == "ok"
+        assert (tmp_path / "decision.portfolio_decision.json").exists()
+
+    def test_directional_rating_accepted_when_nothing_degraded(
+        self, tool: SubmitDecisionTool, tmp_path: Path
+    ) -> None:
+        """False-reject guard: a clean run is unaffected by the gate."""
+        payload = dict(VALID_PAYLOADS["portfolio_decision"])
+        payload["rating"] = "Buy"
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision", payload=payload, run_dir=str(tmp_path)
+            )
+        )
+        assert result["status"] == "ok"
+
+    def test_other_schemas_are_not_gated(
+        self, tool: SubmitDecisionTool, tmp_path: Path
+    ) -> None:
+        """Only the PM's binding call is gated; upstream seats still submit."""
+        _mark_degraded(tmp_path)
+        result = json.loads(
+            tool.execute(
+                schema="research_plan",
+                payload=VALID_PAYLOADS["research_plan"],
+                run_dir=str(tmp_path),
+            )
+        )
+        assert result["status"] == "ok"
+
+    def test_unreadable_marker_does_not_break_submission(
+        self, tool: SubmitDecisionTool, tmp_path: Path
+    ) -> None:
+        """A corrupt marker must fail open, not brick the committee."""
+        (tmp_path / "upstream_degradation.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+        payload = dict(VALID_PAYLOADS["portfolio_decision"])
+        payload["rating"] = "Buy"
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision", payload=payload, run_dir=str(tmp_path)
+            )
+        )
+        assert result["status"] == "ok"
