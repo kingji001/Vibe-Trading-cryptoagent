@@ -15,8 +15,13 @@ from pathlib import Path
 
 import pytest
 
-from src.committee.schemas import render_markdown
-from src.tools.committee_decision_tool import SubmitDecisionTool
+from src.committee.schemas import Rating, render_markdown
+from src.swarm.worker import UPSTREAM_DEGRADATION_FILENAME
+from src.tools.committee_decision_tool import (
+    _DIRECTIONAL_RATINGS,
+    _UPSTREAM_DEGRADATION_FILENAME,
+    SubmitDecisionTool,
+)
 
 LONG = "x" * 120
 
@@ -404,3 +409,88 @@ class TestDegradedUpstreamGate:
             )
         )
         assert result["status"] == "ok"
+
+    @pytest.mark.parametrize("tampering", ["deleted", "emptied"])
+    def test_out_of_band_value_still_gates_after_marker_tampered(
+        self, tool: SubmitDecisionTool, tmp_path: Path, tampering: str
+    ) -> None:
+        """``upstream_degradation.json`` lives in the PM's own run_dir, and
+        ``write_file`` can overwrite any filename there (no blocklist in
+        ``resolve_safe_path``) -- a model can clear the marker itself to
+        unlock a sized directional call on a run with an incomplete
+        upstream. The worker must pass the seat's real degraded-upstream set
+        out-of-band (``degraded_upstreams`` kwarg, injected only for
+        ``submit_decision`` calls -- see worker.py) so the gate does not
+        depend on file contents a tool call already touched.
+
+        Simulates the tampering directly (delete / empty the marker) and
+        proves the gate still refuses when the out-of-band kwarg says
+        degraded.
+        """
+        marker = tmp_path / "upstream_degradation.json"
+        if tampering == "emptied":
+            marker.write_text("{}", encoding="utf-8")
+        # "deleted" case: never create it at all.
+
+        payload = dict(VALID_PAYLOADS["portfolio_decision"])
+        payload["rating"] = "Buy"
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision",
+                payload=payload,
+                run_dir=str(tmp_path),
+                degraded_upstreams=[
+                    {"context_key": "research_plan", "reason": "died mid-work"}
+                ],
+            )
+        )
+
+        assert result["status"] == "error"
+        assert "research_plan" in result["error"]
+        assert not (tmp_path / "decision.portfolio_decision.json").exists()
+
+    def test_wrong_shaped_marker_fails_open_rather_than_raising(
+        self, tool: SubmitDecisionTool, tmp_path: Path
+    ) -> None:
+        """Well-formed JSON of the wrong shape is the plausible drift mode --
+        e.g. a writer emitting a bare list of context keys instead of a list
+        of {context_key, reason} dicts. The three shape guards in
+        ``_degraded_upstreams`` must fail open (treat it as "nothing
+        degraded") rather than raise, same as the malformed-JSON case
+        already covered above."""
+        (tmp_path / "upstream_degradation.json").write_text(
+            json.dumps({"degraded_upstreams": ["research_plan"]}),
+            encoding="utf-8",
+        )
+        payload = dict(VALID_PAYLOADS["portfolio_decision"])
+        payload["rating"] = "Buy"
+        result = json.loads(
+            tool.execute(
+                schema="portfolio_decision", payload=payload, run_dir=str(tmp_path)
+            )
+        )
+        assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Constants pinned against silent drift between committee_decision_tool.py
+# and its two independent sources of truth (worker.py's writer, Rating enum).
+# ---------------------------------------------------------------------------
+
+
+def test_gate_reads_the_filename_the_worker_writes() -> None:
+    """``_UPSTREAM_DEGRADATION_FILENAME`` here and
+    ``UPSTREAM_DEGRADATION_FILENAME`` in worker.py are two independent string
+    literals, each anchored only by its own test. Rename the file in one
+    place without the other and every test still passes -- the gate reads a
+    path the writer no longer writes to, dead in production with nothing
+    red."""
+    assert _UPSTREAM_DEGRADATION_FILENAME == UPSTREAM_DEGRADATION_FILENAME
+
+
+def test_directional_ratings_matches_rating_enum_minus_hold() -> None:
+    """``_DIRECTIONAL_RATINGS`` is a hand-maintained frozenset copy of
+    ``Rating``'s members (minus Hold). Adding a new rating to the enum
+    without updating this set would silently let it bypass the gate --
+    nothing else would fail."""
+    assert _DIRECTIONAL_RATINGS | {"Hold"} == {r.value for r in Rating}

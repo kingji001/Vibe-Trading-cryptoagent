@@ -437,6 +437,18 @@ def run_worker(
     if degraded_upstreams:
         _write_upstream_degradation(artifact_dir, degraded_upstreams)
 
+    # Out-of-band mirror of the same set, injected straight into
+    # submit_decision's kwargs below rather than trusted from the file above.
+    # write_file resolves paths relative to run_dir with no filename
+    # blocklist (resolve_safe_path), so a model can overwrite
+    # upstream_degradation.json itself and clear the gate. This in-memory
+    # value never transits a model-writable file, so tampering with the
+    # marker cannot unlock a sized directional call.
+    degraded_upstream_entries = [
+        {"context_key": key, "reason": reason}
+        for key, reason in (degraded_upstreams or {}).items()
+    ]
+
     t0 = time.monotonic()
     iteration = 0
     summary = ""
@@ -746,6 +758,18 @@ def run_worker(
             )
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
+            if tc.name == "submit_decision":
+                # Scoped to this one tool rather than injected universally:
+                # run_dir is forwarded to every swarm tool call including
+                # remote MCP tools, and MCPRemoteTool._filter_arguments only
+                # strips names in _LOCAL_ONLY_ARGUMENTS (mcp.py) before
+                # relaying the rest to the remote server. A second
+                # universally-injected kwarg would leak this run's degraded-
+                # upstream reasons to any remote MCP tool whose schema
+                # allows additional properties unless that filter set were
+                # also updated — scoping to submit_decision avoids touching
+                # that surface at all.
+                args["degraded_upstreams"] = degraded_upstream_entries
 
             # Wrap tool execution in a heartbeat so the events.jsonl tail has a
             # fresh timestamp every few seconds. The stale-run reaper relies on

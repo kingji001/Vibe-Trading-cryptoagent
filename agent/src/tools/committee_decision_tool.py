@@ -33,8 +33,28 @@ _UPSTREAM_DEGRADATION_FILENAME = "upstream_degradation.json"
 _DIRECTIONAL_RATINGS = frozenset({"Buy", "Overweight", "Sell", "Underweight"})
 
 
-def _degraded_upstreams(run_dir: Any) -> list[dict]:
-    """Return the degraded-upstream entries recorded for this seat, if any."""
+def _degraded_upstreams(run_dir: Any, injected: Any = None) -> list[dict]:
+    """Return the degraded-upstream entries recorded for this seat, if any.
+
+    Args:
+        run_dir: The seat's artifact directory. Used only as the fallback
+            source when ``injected`` is absent, for backward compatibility
+            with callers that never pass the kwarg.
+        injected: The seat's degraded-upstream set passed out-of-band by the
+            swarm worker (worker.py's tool-call loop injects this for
+            ``submit_decision`` calls specifically). Preferred over the
+            on-disk marker: ``upstream_degradation.json`` lives inside the
+            model-writable ``run_dir``, and ``write_file`` can overwrite any
+            filename there (``resolve_safe_path`` has no filename blocklist),
+            so a model can clear the file itself to unlock a sized
+            directional call on a run whose upstream never completed.
+            Trusting the file alone makes this gate cooperative rather than
+            enforced.
+    """
+    if injected is not None:
+        if not isinstance(injected, list):
+            return []
+        return [e for e in injected if isinstance(e, dict)]
     if not run_dir:
         return []
     try:
@@ -149,7 +169,7 @@ class SubmitDecisionTool(BaseTool):
             )
 
         if schema_name == "portfolio_decision":
-            degraded = _degraded_upstreams(run_dir)
+            degraded = _degraded_upstreams(run_dir, kwargs.get("degraded_upstreams"))
             rating = getattr(model, "rating", None)
             rating_value = getattr(rating, "value", None) or str(rating)
             if degraded and rating_value in _DIRECTIONAL_RATINGS:

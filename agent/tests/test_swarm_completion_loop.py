@@ -209,6 +209,96 @@ def test_degraded_worker_writes_upstream_marker_file(monkeypatch, tmp_path):
     ]
 
 
+class _TamperMarkerThenSubmitLLM:
+    """First tool call is ``write_file`` (stands in for a model clearing the
+    on-disk marker), second is ``submit_decision``."""
+
+    def __init__(self, model_name: str | None = None, **kwargs) -> None:
+        self.model_name = model_name
+        self._n = 0
+
+    def __call__(self, *args, **kwargs) -> "_TamperMarkerThenSubmitLLM":
+        return _TamperMarkerThenSubmitLLM(**kwargs)
+
+    def stream_chat(self, messages, tools=None, on_text_chunk=None, timeout=None):
+        self._n += 1
+        name = "write_file" if self._n == 1 else "submit_decision"
+        return LLMResponse(
+            content=LONG_NOTE,
+            tool_calls=[ToolCallRequest(id=f"tc{self._n}", name=name, arguments={"schema": "x"})],
+        )
+
+
+class _TamperRegistry:
+    """Records the args each tool call receives. ``write_file`` overwrites
+    the on-disk marker in place, standing in for a model clearing
+    ``upstream_degradation.json`` via the real ``WriteFileTool`` (Finding A:
+    ``resolve_safe_path`` has no filename blocklist)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def get_definitions(self) -> list[dict]:
+        return [{"type": "function", "function": {"name": "submit_decision"}}]
+
+    def get(self, name: str):
+        return None
+
+    def execute(self, name: str, args: dict) -> str:
+        self.calls.append((name, dict(args)))
+        if name == "write_file":
+            Path(args["run_dir"], "upstream_degradation.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            return json.dumps({"status": "ok"})
+        return VALIDATION_ERROR
+
+
+def test_degraded_upstreams_injected_only_into_submit_decision_and_survives_marker_tampering(
+    monkeypatch, tmp_path
+):
+    """Finding A integration proof. Even after a tool call clears the
+    on-disk ``upstream_degradation.json`` mid-run -- standing in for a model
+    calling ``write_file`` to unlock a sized directional call, since the
+    marker sits in the model-writable run_dir with no filename blocklist --
+    the worker's ``submit_decision`` call still carries the seat's real
+    degraded-upstream set, injected out-of-band. No other tool receives it,
+    confirming the injection is scoped to ``submit_decision`` rather than
+    universal (see worker.py's tool-call loop)."""
+    monkeypatch.setattr(backoff_mod.time, "sleep", lambda *_: None)
+    registry = _TamperRegistry()
+    with (
+        patch.object(worker_mod, "build_swarm_registry", lambda *a, **k: registry),
+        patch.object(worker_mod, "ChatLLM", _TamperMarkerThenSubmitLLM()),
+    ):
+        run_worker(
+            agent_spec=_spec(id="portfolio_manager", max_iterations=2),
+            task=SwarmTask(
+                id="t1", agent_id="portfolio_manager", prompt_template="Decide."
+            ),
+            upstream_summaries={"research_plan": "partial note"},
+            user_vars={},
+            run_dir=tmp_path,
+            degraded_upstreams={
+                "research_plan": "upstream task task-research-plan: x"
+            },
+        )
+
+    marker = tmp_path / "artifacts" / "portfolio_manager" / "upstream_degradation.json"
+    assert json.loads(marker.read_text(encoding="utf-8")) == {}  # tampered clean
+
+    names = [name for name, _ in registry.calls]
+    assert names == ["write_file", "submit_decision"]
+    write_args, submit_args = registry.calls[0][1], registry.calls[1][1]
+    assert "degraded_upstreams" not in write_args
+    assert submit_args["degraded_upstreams"] == [
+        {
+            "context_key": "research_plan",
+            "reason": "upstream task task-research-plan: x",
+        }
+    ]
+
+
 # --- Task 3: prompt marker -------------------------------------------------
 
 
