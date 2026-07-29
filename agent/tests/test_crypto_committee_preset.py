@@ -232,12 +232,17 @@ def test_pm_append_step_enumerates_execution_and_run_id_fields():
     """Final review I2/C3: the PM's step-2 decision_journal append enumeration
     must name the execution fields (stop_loss, take_profit, position_size_pct)
     and run_id — otherwise the prompt-requested execution data never reaches
-    journal.append_decision / the paper executor."""
-    from src.swarm.presets import PRESETS_DIR
+    journal.append_decision / the paper executor.
 
-    raw = (PRESETS_DIR / f"{PRESET}.yaml").read_text(encoding="utf-8")
-    idx = raw.index('action "append"')
-    segment = raw[idx : idx + 600]
+    Scoped to the PM's own built prompt and bounded by the next numbered step.
+    It used to scan the whole YAML for the first 'action "append"' with a fixed
+    600-character window, so any earlier match in any seat's prompt would
+    silently re-anchor it and let the assertion pass against the wrong text.
+    """
+    pm = {a.id: a for a in build_run_from_preset(PRESET, USER_VARS).agents}["portfolio_manager"]
+    prompt = pm.system_prompt
+    start = prompt.index('2. Call decision_journal with action "append"')
+    segment = prompt[start : prompt.index("3. Write report.md")]
     for field in ("stop_loss", "take_profit", "position_size_pct", "run_id"):
         assert field in segment, f"{field!r} missing from PM append enumeration"
 
