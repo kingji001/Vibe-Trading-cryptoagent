@@ -331,6 +331,9 @@ class SwarmRuntime:
         # Compute execution layers
         layers = topological_layers(run.tasks)
         task_summaries: dict[str, str] = {}
+        # task_id -> why it is degraded. Consumed when building each
+        # downstream worker's upstream context (fail-visible, not fail-closed).
+        degraded_tasks: dict[str, str] = {}
         all_succeeded = instrument_error is None
 
         if instrument_error is not None:
@@ -367,6 +370,7 @@ class SwarmRuntime:
                     agent_map=agent_map,
                     layer_task_ids=layer_task_ids,
                     task_summaries=task_summaries,
+                    degraded_tasks=degraded_tasks,
                     run_dir=run_dir,
                     cancel_event=cancel_event,
                     include_shell_tools=include_shell_tools,
@@ -399,6 +403,41 @@ class SwarmRuntime:
                                 data={
                                     "status": result.status,
                                     "iterations": result.iterations,
+                                    "input_tokens": result.input_tokens,
+                                    "output_tokens": result.output_tokens,
+                                },
+                            ),
+                        )
+                    elif result.status == "degraded":
+                        # The seat terminated without a complete deliverable.
+                        # Its partial output still flows downstream — but
+                        # tagged, and the PM decision gate will refuse a sized
+                        # directional call while it stands (spec §4.2 C2.2).
+                        all_succeeded = False
+                        task_summaries[tid] = result.summary
+                        degraded_tasks[tid] = (
+                            result.error or "seat did not complete its deliverable"
+                        )
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        task_store.update_status(
+                            tid,
+                            TaskStatus.degraded,
+                            summary=result.summary,
+                            error=redact_internal_paths(result.error),
+                            completed_at=now_iso,
+                            artifacts=result.artifact_paths,
+                            worker_iterations=result.iterations,
+                        )
+                        resolve_dependencies(run_dir / "tasks", tid)
+                        self._emit_event(
+                            run_id,
+                            self._make_event(
+                                "task_degraded",
+                                task_id=tid,
+                                data={
+                                    "status": result.status,
+                                    "iterations": result.iterations,
+                                    "error": redact_internal_paths(result.error),
                                     "input_tokens": result.input_tokens,
                                     "output_tokens": result.output_tokens,
                                 },
@@ -624,6 +663,7 @@ class SwarmRuntime:
         cancel_event: threading.Event,
         include_shell_tools: bool = False,
         grounding_block: str = "",
+        degraded_tasks: dict[str, str] | None = None,
     ) -> dict[str, WorkerResult]:
         """Execute all tasks in a single layer in parallel, with retry on failure.
 
@@ -640,11 +680,17 @@ class SwarmRuntime:
             cancel_event: Cancellation event.
             include_shell_tools: Whether workers may register shell tools.
             grounding_block: Pre-rendered "Ground Truth" markdown for workers.
+            degraded_tasks: Task IDs that reached a terminal-but-degraded
+                state, mapped to the reason. Projected onto each task's
+                ``input_from`` keys so the consuming worker's prompt carries
+                an explicit incomplete-upstream marker. Keyword-only with a
+                ``None`` default so existing callers are unchanged.
 
         Returns:
             Mapping of task_id -> WorkerResult for all tasks in this layer.
         """
         results: dict[str, WorkerResult] = {}
+        degraded = degraded_tasks or {}
 
         def _event_callback(event: SwarmEvent) -> None:
             self._emit_event(run.id, event)
@@ -676,7 +722,14 @@ class SwarmRuntime:
                     except FileNotFoundError:
                         blocked_upstreams.append((dep_id, "missing"))
                         continue
-                    if dep_task.status != TaskStatus.completed:
+                    # ``degraded`` deliberately does NOT block: aborting a
+                    # 13-seat run costs ~0.9M tokens, so the run proceeds with
+                    # an explicit marker instead (spec §4.2 C2.2). ``failed``
+                    # still blocks — that is the 5/27 gate, unchanged.
+                    if dep_task.status not in (
+                        TaskStatus.completed,
+                        TaskStatus.degraded,
+                    ):
                         blocked_upstreams.append((dep_id, dep_task.status.value))
 
                 if blocked_upstreams:
@@ -722,9 +775,15 @@ class SwarmRuntime:
 
                 # Build upstream summaries from input_from mapping
                 upstream: dict[str, str] = {}
+                degraded_upstreams: dict[str, str] = {}
                 for context_key, source_task_id in task.input_from.items():
                     if source_task_id in task_summaries:
                         upstream[context_key] = task_summaries[source_task_id]
+                    if source_task_id in degraded:
+                        degraded_upstreams[context_key] = (
+                            f"upstream task {source_task_id}: "
+                            f"{degraded[source_task_id]}"
+                        )
 
                 future = executor.submit(
                     self._run_worker_with_retries,
@@ -737,6 +796,7 @@ class SwarmRuntime:
                     run_id=run.id,
                     include_shell_tools=include_shell_tools,
                     grounding_block=grounding_block,
+                    degraded_upstreams=degraded_upstreams,
                 )
                 futures[future] = tid
                 per_task_budget = agent_spec.timeout_seconds * (agent_spec.max_retries + 1)
@@ -808,6 +868,7 @@ class SwarmRuntime:
         run_id: str,
         include_shell_tools: bool = False,
         grounding_block: str = "",
+        degraded_upstreams: dict[str, str] | None = None,
     ) -> WorkerResult:
         """Run a worker with automatic retry on failure.
 
@@ -827,6 +888,9 @@ class SwarmRuntime:
             grounding_block: Pre-rendered "Ground Truth" markdown spliced
                 into the worker's system prompt. Empty string when no
                 symbols were extracted from user_vars.
+            degraded_upstreams: context_key -> reason for upstream
+                deliverables that did not complete; forwarded verbatim so
+                every retry attempt sees the same marker.
 
         Returns:
             WorkerResult from the last attempt.
@@ -868,6 +932,7 @@ class SwarmRuntime:
                 include_shell_tools=include_shell_tools,
                 grounding_block=grounding_block,
                 agent_config=self._agent_config,
+                degraded_upstreams=degraded_upstreams,
             )
 
             cumulative_input_tokens += result.input_tokens
@@ -907,7 +972,11 @@ class SwarmRuntime:
             all_tasks: All tasks in the run.
         """
         for task in all_tasks:
-            if task.status not in (TaskStatus.completed, TaskStatus.failed):
+            if task.status not in (
+                TaskStatus.completed,
+                TaskStatus.degraded,
+                TaskStatus.failed,
+            ):
                 try:
                     task_store.update_status(task.id, TaskStatus.cancelled)
                 except Exception:

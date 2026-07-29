@@ -10,19 +10,24 @@ the fix; the end-to-end replay lives in
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
 import src.providers.backoff as backoff_mod
+import src.swarm.runtime as rt
 import src.swarm.worker as worker_mod
 from src.providers.chat import LLMResponse, ToolCallRequest
 from src.swarm.models import (
+    RunStatus,
     SwarmAgentSpec,
+    SwarmRun,
     SwarmTask,
     TaskStatus,
     WorkerResult,
     WorkerStatus,
 )
+from src.swarm.store import SwarmStore
 from src.swarm.worker import (
     INCOMPLETE_UPSTREAM_MARKER,
     _recurring_tool_errors,
@@ -235,3 +240,149 @@ def test_prompt_unchanged_when_nothing_degraded():
         build_worker_prompt(*args, degraded_upstreams={})
     )
     assert INCOMPLETE_UPSTREAM_MARKER not in build_worker_prompt(*args)
+
+
+# --- Task 4: runtime transitions ------------------------------------------
+
+
+def _two_task_run(tmp_path: Path) -> tuple[SwarmStore, rt.SwarmRuntime, SwarmRun]:
+    store = SwarmStore(base_dir=tmp_path)
+    runtime = rt.SwarmRuntime(store=store)
+    run = SwarmRun(
+        id="r-deg",
+        preset_name="demo",
+        created_at="2026-07-28T18:00:10+00:00",
+        agents=[
+            SwarmAgentSpec(id="judge", role="judge", system_prompt="x", max_retries=0),
+            SwarmAgentSpec(id="trader", role="trader", system_prompt="x", max_retries=0),
+        ],
+        tasks=[
+            SwarmTask(id="task-judge", agent_id="judge", prompt_template="judge"),
+            SwarmTask(
+                id="task-trader",
+                agent_id="trader",
+                prompt_template="trade",
+                depends_on=["task-judge"],
+                blocked_by=["task-judge"],
+                input_from={"research_plan": "task-judge"},
+            ),
+        ],
+    )
+    store.create_run(run)
+    return store, runtime, run
+
+
+def test_degraded_result_marks_task_degraded_and_run_failed(tmp_path, monkeypatch):
+    seen: list[dict] = []
+
+    def fake_worker(agent_spec, task, **kwargs):
+        seen.append({"task": task.id, "degraded": kwargs.get("degraded_upstreams")})
+        if task.id == "task-judge":
+            return WorkerResult(
+                status="degraded",
+                summary="a partial working note",
+                error="hit iteration limit (15) without completing the deliverable",
+                iterations=15,
+            )
+        return WorkerResult(status="completed", summary="trader done", iterations=3)
+
+    monkeypatch.setattr(rt, "run_worker", fake_worker)
+    store, runtime, run = _two_task_run(tmp_path)
+    runtime._execute_run(run, threading.Event())
+
+    reloaded = store.load_run(run.id)
+    by_id = {t.id: t for t in reloaded.tasks}
+    assert by_id["task-judge"].status is TaskStatus.degraded
+    assert by_id["task-judge"].summary == "a partial working note"
+    assert "iteration limit" in by_id["task-judge"].error
+    # fail-visible: the consumer runs, and it is told.
+    assert by_id["task-trader"].status is TaskStatus.completed
+    assert seen[-1]["degraded"] == {
+        "research_plan": "upstream task task-judge: hit iteration limit (15) "
+        "without completing the deliverable"
+    }
+    # run-level status still reports the degradation
+    assert reloaded.status is RunStatus.failed
+
+
+def test_degraded_emits_task_degraded_event(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        rt,
+        "run_worker",
+        lambda *a, **k: WorkerResult(
+            status="degraded",
+            summary="partial",
+            error="hit iteration limit",
+            iterations=15,
+        ),
+    )
+    store, runtime, run = _two_task_run(tmp_path)
+    runtime._execute_run(run, threading.Event())
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / run.id / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    degraded = [e for e in events if e["type"] == "task_degraded"]
+    assert {e["task_id"] for e in degraded} == {"task-judge", "task-trader"}
+    assert degraded[0]["data"]["iterations"] == 15
+    assert "task_completed" not in {e["type"] for e in events}
+
+
+def test_failed_upstream_still_blocks_downstream(tmp_path, monkeypatch):
+    """Guard: degraded is permissive, failed is not — the 5/27 gate stands."""
+    monkeypatch.setattr(
+        rt,
+        "run_worker",
+        lambda *a, **k: WorkerResult(status="failed", summary="", error="boom"),
+    )
+    store, runtime, run = _two_task_run(tmp_path)
+    runtime._execute_run(run, threading.Event())
+
+    by_id = {t.id: t for t in store.load_run(run.id).tasks}
+    assert by_id["task-judge"].status is TaskStatus.failed
+    assert by_id["task-trader"].status is TaskStatus.blocked
+
+
+def test_marker_is_always_co_delivered_with_the_content(tmp_path, monkeypatch):
+    """A consumer can never receive degraded content without its marker.
+
+    ``input_from`` creates no DAG edge (``topological_layers`` reads only
+    ``depends_on``, task_store.py:220), so a consumer CAN be scheduled before
+    a task it reads from. That is survivable only because ``upstream`` and
+    ``degraded_upstreams`` are populated from the same loop over the same two
+    dicts, and ``_execute_run`` writes ``task_summaries[tid]`` and
+    ``degraded_tasks[tid]`` together in the degraded branch. The unordered
+    case therefore yields NEITHER content nor marker — never content alone.
+    """
+    seen: list[dict] = []
+
+    def fake_worker(agent_spec, task, **kwargs):
+        seen.append(
+            {
+                "task": task.id,
+                "upstream": set(kwargs.get("upstream_summaries") or {}),
+                "degraded": set(kwargs.get("degraded_upstreams") or {}),
+            }
+        )
+        if task.id == "task-judge":
+            return WorkerResult(
+                status="degraded",
+                summary="",
+                error="hit iteration limit",
+                iterations=15,
+            )
+        return WorkerResult(status="completed", summary="ok", iterations=1)
+
+    monkeypatch.setattr(rt, "run_worker", fake_worker)
+    store, runtime, run = _two_task_run(tmp_path)
+    runtime._execute_run(run, threading.Event())
+
+    for call in seen:
+        assert call["degraded"] <= call["upstream"], call
+    trader = next(c for c in seen if c["task"] == "task-trader")
+    # even an EMPTY degraded summary still delivers the key, so the marker
+    # is never orphaned by a seat that produced no text at all.
+    assert trader["upstream"] == {"research_plan"}
+    assert trader["degraded"] == {"research_plan"}
