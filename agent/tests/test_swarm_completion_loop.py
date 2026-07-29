@@ -401,3 +401,31 @@ def test_cancellation_does_not_erase_a_degraded_task(tmp_path):
     runtime._cancel_remaining_tasks(task_store, ["task-trader"], task_store.load_all())
     assert task_store.load_task("task-judge").status is TaskStatus.degraded
     assert task_store.load_task("task-trader").status is TaskStatus.cancelled
+
+
+# --- Task 5: store reconciliation -----------------------------------------
+
+
+def test_reconcile_treats_degraded_as_terminal(tmp_path):
+    store = SwarmStore(base_dir=tmp_path)
+    run = SwarmRun(
+        id="r-rec",
+        preset_name="demo",
+        status=RunStatus.running,
+        created_at="2026-07-28T18:00:10+00:00",
+        tasks=[
+            SwarmTask(
+                id="t1", agent_id="a", prompt_template="x", status=TaskStatus.degraded
+            ),
+            SwarmTask(
+                id="t2", agent_id="b", prompt_template="x", status=TaskStatus.completed
+            ),
+        ],
+    )
+    store.create_run(run)
+    reconciled = store.reconcile_run(store.load_run(run.id), write=True)
+
+    assert reconciled.status is RunStatus.failed
+    assert reconciled.completed_at
+    # a degraded task must survive reconciliation unmodified
+    assert {t.id: t.status for t in reconciled.tasks}["t1"] is TaskStatus.degraded

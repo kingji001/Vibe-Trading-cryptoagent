@@ -373,10 +373,10 @@ class SwarmStore:
            callers never see the stale start-of-run snapshot.
         2. **Terminal recovery**: if every task is terminal but ``run.status``
            is still ``running``, derive the real run status from the task
-           statuses (all completed → ``completed``; any failed → ``failed``;
-           else ``cancelled``) and fill ``final_report`` from the last
-           completed task's summary. Handles the "host crashed between the
-           last layer sync and finalize" case.
+           statuses (all completed → ``completed``; any failed or degraded →
+           ``failed``; else ``cancelled``) and fill ``final_report`` from the
+           last completed task's summary. Handles the "host crashed between
+           the last layer sync and finalize" case.
         3. **Stale reap**: if the run is still ``running`` past its
            heartbeat-based threshold, mark non-terminal tasks ``failed`` with
            a diagnostic error and the run ``failed``.
@@ -399,7 +399,12 @@ class SwarmStore:
         hydrated = self.hydrate_run(run)
         now = datetime.now(timezone.utc)
         terminal_run = {RunStatus.completed, RunStatus.failed, RunStatus.cancelled}
-        terminal_task = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
+        terminal_task = {
+            TaskStatus.completed,
+            TaskStatus.degraded,
+            TaskStatus.failed,
+            TaskStatus.cancelled,
+        }
 
         if hydrated.status in terminal_run:
             return hydrated
@@ -432,7 +437,7 @@ class SwarmStore:
         statuses = {t.status for t in run.tasks}
         if statuses <= {TaskStatus.completed}:
             new_status = RunStatus.completed
-        elif TaskStatus.failed in statuses:
+        elif TaskStatus.failed in statuses or TaskStatus.degraded in statuses:
             new_status = RunStatus.failed
         elif statuses <= {TaskStatus.cancelled, TaskStatus.completed}:
             new_status = RunStatus.cancelled
@@ -458,7 +463,12 @@ class SwarmStore:
         """Pure: mark non-terminal tasks failed; derive run status from tasks."""
         from src.swarm.models import TaskStatus
 
-        terminal_task = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
+        terminal_task = {
+            TaskStatus.completed,
+            TaskStatus.degraded,
+            TaskStatus.failed,
+            TaskStatus.cancelled,
+        }
         last_event_at = _last_event_timestamp(self.run_dir(run.id) / "events.jsonl")
         threshold = int(self.compute_stale_threshold(run))
         error_msg = (
