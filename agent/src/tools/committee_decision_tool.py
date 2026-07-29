@@ -25,10 +25,14 @@ from src.agent.tools import BaseTool
 
 # Loop 2 (Completion) decision gate. ``run_dir`` injected into every swarm
 # tool call is the calling seat's artifact dir, and the worker mirrors its
-# degraded-upstream set there as ``upstream_degradation.json``. A sized
-# directional call on a run whose required upstream never completed is what
-# committed $16,965 on a truncated scratch note (spec §4.1); Hold stays open
-# so a degraded run yields a no-op rather than a blind trade.
+# degraded-upstream set there as ``upstream_degradation.json``; the worker
+# also passes that set directly into ``submit_decision``'s kwargs, which
+# takes precedence -- see ``_degraded_upstreams``. The file fallback still
+# exists for callers outside the swarm (tests, the single-agent loop) but is
+# never the source of truth inside a swarm run. A sized directional call on
+# a run whose required upstream never completed is what committed $16,965 on
+# a truncated scratch note (spec §4.1); Hold stays open so a degraded run
+# yields a no-op rather than a blind trade.
 _UPSTREAM_DEGRADATION_FILENAME = "upstream_degradation.json"
 _DIRECTIONAL_RATINGS = frozenset({"Buy", "Overweight", "Sell", "Underweight"})
 

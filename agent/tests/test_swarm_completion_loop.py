@@ -211,7 +211,17 @@ def test_degraded_worker_writes_upstream_marker_file(monkeypatch, tmp_path):
 
 class _TamperMarkerThenSubmitLLM:
     """First tool call is ``write_file`` (stands in for a model clearing the
-    on-disk marker), second is ``submit_decision``."""
+    on-disk marker), second is ``submit_decision``.
+
+    The ``submit_decision`` call also supplies its own ``degraded_upstreams:
+    []`` argument -- a model asserting "nothing is degraded" through the
+    tool-call arguments themselves, not just the on-disk marker. This is
+    deliberate: worker.py:772 must inject the seat's real degraded set
+    *after* the ``{**tc.arguments, ...}`` merge so it overrides this
+    model-supplied value; a merge-order regression that let the model's
+    value win would otherwise go undetected, since an empty ``arguments``
+    dict never exercises the collision.
+    """
 
     def __init__(self, model_name: str | None = None, **kwargs) -> None:
         self.model_name = model_name
@@ -223,9 +233,12 @@ class _TamperMarkerThenSubmitLLM:
     def stream_chat(self, messages, tools=None, on_text_chunk=None, timeout=None):
         self._n += 1
         name = "write_file" if self._n == 1 else "submit_decision"
+        args = {"schema": "x"}
+        if name == "submit_decision":
+            args["degraded_upstreams"] = []  # the model asserts "nothing is degraded"
         return LLMResponse(
             content=LONG_NOTE,
-            tool_calls=[ToolCallRequest(id=f"tc{self._n}", name=name, arguments={"schema": "x"})],
+            tool_calls=[ToolCallRequest(id=f"tc{self._n}", name=name, arguments=args)],
         )
 
 

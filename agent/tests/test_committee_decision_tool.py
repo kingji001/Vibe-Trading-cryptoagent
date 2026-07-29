@@ -488,6 +488,17 @@ def test_gate_reads_the_filename_the_worker_writes() -> None:
     assert _UPSTREAM_DEGRADATION_FILENAME == UPSTREAM_DEGRADATION_FILENAME
 
 
+def test_submit_decision_tool_name_matches_worker_dispatch_string() -> None:
+    """worker.py:761 injects ``degraded_upstreams`` by testing
+    ``tc.name == "submit_decision"``, a string literal independent of this
+    class attribute. Renaming ``SubmitDecisionTool.name`` would silently stop
+    the out-of-band injection -- the gate would fall back to the tamperable
+    on-disk marker with nothing red (test_crypto_committee_preset.py:115
+    pins the preset's tool-name string, not this class attribute, so it
+    would not catch the drift either)."""
+    assert SubmitDecisionTool.name == "submit_decision"
+
+
 def test_directional_ratings_matches_rating_enum_minus_hold() -> None:
     """``_DIRECTIONAL_RATINGS`` is a hand-maintained frozenset copy of
     ``Rating``'s members (minus Hold). Adding a new rating to the enum
